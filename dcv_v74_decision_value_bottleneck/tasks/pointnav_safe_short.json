@@ -1,0 +1,20 @@
+{
+  "name": "safe_short_pointgoal",
+  "domain": "pointnav",
+  "weights": {
+    "collision": 15.0,
+    "non_traversable": 10.0,
+    "safety_risk": 2.0,
+    "route_deviation": 0.5,
+    "lack_of_progress": 2.0,
+    "path_length": 0.5,
+    "discomfort": 0.0,
+    "goal_error": 5.0
+  },
+  "limits": {
+    "collision": 0.05,
+    "non_traversable": 0.05
+  },
+  "constraint_penalty": 100.0,
+  "explanation": "Reach the PointGoal through navigable space while strongly avoiding collisions and unnecessary path length."
+}
