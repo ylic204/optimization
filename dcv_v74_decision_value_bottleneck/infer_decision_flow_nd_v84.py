@@ -123,8 +123,12 @@ def main():
         token_logits=selection["logits"][0].cpu().numpy(),
         predicted_candidate_metrics=predicted_metrics[0].cpu().numpy(),
         predicted_candidate_costs=predicted_cost[0].cpu().numpy(),
+        candidate_valid=batch["candidate_valid"][0].cpu().numpy(),
+        candidate_count=batch["candidate_count"][0].cpu().numpy(),
         selected_candidate_index=candidate_index[0].cpu().numpy(),
         candidate_trajectory=base[0].cpu().numpy(),
+        expert_trajectory=batch["expert_trajectory"][0].cpu().numpy(),
+        expert_is_fallback=batch["expert_is_fallback"][0].cpu().numpy(),
         flow_trajectory=flow_trajectory[0].cpu().numpy(),
         final_trajectory=final_trajectory[0].cpu().numpy(),
     )

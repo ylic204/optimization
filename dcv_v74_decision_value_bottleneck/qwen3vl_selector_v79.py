@@ -632,6 +632,11 @@ class DecisionRelatedQwenSelector(nn.Module):
         )
         return self.set_value_head(value_input).squeeze(-1)
 
+    def pool_decision_latent(self, z, mask, valid):
+        """Pool the information available under ``mask`` into one decision code."""
+        pooled = self._weighted_pool(z, mask * valid.float())
+        return F.normalize(pooled, dim=-1)
+
 
 class PathDecisionHead(nn.Module):
     """Map Qwen3-VL's fused task state to candidate-path logits."""

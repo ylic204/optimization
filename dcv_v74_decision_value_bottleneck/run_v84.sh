@@ -25,5 +25,9 @@ python "$ROOT/train_decision_flow_nd_v84.py" \
   --epochs "${EPOCHS:-30}" \
   --batch "${BATCH_SIZE:-1}" \
   --workers "${WORKERS:-2}" \
+  --lambda-dgd "${LAMBDA_DGD:-0.25}" \
+  --lambda-latent "${LAMBDA_LATENT:-0.25}" \
+  --lambda-value "${LAMBDA_VALUE:-0.25}" \
+  --lambda-policy-distill "${LAMBDA_POLICY_DISTILL:-0.25}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

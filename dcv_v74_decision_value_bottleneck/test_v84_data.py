@@ -4,7 +4,14 @@ from pathlib import Path
 
 import numpy as np
 
-from planning_data_v84 import SDF_SIZE, convert_directory, process_raw_record
+from planning_data_v84 import (
+    MAX_CANDIDATES,
+    MIN_CANDIDATES,
+    SDF_SIZE,
+    adaptive_candidate_count,
+    convert_directory,
+    process_raw_record,
+)
 from raw_record_v84 import save_raw_record
 from split_planning_data_v84 import split_groups
 
@@ -18,9 +25,12 @@ class PlanningDataV84Test(unittest.TestCase):
         reference = np.stack(
             [np.linspace(0, 15, 24), np.zeros(24)], axis=-1
         ).astype(np.float32)
+        expert = reference.copy()
+        expert[:, 1] = 0.2 * np.sin(np.linspace(0, np.pi, len(expert)))
         return {
             "image": np.zeros((72, 96, 3), dtype=np.uint8),
             "reference_path_ego": reference,
+            "expert_trajectory_ego": expert,
             "traversable": traversable,
             "dynamic_obstacle": obstacle,
             "map_bounds": np.asarray([-5, 20, -10, 10], dtype=np.float32),
@@ -34,9 +44,20 @@ class PlanningDataV84Test(unittest.TestCase):
     def test_raw_record_to_training_sample(self):
         raw = self.make_raw()
         sample = process_raw_record(raw, lateral_span=2.5)
-        self.assertEqual(sample["candidate_trajectories"].shape, (11, 16, 3))
-        self.assertEqual(sample["candidate_metrics"].shape, (11, 8))
-        self.assertTrue(sample["candidate_valid"].any())
+        self.assertEqual(
+            sample["candidate_trajectories"].shape,
+            (MAX_CANDIDATES, 16, 3),
+        )
+        self.assertEqual(
+            sample["candidate_metrics"].shape, (MAX_CANDIDATES, 8)
+        )
+        self.assertGreaterEqual(int(sample["candidate_count"]), MIN_CANDIDATES)
+        self.assertLessEqual(int(sample["candidate_count"]), MAX_CANDIDATES)
+        self.assertEqual(
+            int(sample["candidate_valid"].sum()), int(sample["candidate_count"])
+        )
+        self.assertEqual(sample["expert_trajectory"].shape, (16, 2))
+        self.assertFalse(bool(sample["expert_is_fallback"]))
         self.assertEqual(sample["sdf"].shape, (SDF_SIZE, SDF_SIZE))
         self.assertLess(sample["sdf"].min(), 0.0)
         self.assertGreater(sample["sdf"].max(), 0.0)
@@ -58,12 +79,32 @@ class PlanningDataV84Test(unittest.TestCase):
                 task_text=raw["task_text"].item(),
                 source_id=raw["source_id"].item(),
                 sample_id=raw["sample_id"].item(),
+                expert_trajectory_ego=raw["expert_trajectory_ego"],
             )
             convert_directory(raw_root, output_root, "nuplan")
             with np.load(output_root / "scene" / "sample.npz") as sample:
                 self.assertEqual(int(sample["schema_version"]), 84)
                 self.assertEqual(sample["sample_id"].item(), "sample-0")
-                self.assertEqual(sample["candidate_metrics"].shape, (11, 8))
+                self.assertEqual(
+                    sample["candidate_metrics"].shape,
+                    (MAX_CANDIDATES, 8),
+                )
+                self.assertEqual(sample["expert_trajectory"].shape, (16, 2))
+
+    def test_candidate_budget_adapts_to_scene_complexity(self):
+        raw = self.make_raw()
+        simple = adaptive_candidate_count(
+            raw["reference_path_ego"], raw["traversable"]
+        )
+        angle = np.linspace(0.0, np.pi / 2.0, 24)
+        curved = np.stack(
+            [10.0 * np.sin(angle), 10.0 * (1.0 - np.cos(angle))], axis=-1
+        )
+        constrained = raw["traversable"].copy()
+        constrained[:20] = False
+        complex_count = adaptive_candidate_count(curved, constrained)
+        self.assertEqual(simple, MIN_CANDIDATES)
+        self.assertGreater(complex_count, simple)
 
     def test_group_split_keeps_scenes_together(self):
         raw = self.make_raw()

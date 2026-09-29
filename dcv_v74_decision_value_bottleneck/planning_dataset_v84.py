@@ -39,6 +39,15 @@ class PlanningDatasetV84(Dataset):
                 "candidate_valid": torch.from_numpy(
                     data["candidate_valid"].astype(bool)
                 ),
+                "candidate_count": torch.tensor(
+                    data["candidate_count"].item()
+                ).long(),
+                "expert_trajectory": torch.from_numpy(
+                    data["expert_trajectory"].astype(np.float32)
+                ),
+                "expert_is_fallback": torch.tensor(
+                    data["expert_is_fallback"].item()
+                ).bool(),
                 "goal_state": torch.from_numpy(
                     data["goal_state"].astype(np.float32)
                 ),

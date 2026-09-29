@@ -5,7 +5,8 @@
 决策梯度蒸馏（Decision-Gradient Distillation, DGD）、Flow Matching 和固定步数
 神经动力学（Neurodynamic, ND）完成轨迹预测与约束细化。
 
-当前主线版本是 **V8.4**。历史 V7.x 文件保留用于消融和演化过程复现。
+当前主线版本是 **V8.4-r2**（动态候选与 full-information distillation）。
+历史 V7.x 文件保留用于消融和演化过程复现。
 
 ## 1. 方法概览
 
@@ -19,10 +20,10 @@
                                       ▼
                          Qwen3-VL 后续 ViT + LLM 融合
                                       │
-已知地图 ──> 11 条连续候选轨迹 ───────> 候选指标预测与优化选择
+已知地图 ──> 8–32 条自适应连续候选 ──> 候选指标预测与优化选择
                                       │
                                       ▼
-                        Conditional Flow Matching
+专家/测地连续轨迹 ─────> Conditional Flow Matching
                                       │
 地图 SDF ─────────────────────────────> Fixed-Step ND Refiner
                                       │
@@ -36,7 +37,8 @@
 - Qwen3-VL 只接收真实 RGB 与任务文本。
 - 已知地图产生的候选轨迹进入独立的 trajectory branch。
 - Signed Distance Field（SDF）只进入 ND 约束能量，不伪装成视觉 token。
-- teacher 的候选指标、最优解和约束代价只作为训练监督，不作为 student 输入。
+- full-information teacher 保留全部视觉区域；student 只保留预算内 Top-K 区域。
+- teacher 的候选指标、专家轨迹和约束代价只作为训练监督，不作为 student 输入。
 - 默认 `region_grid=9`，共有 `9×9=81` 个可选视觉区域；`budget=0.15`
   时保留约 12 个区域。
 
@@ -47,14 +49,19 @@ L = L_task
   + lambda_metric * L_metric
   + lambda_flow   * L_flow
   + lambda_dgd    * L_dgd
+  + lambda_latent * L_latent
+  + lambda_value  * L_value
+  + lambda_policy * L_policy
 
 L_task = candidate_regret
        + lambda_trajectory * trajectory_imitation
        + lambda_constraint * ND_energy
 ```
 
-其中 DGD 的 token teacher 来自最终规划任务损失对连续 token mask 的梯度，
-而不是来自模型结构重建损失。
+其中 DGD 的 token teacher 来自 **full-token planning forward** 的最终任务损失
+对全信息 mask 的梯度，而不是 Student 自身 mask 的重建梯度。`L_latent` 对齐稀疏
+Student 与全信息 Teacher 的 decision latent，`L_value` 使 latent 预测所选信息集的
+下游规划损失，`L_policy` 蒸馏两者的候选决策分布。
 
 ## 2. 主要文件
 
@@ -150,6 +157,7 @@ token 选择和轨迹规划的影响。
 |---|---|---|
 | `image` | `[H,W,3] uint8` | 第一视角 RGB |
 | `reference_path_ego` | `[N,2]` 或 `[N,3]` | ego-frame 参考路径，可含 yaw |
+| `expert_trajectory_ego` | `[Ne,2]` 或 `[Ne,3]`，推荐 | nuPlan 未来专家轨迹或 PointNav geodesic |
 | `traversable` | `[Hm,Wm] bool` | 已知地图可通行区域 |
 | `dynamic_obstacle` | `[Hm,Wm] bool` | 当前动态障碍 |
 | `map_bounds` | `[4]` | `[xmin,xmax,ymin,ymax]` |
@@ -164,10 +172,13 @@ token 选择和轨迹规划的影响。
 
 V8.4 处理后，每个样本还包含：
 
-- `candidate_trajectories`: `[11,16,3]`，11 条连续 Frenet 候选；
-- `candidate_features`: `[11,8]`，部署时可获得的轨迹几何特征；
-- `candidate_metrics`: `[11,8]`，teacher 监督；
-- `candidate_valid`: `[11]`，轨迹是否在局部地图覆盖范围内；
+- `candidate_trajectories`: `[32,16,3]`，8–32 条真实候选并 padding 到 32；
+- `candidate_features`: `[32,8]`，部署时可获得的轨迹几何特征；
+- `candidate_metrics`: `[32,8]`，teacher 监督；
+- `candidate_valid`: `[32]`，真实候选为 1、padding 为 0；
+- `candidate_count`: scalar，每个场景实际生成的候选数量；
+- `expert_trajectory`: `[16,2]`，独立于候选集合的连续监督轨迹；
+- `expert_is_fallback`: scalar，未导出专家轨迹时是否回退到 reference path；
 - `sdf`: `[128,128]`，自由空间为正、障碍内部为负；
 - `goal_state`: `[dx,dy,distance,bearing]`。
 
@@ -240,6 +251,7 @@ save_raw_record(
     output_path="/data/v84_raw_all/nuplan/log_name/frame_000001.npz",
     image=front_rgb,
     reference_path_ego=route_xy_or_xyyaw,
+    expert_trajectory_ego=future_ego_xy_or_xyyaw,
     traversable=local_drivable_raster,
     dynamic_obstacle=local_dynamic_obstacle_raster,
     map_bounds=[-5.0, 35.0, -20.0, 20.0],
@@ -252,7 +264,9 @@ save_raw_record(
 ```
 
 PointNav 使用相同接口，但设置 `source_id=1`，输入 egocentric RGB、navmesh
-traversability、VO-updated PointGoal 和室内参考路径。
+traversability、VO-updated PointGoal、室内参考路径，并将 geodesic shortest path
+作为 `expert_trajectory_ego`。该字段省略时只用于 smoke test，处理器会回退到
+reference path 并设置 `expert_is_fallback=1`。
 
 nuPlan 导出循环需要依次完成：
 
@@ -261,7 +275,8 @@ nuPlan 导出循环需要依次完成：
 3. rasterize 当前 tracked vehicles/pedestrians；
 4. 将 route polyline 转换到 ego frame；
 5. 选取局部规划 horizon 的目标点；
-6. 调用 `save_raw_record`。
+6. 导出相同 horizon 内的未来 ego expert trajectory；
+7. 调用 `save_raw_record`。
 
 PointNav 导出循环需要依次完成：
 
@@ -329,9 +344,13 @@ done
     └── pointnav/*.npz
 ```
 
-处理程序会确定性地完成：128×128 raster、SDF、11 条候选轨迹、每条 16 个
-轨迹点、8 个指标 target 以及 candidate validity。碰撞和不可通行不会被提前
-从 `candidate_valid` 删除，而是由优化目标和软约束惩罚处理。
+处理程序会确定性地完成：128×128 raster、SDF、基于路线曲率和静态地图复杂度
+动态生成 8–32 条候选、padding 到 32、每条 16 个轨迹点、8 个指标 target，
+以及独立的连续专家轨迹。动态障碍不参与候选数量分配，避免将训练标签泄漏到
+候选生成阶段。
+
+该数据协议已更新；旧版只有 11 条候选且没有 `expert_trajectory` 的 processed
+NPZ 必须重新运行 `process_planning_data_v84.py`，不能直接用于新版训练器。
 
 ## 9. 生成或检查任务优化 JSON
 
@@ -378,8 +397,10 @@ EPOCHS=10 \
 BATCH_SIZE=1 \
 WORKERS=2 \
 LOAD_4BIT=1 \
+LAMBDA_DGD=0 \
+LAMBDA_LATENT=0 \
+LAMBDA_POLICY_DISTILL=0 \
 bash run_v84.sh "$PWD" \
-  --lambda-dgd 0 \
   --output checkpoints/v84_warmup.pt \
   --metrics results/v84_warmup_metrics.json
 ```
@@ -421,6 +442,9 @@ bash run_v84.sh "$PWD" \
 | `--nd-step-size` | 0.15 | ND 更新步长 |
 | `--lambda-flow` | 1.0 | Flow Matching loss 权重 |
 | `--lambda-dgd` | 0.25 | 决策梯度蒸馏权重 |
+| `--lambda-latent` | 0.25 | Student/Teacher decision latent 对齐 |
+| `--lambda-value` | 0.25 | latent 对下游规划损失的预测监督 |
+| `--lambda-policy-distill` | 0.25 | full/student 候选决策分布蒸馏 |
 | `--lr` | 2e-4 | selector/metric head/flow 学习率 |
 
 Qwen backbone 全部冻结，训练参数来自 selector、candidate metric head 和
@@ -468,8 +492,10 @@ python evaluate_decision_flow_nd_v84.py \
 - `random`：随机保留相同 K 个区域；
 - `learned`：selector Top-K。
 
-输出指标包括：candidate regret、trajectory error、ND energy、collision rate、
-goal error、retained regions 和 token ratio。论文实验还应额外记录 wall-clock
+输出指标包括：candidate regret、expert trajectory error、ND energy、collision
+rate、goal error、每场景 candidate count、expert fallback rate、retained regions
+和 token ratio。正式实验中 `expert_fallback_rate` 应为 0。论文实验还应额外记录
+wall-clock
 latency、peak GPU memory、Qwen FLOPs、Flow 时间、ND 时间以及 benchmark 官方
 指标。
 
@@ -529,7 +555,8 @@ bash -n download_planning_data_v84.sh run_v84.sh
 - MILP task schema 与最优候选选择；
 - raw record 写入和读取；
 - log/scene 无泄漏划分；
-- 11 条候选轨迹与 8 个 metric target；
+- 8–32 条自适应候选、padding mask 与 8 个 metric target；
+- 独立 expert trajectory 及 reference fallback 标记；
 - SDF 正负距离；
 - raw-to-processed 目录转换。
 
@@ -562,10 +589,11 @@ simulator rollout、地图 rasterization 和 raw NPZ 导出仍需在各自环境
 
 ## 16. 当前实现边界
 
-- 当前 teacher 在 11 个连续候选轨迹上做精确有限候选优化；不是任意规模的
-  edge-flow 全局规划器。
-- `candidate_valid` 仅表示地图覆盖有效性；碰撞与不可通行通过任务指标和软约束
-  处理。
+- 当前 warm-start teacher 在每个场景的 8–32 条自适应候选上比较成本；它不是
+  任意规模的 edge-flow 全局规划器。最终 Flow/ND 轨迹由独立专家轨迹监督，
+  不再被有限候选集合锁死。
+- `candidate_valid` 区分真实候选和 padding；碰撞、动态障碍与不可通行仍通过
+  任务指标和软约束处理。
 - 当前验证器提供统一离线指标；正式论文还需接入 nuPlan closed-loop 与 Habitat
   PointNav 官方指标。
 - 浏览器上传到 GitHub 的 `.sh` 可能没有 executable bit，可直接使用
@@ -579,4 +607,4 @@ simulator rollout、地图 rasterization 和 raw NPZ 导出仍需在各自环境
 - V8.1：第一视角 RGB 数据模式；
 - V8.2：已知地图与连续候选规划；
 - V8.3：语言任务到优化 JSON 与确定性求解器；
-- **V8.4：DGD + Qwen token pruning + Flow Matching + Fixed-Step ND。**
+- **V8.4-r2：动态候选 + 全信息 DGD + decision latent 蒸馏 + Flow + ND。**

@@ -1,11 +1,12 @@
-# V8.4 complete experiment pipeline
+# V8.4-r2 complete experiment pipeline
 
 V8.4 implements the complete research hypothesis:
 
 1. an LLM task agent maps language to optimization weights and limits;
 2. a Qwen3-VL selector retains a fixed budget of decision-relevant regions;
-3. simulator/map supervision distills candidate costs and the oracle solution;
-4. conditional Flow Matching transports a map candidate toward the teacher;
+3. a full-token online teacher distills decision gradients and candidate policy;
+4. conditional Flow Matching transports a dynamic warm start toward an
+   independent expert/geodesic trajectory;
 5. unrolled neurodynamic (ND) refinement reduces collision, goal, length and
    smoothness energy;
 6. the final planning loss supplies the token-level decision-gradient teacher.
@@ -75,6 +76,7 @@ save_raw_record(
     output_path="/data/v84_raw/train/nuplan/frame_000001.npz",
     image=front_rgb,
     reference_path_ego=route_xy_or_xyyaw,
+    expert_trajectory_ego=future_ego_xy_or_geodesic,
     traversable=local_drivable_raster,
     dynamic_obstacle=local_dynamic_obstacle_raster,
     map_bounds=[-5.0, 35.0, -20.0, 20.0],
@@ -166,11 +168,16 @@ The processor performs these deterministic steps:
 
 1. resize traversability/obstacle rasters to 128x128;
 2. create a signed-distance field, positive in free space;
-3. generate eleven continuous Frenet candidates with sixteen points each;
-4. sample map/obstacle values along every trajectory;
-5. generate eight normalized metric targets;
-6. mark invalid candidates;
-7. save the RGB, map, candidates and supervision in one NPZ.
+3. allocate 8--32 candidates from route curvature and static-map complexity;
+4. generate lateral, terminal-heading and progress-profile variations;
+5. keep a diverse subset and pad it to 32 with `candidate_valid=0`;
+6. sample map/obstacle values and generate eight normalized metric targets;
+7. resample the independent expert trajectory to sixteen points;
+8. save the RGB, map, candidates and supervision in one NPZ.
+
+If `expert_trajectory_ego` is omitted, conversion falls back to the reference
+path and writes `expert_is_fallback=1`. This supports a smoke test, but final
+nuPlan/PointNav experiments should export true future/geodesic supervision.
 
 ## E. Qwen input
 
@@ -210,8 +217,8 @@ TRAIN_DATA=/data/v84/train \
 VAL_DATA=/data/v84/val \
 VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
 DEVICE=1 BUDGET=1.0 EPOCHS=10 \
+LAMBDA_DGD=0 LAMBDA_LATENT=0 LAMBDA_POLICY_DISTILL=0 \
 bash run_v84.sh /home/lyi/neurodynamic/dcv_v74_decision_value_bottleneck \
-  --lambda-dgd 0 \
   --output checkpoints/v84_warmup.pt
 ```
 
@@ -235,9 +242,16 @@ Matching at inference/training, and `--nd-steps 0` removes ND refinement.
 
 ## G. Losses
 
-The exact finite-candidate teacher is selected from simulator/map target
-metrics under the language task weights and limits. The student predicts these
-metrics from pruned RGB/text features.
+The full-information online teacher sends all 81 visual regions through the
+remaining Qwen vision blocks and LLM. The Student uses only the hard Top-K
+regions. DGD differentiates the teacher's final planning loss with respect to
+the all-one visual mask, so it estimates the loss increase caused by removing
+each region from the full-information state.
+
+The variable candidate bank supplies a warm start and discrete-regret target.
+It no longer supplies the continuous Flow target. The Student predicts its
+metrics from pruned RGB/text features, while Flow Matching targets the exported
+expert future/geodesic trajectory.
 
 Flow Matching learns the vector field between a candidate warm start and the
 teacher trajectory. ND unrolls gradient flow on signed-distance safety,
@@ -249,10 +263,17 @@ The total loss is:
 final planning task loss
 + candidate metric calibration
 + Flow Matching velocity loss
-+ decision-gradient token distillation
++ full-information decision-gradient token distillation
++ selected/full decision-latent cosine alignment
++ selected-set downstream-value prediction
++ full/student candidate-policy KL distillation
 ```
 
 DGD uses only the final planning terms, not coefficient reconstruction loss.
+The latent objective is explicit: the selected-region latent must approximate
+the full-region decision code and predict the downstream planning loss of the
+selected information set. This prevents `z` from being trained only as an
+incidental input to the token score head.
 
 ## H. Evaluate
 
@@ -274,8 +295,9 @@ The evaluator runs three controlled modes with the same Flow/ND planner:
 - `random`: random K regions;
 - `learned`: selector Top-K regions.
 
-It reports candidate regret, trajectory error, ND energy, collision rate, goal
-error, retained region count and retained-token ratio.
+It reports candidate regret, expert-trajectory error, ND energy, collision
+rate, goal error, candidate count, expert-fallback rate, retained region count
+and retained-token ratio. A final experiment should have zero fallback rate.
 
 Run one sample and export its selected image regions, candidate decision, Flow
 trajectory and ND-refined trajectory:

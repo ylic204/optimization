@@ -43,7 +43,7 @@ class CandidateMetricHead(nn.Module):
         ego_state,
         source_id,
     ):
-        # One embedding is produced for each of the eleven map candidates.
+        # One embedding is produced for every valid or padded map candidate.
         candidate = self.trajectory_encoder(trajectories, trajectory_features)
 
         # The fused Qwen vector contains image evidence conditioned on task text.

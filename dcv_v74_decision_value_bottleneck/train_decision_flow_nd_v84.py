@@ -103,14 +103,17 @@ def augmented_candidate_cost(metrics, weights, limits, limit_mask, penalty):
 
 
 def oracle_trajectory(batch, weights, limits, limit_mask, penalty):
-    """Exact finite-candidate teacher generated from simulator metrics."""
+    """Return the continuous expert target and the best discrete candidate.
+
+    The expert trajectory supervises Flow Matching and final trajectory loss.
+    The finite-candidate optimum is retained only for warm-start regret.
+    """
     cost = augmented_candidate_cost(
         batch["candidate_metrics"], weights, limits, limit_mask, penalty
     )
     cost = cost.masked_fill(~batch["candidate_valid"], torch.inf)
     oracle_index = cost.argmin(-1)
-    row = torch.arange(cost.shape[0], device=cost.device)
-    target = batch["candidate_trajectories"][row, oracle_index, :, :2]
+    target = batch["expert_trajectory"]
     return target, oracle_index, cost
 
 
@@ -126,35 +129,48 @@ def soft_candidate_warm_start(
     predicted_cost = augmented_candidate_cost(
         predicted_metrics, weights, limits, limit_mask, penalty
     )
-    predicted_cost = predicted_cost.masked_fill(~batch["candidate_valid"], 1e4)
+    predicted_cost = predicted_cost.masked_fill(
+        ~batch["candidate_valid"], torch.inf
+    )
     probability = torch.softmax(-predicted_cost / temperature, dim=-1)
     candidate_xy = batch["candidate_trajectories"][..., :2]
     base = (probability[:, :, None, None] * candidate_xy).sum(1)
     return base, probability, predicted_cost
 
 
-def expected_candidate_regret(probability, oracle_cost, valid):
+def candidate_regret_values(probability, oracle_cost, valid):
     minimum = oracle_cost.min(-1).values
     maximum = oracle_cost.masked_fill(~valid, -torch.inf).max(-1).values
     scale = (maximum - minimum).clamp_min(1e-4)
     normalized = (oracle_cost - minimum[:, None]) / scale[:, None]
     normalized = normalized.masked_fill(~valid, 0.0)
-    return (probability * normalized).sum(-1).mean()
+    return (probability * normalized).sum(-1)
+
+
+def expected_candidate_regret(probability, oracle_cost, valid):
+    return candidate_regret_values(probability, oracle_cost, valid).mean()
 
 
 def decision_gradient_teacher(task_loss, soft_mask, valid):
     """Token utility is the fixed-budget descent direction of final task loss."""
-    gradient = torch.autograd.grad(task_loss, soft_mask, retain_graph=True)[0]
+    gradient = torch.autograd.grad(task_loss, soft_mask, retain_graph=False)[0]
     utility = -gradient * valid.float()
     utility = utility - utility.mean(-1, keepdim=True)
     utility = utility - utility.min(-1, keepdim=True).values
     utility = utility * valid.float()
-    return (utility / utility.sum(-1, keepdim=True).clamp_min(1e-8)).detach()
+    total = utility.sum(-1, keepdim=True)
+    uniform = valid.float() / valid.float().sum(-1, keepdim=True).clamp_min(1.0)
+    normalized = torch.where(
+        total > 1e-8, utility / total.clamp_min(1e-8), uniform
+    )
+    return normalized.detach()
 
 
-def trajectory_metrics(model, trajectory, target, batch, weights):
-    """Final downstream loss after Flow Matching and ND refinement."""
-    imitation = F.smooth_l1_loss(trajectory, target)
+def trajectory_metric_values(model, trajectory, target, batch, weights):
+    """Per-sample downstream values after Flow Matching and ND refinement."""
+    imitation = F.smooth_l1_loss(
+        trajectory, target, reduction="none"
+    ).mean(dim=(1, 2))
     energy = model.refiner.energy(
         trajectory,
         trajectory.detach(),
@@ -162,15 +178,88 @@ def trajectory_metrics(model, trajectory, target, batch, weights):
         batch["sdf"],
         batch["map_bounds"],
         weights,
-    ).mean()
+    )
     clearance = model.refiner.sample_sdf(
         batch["sdf"], trajectory, batch["map_bounds"]
     )
-    collision_rate = (clearance < 0.0).float().mean()
+    collision_rate = (clearance < 0.0).float().mean(-1)
     goal_error = torch.linalg.vector_norm(
         trajectory[:, -1] - batch["goal_state"][:, :2], dim=-1
-    ).mean()
+    )
     return imitation, energy, collision_rate, goal_error
+
+
+def trajectory_metrics(model, trajectory, target, batch, weights):
+    values = trajectory_metric_values(model, trajectory, target, batch, weights)
+    return tuple(value.mean() for value in values)
+
+
+def planning_rollout(
+    model,
+    fused,
+    batch,
+    weights,
+    limits,
+    limit_mask,
+    penalty,
+    task_vector,
+    target,
+    oracle_cost,
+    args,
+    differentiable,
+):
+    """Run coefficient prediction, warm start, Flow and fixed-step ND."""
+    predicted_metrics = model.predict_metrics(fused, batch)
+    base, probability, predicted_cost = soft_candidate_warm_start(
+        predicted_metrics,
+        batch,
+        weights,
+        limits,
+        limit_mask,
+        penalty,
+        args.decision_temperature,
+    )
+    flow_trajectory = model.flow.integrate(
+        base,
+        fused,
+        batch["goal_state"],
+        batch["ego_state"],
+        task_vector,
+        args.flow_steps,
+    )
+    refined = model.refiner(
+        flow_trajectory,
+        batch["goal_state"],
+        batch["sdf"],
+        batch["map_bounds"],
+        weights,
+        differentiable=differentiable,
+    )
+    imitation, energy, collision, goal_error = trajectory_metric_values(
+        model, refined, target, batch, weights
+    )
+    regret = candidate_regret_values(
+        probability, oracle_cost, batch["candidate_valid"]
+    )
+    task_values = (
+        regret
+        + args.lambda_trajectory * imitation
+        + args.lambda_constraint * energy
+    )
+    return {
+        "predicted_metrics": predicted_metrics,
+        "predicted_cost": predicted_cost,
+        "base": base,
+        "probability": probability,
+        "flow_trajectory": flow_trajectory,
+        "refined": refined,
+        "regret": regret,
+        "imitation": imitation,
+        "energy": energy,
+        "collision": collision,
+        "goal_error": goal_error,
+        "task_values": task_values,
+    }
 
 
 def train_epoch(model, loader, optimizer, args, device, tasks):
@@ -178,7 +267,8 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
     model.metric_head.train()
     model.flow.train()
     logs = {key: [] for key in (
-        "loss", "task", "flow", "metric", "dgd", "collision", "goal_error"
+        "loss", "task", "flow", "metric", "dgd", "latent", "value",
+        "policy_distill", "collision", "goal_error"
     )}
 
     for raw in tqdm(loader, desc="V8.4 train"):
@@ -198,7 +288,53 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         region_count = selection["logits"].shape[-1]
         k = max(1, round(args.budget * region_count))
 
-        # 2. Straight-through Top-K: hard forward values, soft mask derivatives.
+        # 2. The continuous expert is independent of the finite candidate bank.
+        target, _, oracle_cost = oracle_trajectory(
+            batch, weights, limits, limit_mask, penalty
+        )
+
+        # 3. Full-information online teacher: every visual region reaches the
+        # later Qwen blocks.  DGD is evaluated at this all-one information state.
+        needs_full_teacher = (
+            args.lambda_dgd > 0.0 or args.lambda_policy_distill > 0.0
+        )
+        teacher_probability = None
+        if needs_full_teacher:
+            teacher_mask = (
+                region_valid.float()
+                .detach()
+                .requires_grad_(args.lambda_dgd > 0.0)
+            )
+            teacher_fused = model.fuse_mask(encoded, teacher_mask)
+            teacher_rollout = planning_rollout(
+                model,
+                teacher_fused,
+                batch,
+                weights,
+                limits,
+                limit_mask,
+                penalty,
+                task_vector,
+                target,
+                oracle_cost,
+                args,
+                differentiable=args.lambda_dgd > 0.0,
+            )
+            teacher_probability = teacher_rollout["probability"].detach()
+            if args.lambda_dgd > 0.0:
+                teacher_utility = decision_gradient_teacher(
+                    teacher_rollout["task_values"].mean(),
+                    teacher_mask,
+                    region_valid,
+                )
+            else:
+                teacher_utility = None
+            del teacher_rollout, teacher_fused, teacher_mask
+        else:
+            teacher_utility = None
+
+        # 4. Student straight-through Top-K: hard values in the forward pass,
+        # differentiable fixed-mass mask in the backward pass.
         soft_mask = fixed_mass_mask(
             selection["logits"], region_valid, k, args.mask_temperature
         )
@@ -206,34 +342,32 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         mask = hard_mask + soft_mask - soft_mask.detach()
         fused = model.fuse_mask(encoded, mask)
 
-        # 3. The exact candidate teacher uses simulator/map metrics, not model input.
-        target, _, oracle_cost = oracle_trajectory(
-            batch, weights, limits, limit_mask, penalty
-        )
-
-        # 4. The pruned VLM predicts optimization coefficients for all candidates.
-        predicted_metrics = model.predict_metrics(fused, batch)
-        metric_loss = F.smooth_l1_loss(
-            predicted_metrics[batch["candidate_valid"]],
-            batch["candidate_metrics"][batch["candidate_valid"]],
-        )
-        base, probability, _ = soft_candidate_warm_start(
-            predicted_metrics,
+        # 5. The pruned Student predicts coefficients and a continuous plan.
+        student = planning_rollout(
+            model,
+            fused,
             batch,
             weights,
             limits,
             limit_mask,
             penalty,
-            args.decision_temperature,
+            task_vector,
+            target,
+            oracle_cost,
+            args,
+            differentiable=True,
         )
-        candidate_regret = expected_candidate_regret(
-            probability, oracle_cost, batch["candidate_valid"]
+        predicted_metrics = student["predicted_metrics"]
+        metric_loss = F.smooth_l1_loss(
+            predicted_metrics[batch["candidate_valid"]],
+            batch["candidate_metrics"][batch["candidate_valid"]],
         )
 
-        # 5. Flow Matching distills the solver trajectory distribution.
+        # 6. Flow Matching targets the continuous expert trajectory rather than
+        # the best member of a fixed eleven-trajectory bank.
         if args.lambda_flow > 0.0:
             flow_loss = model.flow.matching_loss(
-                base,
+                student["base"],
                 target,
                 fused,
                 batch["goal_state"],
@@ -242,45 +376,55 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
             )
         else:
             flow_loss = fused.new_zeros(())
-        flow_trajectory = model.flow.integrate(
-            base,
-            fused,
-            batch["goal_state"],
-            batch["ego_state"],
-            task_vector,
-            args.flow_steps,
+
+        # 7. Explicit decision-related latent learning.
+        full_latent = model.selector.pool_decision_latent(
+            selection["z"], region_valid.float(), region_valid
+        ).detach()
+        selected_latent = model.selector.pool_decision_latent(
+            selection["z"], soft_mask, region_valid
+        )
+        latent_loss = (1.0 - F.cosine_similarity(
+            selected_latent, full_latent, dim=-1
+        )).mean()
+        predicted_set_value = model.selector.predict_set_value(
+            selection["z"],
+            selection["task_context"],
+            soft_mask,
+            region_valid,
+            budget,
+        )
+        value_loss = F.smooth_l1_loss(
+            predicted_set_value, student["task_values"].detach()
         )
 
-        # 6. ND refines safety, smoothness, length and terminal-goal constraints.
-        refined = model.refiner(
-            flow_trajectory,
-            batch["goal_state"],
-            batch["sdf"],
-            batch["map_bounds"],
-            weights,
-            differentiable=True,
-        )
-        imitation, nd_energy, collision, goal_error = trajectory_metrics(
-            model, refined, target, batch, weights
-        )
+        if teacher_probability is not None:
+            policy_distill = F.kl_div(
+                student["probability"].clamp_min(1e-8).log(),
+                teacher_probability,
+                reduction="batchmean",
+            )
+        else:
+            policy_distill = fused.new_zeros(())
+        if teacher_utility is not None:
+            dgd = F.kl_div(
+                F.log_softmax(selection["logits"], dim=-1),
+                teacher_utility,
+                reduction="batchmean",
+            )
+        else:
+            dgd = fused.new_zeros(())
 
-        # 7. This is the downstream planning loss used for token distillation.
-        task_loss = (
-            candidate_regret
-            + args.lambda_trajectory * imitation
-            + args.lambda_constraint * nd_energy
-        )
-        teacher = decision_gradient_teacher(task_loss, soft_mask, region_valid)
-        dgd = F.kl_div(
-            F.log_softmax(selection["logits"], dim=-1),
-            teacher,
-            reduction="batchmean",
-        )
+        # 8. The final task loss supervises the actually retained information.
+        task_loss = student["task_values"].mean()
         loss = (
             task_loss
             + args.lambda_metric * metric_loss
             + args.lambda_flow * flow_loss
             + args.lambda_dgd * dgd
+            + args.lambda_latent * latent_loss
+            + args.lambda_value * value_loss
+            + args.lambda_policy_distill * policy_distill
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -298,8 +442,11 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         logs["flow"].append(float(flow_loss.detach()))
         logs["metric"].append(float(metric_loss.detach()))
         logs["dgd"].append(float(dgd.detach()))
-        logs["collision"].append(float(collision.detach()))
-        logs["goal_error"].append(float(goal_error.detach()))
+        logs["latent"].append(float(latent_loss.detach()))
+        logs["value"].append(float(value_loss.detach()))
+        logs["policy_distill"].append(float(policy_distill.detach()))
+        logs["collision"].append(float(student["collision"].mean().detach()))
+        logs["goal_error"].append(float(student["goal_error"].mean().detach()))
 
     return {key: float(np.mean(value)) for key, value in logs.items()}
 
@@ -361,6 +508,10 @@ def evaluate_mode(model, encoded, selection, region_valid, batch, args, task_dat
         "nd_energy": float(energy),
         "collision_rate": float(collision),
         "goal_error": float(goal_error),
+        "candidate_count": float(batch["candidate_count"].float().mean()),
+        "expert_fallback_rate": float(
+            batch["expert_is_fallback"].float().mean()
+        ),
         "tokens": float(k),
         "token_ratio": float(k / region_count),
     }
@@ -373,7 +524,8 @@ def validate(model, loader, args, device, tasks):
     logs = {
         mode: {key: [] for key in (
             "regret", "trajectory_error", "nd_energy", "collision_rate",
-            "goal_error", "tokens", "token_ratio"
+            "goal_error", "candidate_count", "expert_fallback_rate",
+            "tokens", "token_ratio"
         )}
         for mode in ("full", "random", "learned")
     }
@@ -434,6 +586,9 @@ def parse_args():
     parser.add_argument("--lambda-metric", type=float, default=1.0)
     parser.add_argument("--lambda-flow", type=float, default=1.0)
     parser.add_argument("--lambda-dgd", type=float, default=0.25)
+    parser.add_argument("--lambda-latent", type=float, default=0.25)
+    parser.add_argument("--lambda-value", type=float, default=0.25)
+    parser.add_argument("--lambda-policy-distill", type=float, default=0.25)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
