@@ -30,8 +30,38 @@ class DCVDataset(Dataset):
             "optimal_cost": torch.tensor(float(d["optimal_cost"]), dtype=torch.float32),
             "patch_graph_feat": torch.from_numpy(d["patch_graph_feat"]).float(),
         }
+        # V7.6 task conditioning. Older datasets remain readable and receive
+        # the original balanced navigation objective as their default prompt.
+        out["task_text"] = str(d["task_text"].item()) if "task_text" in d.files else (
+            "Navigate from node 0 to node 13. Minimize travel cost while "
+            "balancing rough terrain, hazards, and blocked regions."
+        )
+        out["task_name"] = str(d["task_name"].item()) if "task_name" in d.files else "balanced"
+        out["task_risks"] = torch.from_numpy(d["task_risks"]).float() if "task_risks" in d.files else torch.tensor(
+            [0.0, 0.35, 1.0, 20.0], dtype=torch.float32
+        )
         if "coarse_oracle_regret" in d.files:
             out["coarse_oracle_regret"] = torch.tensor(float(d["coarse_oracle_regret"]), dtype=torch.float32)
+        # Optional V7.9 spatial-topology fields.  They are metadata and
+        # supervision, not inputs to the student selector.
+        for key in (
+            "edge_stage",
+            "edge_choice",
+            "path_edge_indices",
+            "path_patch_sequence",
+            "hub_patches",
+            "optimal_edge_patches",
+            "optimal_path_patches",
+        ):
+            if key in d.files:
+                out[key] = torch.from_numpy(d[key]).long()
+        for key in ("route_patch_mask", "optimal_edge_mask"):
+            if key in d.files:
+                out[key] = torch.from_numpy(d[key]).float()
+        if "observable_layout" in d.files:
+            out["observable_layout"] = str(d["observable_layout"].item())
+        if "spatial_grid" in d.files:
+            out["spatial_grid"] = torch.tensor(int(d["spatial_grid"]), dtype=torch.long)
         if self.teacher_root is not None:
             td = np.load(self.teacher_root/f"{p.stem}.npz")
             for key in td.files:

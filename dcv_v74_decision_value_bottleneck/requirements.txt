@@ -2,3 +2,8 @@ torch
 numpy
 pillow
 tqdm
+scipy>=1.11
+pytest>=8.0
+transformers>=4.57,<5.18
+accelerate>=1.0
+bitsandbytes>=0.45; platform_system == "Linux"
