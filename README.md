@@ -1,335 +1,261 @@
 # Decision-Related Visual Token Selection for VLM Planning
 
 本仓库研究面向机器人导航与路径规划的视觉 token 压缩：在固定视觉预算下，
-让 Qwen3-VL-8B 只保留对最终优化决策有用的图像区域，同时使用求解器监督、
-决策梯度蒸馏（Decision-Gradient Distillation, DGD）、Flow Matching 和固定步数
-神经动力学（Neurodynamic, ND）完成轨迹预测与约束细化。
+让 Qwen3-VL-8B 只保留对最终优化决策有用的图像区域，并用任务损失的梯度知识
+训练一个可在固定步数内执行的视觉 mask 动力系统。
 
-当前主线版本是 **V8.4-r2**（动态候选与 full-information distillation）。
-历史 V7.x 文件保留用于消融和演化过程复现。
+当前主线版本是 **V8.5：Teacher-Gradient Flow Matching + Fixed-Step
+Neurodynamics + Endpoint Improvement**。V8.5 的核心变化是：
 
-## 1. 方法概览
+- Student 学习 full-information Teacher 的任务梯度下降方向；
+- Flow Matching 与神经动力学描述的是**同一个视觉 mask 向量场**；
+- ND 直接执行该向量场，不再使用 V8.4 的 `trajectory Flow -> ND refiner`
+  串联结构；
+- 使用端点损失 `L_improve`，约束固定步更新后的任务损失优于初始状态；
+- V8.4 及更早版本继续保留，用于复现和消融。
 
-```text
-任务文本 ──> Qwen 任务 Agent ──> 优化权重、约束和惩罚系数
-                                      │
-第一视角 RGB ──> Qwen3-VL early ViT ──> 81 个视觉区域
-                                      │
-任务文本 embedding ──────────────────> Decision Token Selector
-                                      │ Top-K，预算 K
-                                      ▼
-                         Qwen3-VL 后续 ViT + LLM 融合
-                                      │
-已知地图 ──> 8–32 条自适应连续候选 ──> 候选指标预测与优化选择
-                                      │
-                                      ▼
-专家/测地连续轨迹 ─────> Conditional Flow Matching
-                                      │
-地图 SDF ─────────────────────────────> Fixed-Step ND Refiner
-                                      │
-                                      ▼
-                最终任务损失 + 决策梯度蒸馏 token selector
-```
+V8.5 复用 V8.4 的 nuPlan/PointNav 数据协议、候选轨迹、任务指标和优化 JSON，
+无需重新设计数据格式。
 
-关键边界：
-
-- Student **不输入 `graph_feat`**。
-- Qwen3-VL 只接收真实 RGB 与任务文本。
-- 已知地图产生的候选轨迹进入独立的 trajectory branch。
-- Signed Distance Field（SDF）只进入 ND 约束能量，不伪装成视觉 token。
-- full-information teacher 保留全部视觉区域；student 只保留预算内 Top-K 区域。
-- teacher 的候选指标、专家轨迹和约束代价只作为训练监督，不作为 student 输入。
-- 默认 `region_grid=9`，共有 `9×9=81` 个可选视觉区域；`budget=0.15`
-  时保留约 12 个区域。
-
-V8.4 的总损失为：
+## 1. V8.5 方法概览
 
 ```text
-L = L_task
-  + lambda_metric * L_metric
-  + lambda_flow   * L_flow
-  + lambda_dgd    * L_dgd
-  + lambda_latent * L_latent
-  + lambda_value  * L_value
-  + lambda_policy * L_policy
-
-L_task = candidate_regret
-       + lambda_trajectory * trajectory_imitation
-       + lambda_constraint * ND_energy
+任务文本 ────────────────> task context c
+                              │
+第一视角 RGB ─> Qwen early ViT ─> R 个完整视觉区域 z
+                              │
+                              ▼
+                 Decision Token Selector
+                              │
+                   初始固定预算 mask w⁰
+                              │
+            ┌─────────────────┴─────────────────┐
+            │                                   │
+ Full-information Teacher              Student mask field
+ ∇w J_T(w) + 可行域投影               vθ(w,t,z,c)
+            │                                   │
+            └──── 梯度方向/步更新匹配 ──────────┘
+                                                │
+                                  K 步 projected ND
+                                                │
+                                      最终 mask wᴷ
+                                                │
+                           Straight-through hard Top-K
+                                                │
+                           Qwen 后续 ViT + 候选规划
+                                                │
+             L_task + L_gfm + L_improve + auxiliary losses
 ```
 
-其中 DGD 的 token teacher 来自 **full-token planning forward** 的最终任务损失
-对全信息 mask 的梯度，而不是 Student 自身 mask 的重建梯度。`L_latent` 对齐稀疏
-Student 与全信息 Teacher 的 decision latent，`L_value` 使 latent 预测所选信息集的
-下游规划损失，`L_policy` 蒸馏两者的候选决策分布。
+这里的“fixed-step”指推理时使用固定的更新次数 `K`。每一步的正步长由模型学习，
+初始化值由 `--mask-step-size` 指定。
 
-## 2. 主要文件
+### 1.1 关键边界
 
-所有实验代码位于 `dcv_v74_decision_value_bottleneck/`。
+- Student **不输入 `graph_feat`、SDF 或 teacher candidate metrics**。
+- Qwen3-VL 的视觉输入是真实第一视角 RGB，语言输入是真实任务文本。
+- known-map 候选轨迹只进入独立的候选规划分支，不伪装成视觉 token。
+- Teacher 在训练时使用完整 early-vision regions 和真实候选指标构造任务监督。
+- Student 部署时只保留预算内的 hard Top-K regions。
+- 默认 `region_grid=9`，共有 `9×9=81` 个视觉区域；`budget=0.15` 时保留
+  约 12 个区域。
+- V8.5 优化的是**视觉信息选择状态**，不再生成一条 Flow trajectory 后交给
+  另一个 ND trajectory refiner。
+
+## 2. 预算约束的视觉 mask 动力学
+
+令 `w in [0,1]^R` 为 relaxed visual-region mask，固定保留质量为 `k`：
+
+```text
+C_k = {w | 0 <= w_r <= 1, sum_r w_r = k}.
+```
+
+`Pi_Ck` 是 capped-simplex 投影。它同时保证：
+
+- 所有 mask 权重位于 `[0,1]`；
+- 无效区域的权重为 0；
+- 每个样本的总视觉预算严格等于 `k`。
+
+Selector 首先产生 task-conditioned 初始状态：
+
+```text
+w⁰ = Pi_Ck(sigmoid(selector_logits / tau_mask)).
+```
+
+## 3. Full-information Teacher 梯度
+
+在随机采样的 ND 中间状态 `w` 上，Teacher 对真实规划任务目标求梯度：
+
+```text
+g_T(w) = grad_w J_T(w).
+```
+
+无约束负梯度不一定满足 token budget，因此 Teacher target 使用投影后的可执行
+下降方向：
+
+```text
+w_T+ = Pi_Ck(w - eta_T * g_T(w))
+v_T  = (w_T+ - w) / eta_T.
+```
+
+这一步借鉴 gradient-direction matching 的思想，但匹配对象从网络参数空间转为
+视觉 mask 状态空间。Teacher 能访问完整视觉表示并通过下游任务损失判断哪些区域
+应该被增强或抑制；Student 学习在没有在线反向求导 Teacher 的情况下预测该方向。
+
+## 4. Flow Matching 与 ND 的关系
+
+V8.5 中二者不是前后两个模块：
+
+- **Flow Matching**：训练视角，监督局部 Student velocity；
+- **Neurodynamics**：执行视角，用固定次数迭代同一个 velocity field。
+
+Student 向量场为：
+
+```text
+v_theta = v_theta(w, t, z, c),
+```
+
+其中 `z` 是 decision-related region latent，`c` 是任务上下文，`t=s/K` 是归一化
+步索引。Student velocity 在有效区域上做零均值处理，再通过可行域投影保持预算。
+
+固定步 ND 为：
+
+```text
+w^(s+1) = Pi_Ck(w^s + eta_s * v_theta(w^s, s/K, z, c)),
+s = 0, ..., K-1.
+```
+
+### 4.1 Gradient Flow Matching loss
+
+方向项是主要蒸馏信号：
+
+```text
+L_dir = 1 - cos(v_theta, v_T).
+```
+
+为避免只匹配方向却产生不可控步幅，代码同时使用可调的 magnitude 和 projected
+one-step 辅助项：
+
+```text
+L_mag  = SmoothL1(log(1 + ||v_theta||), log(1 + ||v_T||))
+L_step = SmoothL1(Pi_Ck(w + eta_s v_theta), w_T+)
+
+L_gfm = L_dir
+        + alpha_mag  * L_mag
+        + alpha_step * L_step.
+```
+
+Teacher 梯度非常小时，该样本不参与 cosine direction 平均，避免数值不稳定。
+
+## 5. Endpoint improvement loss
+
+`L_improve` 只比较初始和最终状态：
+
+```text
+L_improve = mean ReLU(
+    J_T(wᴷ) - stopgrad(J_T(w⁰)) + delta
+).
+```
+
+其中：
+
+- `J_T(w⁰)` 是初始 task-conditioned mask 的任务损失；
+- `J_T(wᴷ)` 在 straight-through hard Top-K mask 上计算，forward 与实际部署一致；
+- `stopgrad` 阻止模型通过故意恶化初始状态来降低 hinge loss；
+- `delta >= 0` 是要求的最小改善 margin；
+- `delta=0` 时，仅在最终任务损失高于初始任务损失时产生惩罚。
+
+它不是逐步单调约束。V8.5 允许中间状态暂时上升，只要求固定 `K` 步后的端点
+产生净改善。这比原先设想的 `L_prog` 更符合有限步优化器的训练目标。
+
+## 6. V8.5 总损失
+
+```text
+L_total = L_task
+          + lambda_metric  * L_metric
+          + lambda_gfm     * L_gfm
+          + lambda_latent  * L_latent
+          + lambda_value   * L_value
+          + lambda_improve * L_improve.
+```
+
+各项含义：
+
+| 损失 | 作用 |
+|---|---|
+| `L_task` | 最终稀疏视觉信息下的 expected normalized candidate regret |
+| `L_metric` | 有效候选的 8 维任务指标回归 |
+| `L_gfm` | Student 对 Teacher projected descent velocity 的匹配 |
+| `L_latent` | 稀疏信息集与 full-information decision latent 对齐 |
+| `L_value` | 预测当前所选信息集对应的下游任务损失 |
+| `L_improve` | 最终状态相对初始状态的端点改善约束 |
+
+V8.5 不再包含 V8.4 的 trajectory `L_flow` 与 trajectory ND energy，也不引入
+per-step `L_prog`。
+
+## 7. 主要文件
+
+实验代码位于 `dcv_v74_decision_value_bottleneck/`。
+
+### 7.1 V8.5 主线
 
 | 文件 | 功能 |
 |---|---|
-| `download_planning_data_v84.sh` | 下载公开 devkit、PointNav-VO 与 PointNav episode |
-| `raw_record_v84.py` | nuPlan/Habitat 共用的原始数据导出接口 |
+| `gradient_flow_selector_v85.py` | capped-simplex 投影、Student mask field、固定步 ND |
+| `train_gradient_flow_selector_v85.py` | Teacher 梯度、`L_gfm`、`L_improve`、训练与验证 |
+| `evaluate_gradient_flow_selector_v85.py` | full/random/learned 三种视觉预算模式评估 |
+| `run_v85.sh` | V8.5 训练启动脚本 |
+| `test_v85_gradient_flow.py` | 投影、rollout 和 detached baseline 测试 |
+| `README_V85_GRADIENT_FLOW.md` | V8.5 数学与实现补充说明 |
+
+### 7.2 复用的数据与规划组件
+
+| 文件 | 功能 |
+|---|---|
+| `raw_record_v84.py` | nuPlan/Habitat 共用 raw record |
 | `split_planning_data_v84.py` | 按完整 log/scene 划分 train/val/test |
-| `planning_data_v84.py` | 构造候选轨迹、8 个指标和 SDF |
-| `process_planning_data_v84.py` | raw NPZ 到 V8.4 NPZ 的转换入口 |
-| `planning_dataset_v84.py` | PyTorch 数据集 |
-| `optimization_task_v83.py` | Qwen 文本 Agent：任务文本到优化 JSON |
-| `candidate_milp_solver_v83.py` | 有限候选 MILP teacher/审计求解器 |
-| `qwen3vl_selector_v79.py` | 可在 ViT 内真正删除视觉区域的 Qwen3-VL backbone |
-| `flow_nd_planner_v84.py` | token selector、指标头、Flow Matching、ND |
-| `train_decision_flow_nd_v84.py` | 两阶段训练与验证主程序 |
-| `run_v84.sh` | V8.4 训练启动脚本 |
-| `evaluate_decision_flow_nd_v84.py` | full/random/learned 三种 token 模式测试 |
-| `infer_decision_flow_nd_v84.py` | 单样本推理及轨迹导出 |
-| `README_V84_COMPLETE_PIPELINE.md` | V8.4 补充技术说明 |
+| `planning_data_v84.py` | 候选轨迹、8 个指标与 SDF 构造 |
+| `process_planning_data_v84.py` | raw NPZ 转换入口 |
+| `planning_dataset_v84.py` | V8.5 复用的 PyTorch dataset |
+| `optimization_task_v83.py` | 任务文本到优化 JSON |
+| `candidate_milp_solver_v83.py` | 有限候选 MILP teacher/audit solver |
+| `qwen3vl_selector_v79.py` | 支持 ViT 内物理 token pruning 的 Qwen backbone |
+| `mapped_vlm_optimizer_v83.py` | Candidate metric head |
 
-## 3. 环境准备
+### 7.3 历史 V8.4 基线
 
-建议使用三个独立环境，避免旧版 Habitat/nuPlan 依赖覆盖 Qwen 所需的
-PyTorch、Transformers 和 CUDA：
+`flow_nd_planner_v84.py`、`train_decision_flow_nd_v84.py`、`run_v84.sh` 和
+`README_V84_COMPLETE_PIPELINE.md` 保留原始 trajectory Flow + ND 串联设计，
+仅用于历史复现和结构消融，不代表当前主框架。
 
-1. nuPlan 官方环境：读取 DB、地图和相机数据，导出 raw NPZ；
-2. PointNav-VO/Habitat 固定环境：运行 Gibson 场景和 VO，导出 raw NPZ；
-3. Qwen 训练环境：数据转换、V8.4 训练、验证和推理。
+## 8. 环境准备
 
-### 3.1 Qwen 训练环境
+建议分开使用 simulator 数据导出环境与 Qwen 训练环境，避免 nuPlan/Habitat 的
+旧依赖覆盖训练所需的 PyTorch、Transformers 和 CUDA。
 
 ```bash
 git clone https://github.com/ylic204/optimization.git
 cd optimization/dcv_v74_decision_value_bottleneck
 
-conda create -n dcv-v84 python=3.12 -y
-conda activate dcv-v84
+conda create -n dcv-v85 python=3.12 -y
+conda activate dcv-v85
 pip install -r requirements.txt
 ```
 
-主要依赖包括：
+主要依赖：PyTorch、Transformers、Accelerate、bitsandbytes、NumPy、SciPy、
+Pillow、tqdm 和 pytest。
 
-- PyTorch；
-- `transformers>=4.57,<5.18`；
-- `accelerate>=1.0`；
-- `bitsandbytes>=0.45`；
-- NumPy、SciPy、Pillow、tqdm 和 pytest。
-
-Qwen3-VL-8B 权重建议放在数据盘，例如：
+Qwen3-VL-8B 权重建议存放在数据盘：
 
 ```text
 /data/lyi/models/Qwen3-VL-8B-Instruct
 ```
 
-代码默认只读取本地权重，不会在训练时自动联网下载模型。
+代码默认 `local_files_only=True`，训练时不会自动下载模型权重。
 
-## 4. 数据介绍
+## 9. 数据协议
 
-### 4.1 nuPlan
-
-nuPlan 用于已知道路地图条件下的自动驾驶局部路径规划。每个样本使用：
-
-- 前视相机 `CAM_F0` RGB；
-- ego-frame route/reference path；
-- 局部 drivable-area raster；
-- 当前车辆和行人形成的 dynamic-obstacle raster；
-- 局部目标点和 8 维 ego state。
-
-建议先用 mini split 验证完整流程，再扩展到 trainval。必须按照完整 log 或
-scenario 划分数据，不能随机打散相邻帧，否则会产生严重的数据泄漏。
-
-### 4.2 Habitat PointNav / Gibson
-
-PointNav 用于已知 navmesh 下的室内 PointGoal 导航。每个样本使用：
-
-- agent 第一视角 RGB；
-- navmesh shortest path；
-- `pathfinder.is_navigable()` 产生的局部 traversability raster；
-- VO 更新后的 PointGoal；
-- 碰撞观测形成的 obstacle raster。
-
-建议同时导出 oracle-pose 与 VO-pose 两套数据，用它们的差异评估定位误差对
-token 选择和轨迹规划的影响。
-
-### 4.3 统一 raw record
-
-两个数据源最终都由 `save_raw_record(...)` 写成 NPZ：
-
-| 字段 | 形状/类型 | 含义 |
-|---|---|---|
-| `image` | `[H,W,3] uint8` | 第一视角 RGB |
-| `reference_path_ego` | `[N,2]` 或 `[N,3]` | ego-frame 参考路径，可含 yaw |
-| `expert_trajectory_ego` | `[Ne,2]` 或 `[Ne,3]`，推荐 | nuPlan 未来专家轨迹或 PointNav geodesic |
-| `traversable` | `[Hm,Wm] bool` | 已知地图可通行区域 |
-| `dynamic_obstacle` | `[Hm,Wm] bool` | 当前动态障碍 |
-| `map_bounds` | `[4]` | `[xmin,xmax,ymin,ymax]` |
-| `goal_xy` | `[2]` | ego-frame 目标坐标 |
-| `ego_state` | `[8]` | 速度、加速度、转向等状态 |
-| `task_text` | string | 当前规划任务文本 |
-| `source_id` | scalar | nuPlan=0，PointNav=1 |
-| `sample_id` | string | 唯一样本标识 |
-
-坐标约定：x 轴向前，y 轴向左；raster 第 0 行对应 `ymax`，第 0 列对应
-`xmin`。
-
-V8.4 处理后，每个样本还包含：
-
-- `candidate_trajectories`: `[32,16,3]`，8–32 条真实候选并 padding 到 32；
-- `candidate_features`: `[32,8]`，部署时可获得的轨迹几何特征；
-- `candidate_metrics`: `[32,8]`，teacher 监督；
-- `candidate_valid`: `[32]`，真实候选为 1、padding 为 0；
-- `candidate_count`: scalar，每个场景实际生成的候选数量；
-- `expert_trajectory`: `[16,2]`，独立于候选集合的连续监督轨迹；
-- `expert_is_fallback`: scalar，未导出专家轨迹时是否回退到 reference path；
-- `sdf`: `[128,128]`，自由空间为正、障碍内部为负；
-- `goal_state`: `[dx,dy,distance,bearing]`。
-
-8 个 lower-is-better 指标依次为：`collision`、`non_traversable`、
-`safety_risk`、`route_deviation`、`lack_of_progress`、`path_length`、
-`discomfort`、`goal_error`。
-
-## 5. 下载数据与代码
-
-在项目目录运行：
-
-```bash
-bash download_planning_data_v84.sh /data/planning_sources
-```
-
-脚本会自动完成：
-
-1. clone `motional/nuplan-devkit`；
-2. clone `Xiaoming-Zhao/PointNav-VO`；
-3. 下载并解压公开的 PointNav-Gibson-v2 episode 描述。
-
-脚本不能替你接受数据许可证，因此下面两部分需要人工完成。
-
-### 5.1 nuPlan 授权数据
-
-登录 nuPlan 官方数据页面，接受条款后至少下载：
-
-- maps；
-- mini DB split；
-- 与 DB 对应的 mini camera sensor blobs。
-
-整理为：
-
-```text
-/data/planning_sources/nuplan/
-├── maps/
-└── nuplan-v1.1/
-    ├── splits/mini/*.db
-    └── sensor_blobs/<log>/CAM_F0/*.jpg
-```
-
-在 nuPlan 环境中设置：
-
-```bash
-export NUPLAN_DATA_ROOT=/data/planning_sources/nuplan/nuplan-v1.1
-export NUPLAN_MAPS_ROOT=/data/planning_sources/nuplan/maps
-export NUPLAN_EXP_ROOT=/data/planning_sources/nuplan/exp
-```
-
-### 5.2 Gibson 场景
-
-接受 Gibson 使用条款后，将 Habitat-compatible 的 `.glb` 与 `.navmesh`
-场景文件放入：
-
-```text
-/data/planning_sources/PointNav-VO/dataset/Gibson/gibson/
-```
-
-下载脚本只下载 episode JSON，不包含受许可约束的 Gibson 3D 场景。
-
-## 6. 从 simulator 导出 raw NPZ
-
-下载完成不等于已经得到训练集。必须分别在 nuPlan 和 Habitat 环境的 rollout
-循环中调用统一导出函数：
-
-```python
-from raw_record_v84 import save_raw_record
-
-save_raw_record(
-    output_path="/data/v84_raw_all/nuplan/log_name/frame_000001.npz",
-    image=front_rgb,
-    reference_path_ego=route_xy_or_xyyaw,
-    expert_trajectory_ego=future_ego_xy_or_xyyaw,
-    traversable=local_drivable_raster,
-    dynamic_obstacle=local_dynamic_obstacle_raster,
-    map_bounds=[-5.0, 35.0, -20.0, 20.0],
-    goal_xy=[30.0, 0.0],
-    ego_state=[vx, vy, ax, ay, yaw_rate, steering, 0.0, 0.0],
-    task_text="Drive safely to the goal while following the mapped route.",
-    source_id=0,
-    sample_id="log_name/iteration_12",
-)
-```
-
-PointNav 使用相同接口，但设置 `source_id=1`，输入 egocentric RGB、navmesh
-traversability、VO-updated PointGoal、室内参考路径，并将 geodesic shortest path
-作为 `expert_trajectory_ego`。该字段省略时只用于 smoke test，处理器会回退到
-reference path 并设置 `expert_is_fallback=1`。
-
-nuPlan 导出循环需要依次完成：
-
-1. 读取当前 iteration 的 `CAM_F0`；
-2. 将 drivable/lane map rasterize 到 ego frame；
-3. rasterize 当前 tracked vehicles/pedestrians；
-4. 将 route polyline 转换到 ego frame；
-5. 选取局部规划 horizon 的目标点；
-6. 导出相同 horizon 内的未来 ego expert trajectory；
-7. 调用 `save_raw_record`。
-
-PointNav 导出循环需要依次完成：
-
-1. 读取 `obs["rgb"]` 和可选的 `obs["depth"]`；
-2. 用 PointNav-VO 更新 agent pose 和局部 PointGoal；
-3. 查询 navmesh shortest path；
-4. 在 ego-frame raster 上调用 `pathfinder.is_navigable()`；
-5. 加入碰撞观测并调用 `save_raw_record`。
-
-## 7. 划分 train/val/test
-
-必须先按照完整 nuPlan log 或 Gibson scene 划分，再生成候选监督：
-
-```bash
-python split_planning_data_v84.py \
-  --input-root /data/v84_raw_all/nuplan \
-  --output-root /data/v84_raw_split/nuplan \
-  --val-ratio 0.1 \
-  --test-ratio 0.1 \
-  --seed 2026 \
-  --group-depth 1
-
-python split_planning_data_v84.py \
-  --input-root /data/v84_raw_all/pointnav \
-  --output-root /data/v84_raw_split/pointnav \
-  --val-ratio 0.1 \
-  --test-ratio 0.1 \
-  --seed 2026 \
-  --group-depth 1
-```
-
-`group-depth=1` 表示 raw root 下第一层目录是 log/scene。脚本会生成
-`split_manifest.json`，其中记录 seed、分组分配和准确样本数，应随实验结果保存。
-
-## 8. 生成 V8.4 训练数据
-
-对两个数据源、三个 split 分别运行：
-
-```bash
-for split in train val test; do
-  python process_planning_data_v84.py \
-    --raw-root /data/v84_raw_split/nuplan/${split} \
-    --output-root /data/v84/${split}/nuplan \
-    --source nuplan
-
-  python process_planning_data_v84.py \
-    --raw-root /data/v84_raw_split/pointnav/${split} \
-    --output-root /data/v84/${split}/pointnav \
-    --source pointnav
-done
-```
-
-最终目录应为：
+V8.5 直接使用 V8.4 processed NPZ。推荐目录为：
 
 ```text
 /data/v84/
@@ -344,72 +270,45 @@ done
     └── pointnav/*.npz
 ```
 
-处理程序会确定性地完成：128×128 raster、SDF、基于路线曲率和静态地图复杂度
-动态生成 8–32 条候选、padding 到 32、每条 16 个轨迹点、8 个指标 target，
-以及独立的连续专家轨迹。动态障碍不参与候选数量分配，避免将训练标签泄漏到
-候选生成阶段。
+每个 processed sample 的主要字段：
 
-该数据协议已更新；旧版只有 11 条候选且没有 `expert_trajectory` 的 processed
-NPZ 必须重新运行 `process_planning_data_v84.py`，不能直接用于新版训练器。
+| 字段 | 形状 | 含义 |
+|---|---|---|
+| `image` | `[H,W,3]` | 第一视角 RGB |
+| `candidate_trajectories` | `[32,16,3]` | 8–32 条真实候选，padding 到 32 |
+| `candidate_features` | `[32,8]` | 部署时可获得的候选几何特征 |
+| `candidate_metrics` | `[32,8]` | 仅用于训练监督的真实指标 |
+| `candidate_valid` | `[32]` | 有效候选 mask |
+| `goal_state` | `[4]` | `dx,dy,distance,bearing` |
+| `ego_state` | `[8]` | 车辆/机器人当前状态 |
+| `task_text` | string | 当前规划任务文本 |
+| `source_id` | scalar | nuPlan=0，PointNav=1 |
 
-## 9. 生成或检查任务优化 JSON
+8 个 lower-is-better 指标为：`collision`、`non_traversable`、`safety_risk`、
+`route_deviation`、`lack_of_progress`、`path_length`、`discomfort`、`goal_error`。
 
-仓库提供两个可以直接运行的默认任务：
+完整的下载、simulator rollout、无泄漏划分和 raw-to-processed 转换步骤见
+`README_V84_COMPLETE_PIPELINE.md` 的数据章节。V8.5 仅替换模型和训练目标，
+不改变这部分数据生成流程。
+
+## 10. 任务优化 JSON
+
+默认任务：
 
 ```text
 tasks/nuplan_safe_progress.json
 tasks/pointnav_safe_short.json
 ```
 
-也可以让 Qwen3-VL-8B 将新任务文本映射为固定 schema 的优化参数：
+其中包含 8 个任务指标的权重、upper limits 与 constraint penalty。正式实验应
+固定并保存相同 JSON，避免不同运行之间的任务目标发生变化。
+
+## 11. V8.5 训练
 
 ```bash
-python optimization_task_v83.py \
-  --model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --domain nuplan \
-  --task-text "Follow the mapped route, avoid collisions, and make progress." \
-  --output tasks/my_nuplan_task.json \
-  --device cuda:1 \
-  --load-4bit
-```
-
-Agent 只生成包含 8 个指标权重、upper limits、constraint penalty 和说明的
-JSON，不生成或执行 Python 求解器代码。正式实验前应人工检查 JSON，并在一次
-受控实验中固定该 JSON。
-
-## 10. 模型训练
-
-训练建议分成两个阶段。
-
-### 10.1 Stage 1：全 token warm-up
-
-先使用全部 81 个区域学习候选指标、任务决策和轨迹生成器，不启用 DGD：
-
-```bash
+cd /path/to/optimization/dcv_v74_decision_value_bottleneck
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-TRAIN_DATA=/data/v84/train \
-VAL_DATA=/data/v84/val \
-VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
-DEVICE=1 \
-BUDGET=1.0 \
-EPOCHS=10 \
-BATCH_SIZE=1 \
-WORKERS=2 \
-LOAD_4BIT=1 \
-LAMBDA_DGD=0 \
-LAMBDA_LATENT=0 \
-LAMBDA_POLICY_DISTILL=0 \
-bash run_v84.sh "$PWD" \
-  --output checkpoints/v84_warmup.pt \
-  --metrics results/v84_warmup_metrics.json
-```
-
-### 10.2 Stage 2：固定预算决策梯度蒸馏
-
-从 warm-up 权重继续，恢复目标预算并训练 selector：
-
-```bash
 TRAIN_DATA=/data/v84/train \
 VAL_DATA=/data/v84/val \
 VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
@@ -419,185 +318,175 @@ EPOCHS=30 \
 BATCH_SIZE=1 \
 WORKERS=2 \
 LOAD_4BIT=1 \
-RESUME=checkpoints/v84_warmup.pt \
-NUPLAN_TEXT="Follow the mapped route safely and make progress." \
-POINTNAV_TEXT="Reach the goal safely using the known map." \
-bash run_v84.sh "$PWD" \
-  --output checkpoints/v84_decision_flow_nd.pt \
-  --metrics results/v84_training_metrics.json
+MASK_STEPS=4 \
+MASK_STEP_SIZE=0.25 \
+TEACHER_STEP_SIZE=0.25 \
+LAMBDA_GFM=1.0 \
+LAMBDA_LATENT=0.25 \
+LAMBDA_VALUE=0.25 \
+LAMBDA_IMPROVE=0.10 \
+IMPROVE_MARGIN=0.0 \
+bash run_v85.sh "$PWD" \
+  --output checkpoints/v85_gradient_flow.pt \
+  --metrics results/v85_training_metrics.json
 ```
 
-`DEVICE=1` 对应 `cuda:1`。如果不设置 `NUPLAN_TEXT`/`POINTNAV_TEXT`，训练器
-使用每个 NPZ 中的 `task_text`。
+`DEVICE=1` 对应 `cuda:1`。可通过 `NUPLAN_TEXT` 和 `POINTNAV_TEXT` 覆盖 NPZ
+中的任务文本。
 
-默认关键参数：
+### 11.1 默认关键参数
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
 | `--region-grid` | 9 | 81 个 Qwen merge regions |
-| `--prune-layer` | 4 | 在第 4 个 early vision block 后选择 |
+| `--prune-layer` | 4 | early vision 第 4 层后选择 |
 | `--budget` | 0.15 | 视觉区域保留比例 |
-| `--flow-steps` | 8 | Flow Euler integration steps |
-| `--nd-steps` | 6 | ND unrolled refinement steps |
-| `--nd-step-size` | 0.15 | ND 更新步长 |
-| `--lambda-flow` | 1.0 | Flow Matching loss 权重 |
-| `--lambda-dgd` | 0.25 | 决策梯度蒸馏权重 |
-| `--lambda-latent` | 0.25 | Student/Teacher decision latent 对齐 |
-| `--lambda-value` | 0.25 | latent 对下游规划损失的预测监督 |
-| `--lambda-policy-distill` | 0.25 | full/student 候选决策分布蒸馏 |
-| `--lr` | 2e-4 | selector/metric head/flow 学习率 |
+| `--mask-temperature` | 0.35 | 初始 relaxed mask 温度 |
+| `--mask-steps` | 4 | Student ND 固定更新次数 |
+| `--mask-step-size` | 0.25 | 可学习步长的初始化值 |
+| `--teacher-step-size` | 0.25 | Teacher projected gradient step |
+| `--gfm-magnitude-weight` | 0.1 | `L_mag` 在 `L_gfm` 内的权重 |
+| `--gfm-step-weight` | 0.5 | `L_step` 在 `L_gfm` 内的权重 |
+| `--lambda-gfm` | 1.0 | Teacher gradient-flow matching 权重 |
+| `--lambda-latent` | 0.25 | decision latent 对齐权重 |
+| `--lambda-value` | 0.25 | set-value prediction 权重 |
+| `--lambda-improve` | 0.1 | endpoint improvement 权重 |
+| `--improve-margin` | 0.0 | 要求的最小端点改善量 |
+| `--lr` | `2e-4` | selector、metric head、mask field 学习率 |
 
-Qwen backbone 全部冻结，训练参数来自 selector、candidate metric head 和
-Flow Matching 网络。训练期使用 straight-through fixed-mass mask 保留梯度；
-验证和推理期使用真正的 hard Top-K，并在 Qwen 后续层物理删除未选视觉区域。
+### 11.2 从旧 checkpoint 初始化
 
-### 10.3 24 GB GPU 建议
+`--resume` 会加载 selector 与 candidate metric head；如果 checkpoint 中含有
+`mask_flow`，也会恢复 V8.5 动力学参数。因此可以用 V8.4 checkpoint 初始化
+共享模块，但 V8.4 的 trajectory Flow/ND 权重不会映射到 V8.5 mask field。
 
-Qwen3-VL-8B 即使冻结也会占用较多激活显存。先使用：
+## 12. 独立评估
+
+```bash
+python evaluate_gradient_flow_selector_v85.py \
+  --checkpoint checkpoints/v85_gradient_flow.pt \
+  --data /data/v84/test \
+  --nuplan-task tasks/nuplan_safe_progress.json \
+  --pointnav-task tasks/pointnav_safe_short.json \
+  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
+  --device cuda:1 \
+  --batch 1 \
+  --workers 2 \
+  --load-4bit \
+  --output results/v85_test_metrics.json
+```
+
+同一 checkpoint 比较：
+
+- `full`：保留全部视觉区域；
+- `random`：随机保留相同数量的区域；
+- `learned`：初始 mask 经固定步 Student dynamics 后执行 hard Top-K。
+
+当前输出指标包括：
+
+| 指标 | 含义 |
+|---|---|
+| `regret` | 最终离散候选选择的 normalized regret |
+| `expected_regret` | soft candidate policy 的期望任务 regret |
+| `metric_mae` | 有效候选的指标预测误差 |
+| `mask_change` | ND 终态与初始 relaxed mask 的平均变化 |
+| `tokens` | 实际保留区域数量 |
+| `token_ratio` | 实际区域保留比例 |
+
+训练日志还记录 `direction`、`magnitude`、`step`、`improve`、`task_gain` 和
+`teacher_direction_norm`，用于判断 Teacher signal 是否可靠以及固定步动力学是否
+真正改善任务。
+
+## 13. 建议的核心实验
+
+### 13.1 准确性—效率 trade-off
 
 ```text
-LOAD_4BIT=1, BATCH_SIZE=1, WORKERS=2
+budget in {0.05, 0.10, 0.15, 0.20, 1.0}
 ```
 
-如果仍然 OOM，可先做功能验证：
+每个预算同时报告 regret、retained tokens、wall-clock latency、peak GPU memory
+和可选 FLOPs。主要比较 learned Top-K、equal-budget random 与 full-token upper
+reference。
 
-```bash
-TRAIN_DATA=/data/v84/train VAL_DATA=/data/v84/val \
-LOAD_4BIT=1 BATCH_SIZE=1 \
-bash run_v84.sh "$PWD" --flow-steps 4 --nd-steps 2
-```
-
-然后再逐步恢复论文实验默认的 `flow_steps=8`、`nd_steps=6`。不要通过减小
-`budget` 来解决 early ViT 的全部显存问题，因为 selector 之前的层仍需处理
-完整图像；更小 budget 主要减少 pruning layer 之后的计算。
-
-## 11. 验证结果
-
-```bash
-python evaluate_decision_flow_nd_v84.py \
-  --data /data/v84/test \
-  --checkpoint checkpoints/v84_decision_flow_nd.pt \
-  --nuplan-task tasks/nuplan_safe_progress.json \
-  --pointnav-task tasks/pointnav_safe_short.json \
-  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --device cuda:1 \
-  --load-4bit \
-  --budget 0.15 \
-  --output results/v84_test_metrics.json
-```
-
-同一 checkpoint 会比较：
-
-- `full`：保留全部 81 个区域；
-- `random`：随机保留相同 K 个区域；
-- `learned`：selector Top-K。
-
-输出指标包括：candidate regret、expert trajectory error、ND energy、collision
-rate、goal error、每场景 candidate count、expert fallback rate、retained regions
-和 token ratio。正式实验中 `expert_fallback_rate` 应为 0。论文实验还应额外记录
-wall-clock
-latency、peak GPU memory、Qwen FLOPs、Flow 时间、ND 时间以及 benchmark 官方
-指标。
-
-## 12. 单样本推理
-
-```bash
-python infer_decision_flow_nd_v84.py \
-  --data /data/v84/test \
-  --index 0 \
-  --checkpoint checkpoints/v84_decision_flow_nd.pt \
-  --nuplan-task tasks/nuplan_safe_progress.json \
-  --pointnav-task tasks/pointnav_safe_short.json \
-  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --device cuda:1 \
-  --load-4bit \
-  --budget 0.15 \
-  --output results/v84_prediction.npz
-```
-
-输出 NPZ 包含：
-
-- `selected_region_indices` 和 `token_logits`；
-- `predicted_candidate_metrics`、costs 和最终 candidate index；
-- candidate warm start；
-- Flow trajectory；
-- ND-refined final trajectory。
-
-## 13. 消融实验
-
-建议至少报告以下组合：
+### 13.2 损失消融
 
 | 实验 | 设置 |
 |---|---|
-| Full-token upper reference | `budget=1.0` |
-| Equal-budget random | evaluator 自动提供 `random` |
-| Learned selector | `budget=0.15` |
-| w/o DGD | `--lambda-dgd 0` |
-| w/o Flow Matching | `--flow-steps 0 --lambda-flow 0` |
-| w/o ND refinement | `--nd-steps 0` |
-| 不同预算 | `budget∈{0.05,0.10,0.15,0.20,1.0}` |
+| w/o Teacher gradient matching | `--lambda-gfm 0` |
+| direction only | `--gfm-magnitude-weight 0 --gfm-step-weight 0` |
+| w/o endpoint improvement | `--lambda-improve 0` |
+| w/o latent alignment | `--lambda-latent 0` |
+| w/o set-value prediction | `--lambda-value 0` |
+| positive improvement margin | `--improve-margin 0.01` 等 |
 
-应优先验证 learned K-token 是否同时优于 random K-token，并接近 full-token；
-随后再分析 Flow 和 ND 对任务误差、碰撞、速度和稳定性的贡献。
+### 13.3 动力学消融
+
+比较 `mask_steps in {1,2,4,8}`，报告性能、延迟和 `task_gain`。V8.5 关注的是
+固定计算预算下是否获得更好的信息选择，而不是证明所有中间步骤单调下降。
+
+### 13.4 与 V8.4 的结构对比
+
+- V8.4：candidate warm start → trajectory Flow → trajectory ND；
+- V8.5：Teacher gradient supervision → one mask field → fixed-step mask ND。
+
+该实验用于验证收益来自 decision-driven information dynamics，而不是额外串联
+一个轨迹生成/修正网络。
 
 ## 14. 测试
 
-不加载 Qwen 权重的数据与求解器测试：
+不加载 Qwen 权重的 V8.5 检查：
 
 ```bash
-python -m unittest -v test_v83_optimization.py test_v84_data.py
-python -m py_compile *_v84.py
-bash -n download_planning_data_v84.sh run_v84.sh
+python -m py_compile \
+  gradient_flow_selector_v85.py \
+  train_gradient_flow_selector_v85.py \
+  evaluate_gradient_flow_selector_v85.py \
+  test_v85_gradient_flow.py
+
+bash -n run_v85.sh
+pytest -q test_v85_gradient_flow.py
 ```
 
-当前测试覆盖：
+单元测试覆盖：
 
-- MILP task schema 与最优候选选择；
-- raw record 写入和读取；
-- log/scene 无泄漏划分；
-- 8–32 条自适应候选、padding mask 与 8 个 metric target；
-- 独立 expert trajectory 及 reference fallback 标记；
-- SDF 正负距离；
-- raw-to-processed 目录转换。
+- capped-simplex 投影的预算、上下界和无效区域；
+- mask ND 每一步后的可行性；
+- `L_improve` 对初始 baseline 的梯度阻断。
 
-## 15. 常见问题
+## 15. 24 GB GPU 建议
 
-### `ModuleNotFoundError`
+Qwen3-VL-8B 即使冻结也会占用较多激活显存，建议从以下配置开始：
 
-请进入代码目录再运行，或加入 `PYTHONPATH`：
-
-```bash
-cd /path/to/optimization/dcv_v74_decision_value_bottleneck
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+```text
+LOAD_4BIT=1
+BATCH_SIZE=1
+WORKERS=2
+MASK_STEPS=4
 ```
 
-### `CUDA out of memory`
+如果仍然 OOM：
 
-首先设置 `LOAD_4BIT=1`、`BATCH_SIZE=1` 和
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。确认 GPU 上没有其他进程，
-再临时减小 `flow_steps` 与 `nd_steps`。
+1. 确认同一 GPU 上没有其他进程；
+2. 设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；
+3. 用较少 `MASK_STEPS` 做 smoke test；
+4. 再考虑 activation checkpointing 或把不同 Teacher forward 分阶段计算。
 
-### 数据中没有 `task_text`
-
-V8.4 raw schema 要求写入 `task_text`。训练时也可以通过 `NUPLAN_TEXT` 和
-`POINTNAV_TEXT` 覆盖数据中的文本，但这不会替代 `source_id` 对应的优化 JSON。
-
-### 下载脚本执行后为什么没有训练 NPZ
-
-下载脚本只获取公开代码、episode 和可自动下载的资源。nuPlan/Gibson 授权数据、
-simulator rollout、地图 rasterization 和 raw NPZ 导出仍需在各自环境中完成。
+减小 `budget` 主要减少 pruning layer 之后的计算，无法消除 early ViT 处理完整
+图像时的显存开销。
 
 ## 16. 当前实现边界
 
-- 当前 warm-start teacher 在每个场景的 8–32 条自适应候选上比较成本；它不是
-  任意规模的 edge-flow 全局规划器。最终 Flow/ND 轨迹由独立专家轨迹监督，
-  不再被有限候选集合锁死。
-- `candidate_valid` 区分真实候选和 padding；碰撞、动态障碍与不可通行仍通过
-  任务指标和软约束处理。
-- 当前验证器提供统一离线指标；正式论文还需接入 nuPlan closed-loop 与 Habitat
-  PointNav 官方指标。
-- 浏览器上传到 GitHub 的 `.sh` 可能没有 executable bit，可直接使用
-  `bash script_name.sh ...`，或 clone 后执行 `chmod +x *.sh`。
+- Teacher 是训练期由下游任务损失反向得到的 projected mask-gradient oracle，
+  不是额外训练的独立大模型。
+- 当前候选规划仍在每个场景的 8–32 条自适应候选上进行，不是任意规模的
+  edge-flow 全局规划器。
+- V8.5 当前重点是 token selection 的准确性—效率 trade-off；尚未把同一框架
+  扩展到通信资源、传感器频率或多机器人带宽分配。
+- 当前 evaluator 提供统一离线指标；正式论文还需接入 nuPlan closed-loop、
+  Habitat PointNav 官方指标以及硬件延迟统计。
+- `L_improve` 保证的是训练目标中的端点 hinge 约束，不等价于对任意未见样本的
+  数学下降保证。
 
 ## 17. 版本说明
 
@@ -606,5 +495,10 @@ simulator rollout、地图 rasterization 和 raw NPZ 导出仍需在各自环境
 - V7.8–V7.9：Qwen3-VL-8B ViT 内 token pruning；
 - V8.1：第一视角 RGB 数据模式；
 - V8.2：已知地图与连续候选规划；
-- V8.3：语言任务到优化 JSON 与确定性求解器；
-- **V8.4-r2：动态候选 + 全信息 DGD + decision latent 蒸馏 + Flow + ND。**
+- V8.3：任务文本到优化 JSON 与确定性求解器；
+- V8.4-r2：动态候选、full-information DGD、trajectory Flow + ND；
+- **V8.5：Teacher projected gradient matching、统一 mask flow/ND、端点
+  `L_improve`。**
+
+V8.5 的详细数学说明见
+[`dcv_v74_decision_value_bottleneck/README_V85_GRADIENT_FLOW.md`](dcv_v74_decision_value_bottleneck/README_V85_GRADIENT_FLOW.md)。
