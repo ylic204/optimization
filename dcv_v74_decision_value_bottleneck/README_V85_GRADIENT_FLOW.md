@@ -11,6 +11,12 @@ matching and neurodynamics now refer to the same visual-mask vector field:
 
 V8.4 remains in the repository as the reproducible serial baseline.
 
+On the `v85-bev-input` branch, every visual region comes from a fixed-metric
+ego-centric BEV rather than a first-person camera frame.  This changes the
+observation representation, not the relationship between Flow Matching and
+neurodynamics described below.  See `README_V85_BEV_INPUT.md` for the nuPlan
+export and schema contract.
+
 ## State and Teacher direction
 
 Let `w in [0, 1]^R` be the relaxed visual-region mask, with a fixed token
@@ -86,6 +92,7 @@ backward pass still reaches the relaxed ND state.
   direction matching, `L_improve`, training, and validation.
 - `evaluate_gradient_flow_selector_v85.py`: standalone full/random/learned
   comparison for a saved checkpoint.
+- `planning_dataset_bev_v85.py`: BEV-only dataset and metric-geometry checks.
 - `run_v85.sh`: environment-variable-driven training launcher.
 - `test_v85_gradient_flow.py`: projection, rollout, and detached-baseline
   unit tests.
@@ -93,8 +100,8 @@ backward pass still reaches the relaxed ND state.
 ## Training
 
 ```bash
-TRAIN_DATA=/path/to/train.jsonl \
-VAL_DATA=/path/to/val.jsonl \
+TRAIN_DATA=/data/v85_bev/processed/train \
+VAL_DATA=/data/v85_bev/processed/val \
 VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct \
 bash run_v85.sh /path/to/dcv_v74_decision_value_bottleneck
 ```
@@ -114,8 +121,8 @@ IMPROVE_MARGIN=0.0
 
 ```bash
 python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_gradient_flow.pt \
-  --data /path/to/test.jsonl \
+  --checkpoint checkpoints/v85_bev_gradient_flow.pt \
+  --data /data/v85_bev/processed/test \
   --nuplan-task tasks/nuplan_safe_progress.json \
   --pointnav-task tasks/pointnav_safe_short.json
 ```

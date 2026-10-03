@@ -11,6 +11,9 @@ fi
 if [[ -n "${RESUME:-}" ]]; then
   EXTRA_ARGS+=(--resume "$RESUME")
 fi
+if [[ "${ALLOW_CROSS_VIEW_RESUME:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--allow-cross-view-resume)
+fi
 
 python "$ROOT/train_gradient_flow_selector_v85.py" \
   --data "${TRAIN_DATA:?set TRAIN_DATA}" \

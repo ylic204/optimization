@@ -15,7 +15,6 @@ from mapped_vlm_optimizer_v83 import CandidateMetricHead
 from qwen3vl_selector_v79 import (
     DecisionRelatedQwenSelector,
     FrozenQwen3VLPrunableBackbone,
-    normalized_region_positions,
     topk_region_indices,
 )
 
@@ -68,6 +67,30 @@ def fixed_mass_mask(logits, valid, mass, temperature=0.35):
 def hard_topk_mask(scores, valid, k):
     indices = topk_region_indices(scores, valid, int(k))
     return torch.zeros_like(scores).scatter(1, indices, 1.0)
+
+
+def normalized_bev_region_positions(region_world_bounds, reference):
+    """Return region centers as normalized x-forward/y-left coordinates."""
+    bounds = torch.as_tensor(
+        region_world_bounds,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    if bounds.ndim != 3 or bounds.shape[-1] != 4:
+        raise ValueError("region_world_bounds must have shape [B,R,4]")
+    if bounds.shape[:2] != reference.shape[:2]:
+        raise ValueError("BEV bounds and visual-region sequence do not align")
+    centers = torch.stack(
+        [
+            0.5 * (bounds[..., 0] + bounds[..., 1]),
+            0.5 * (bounds[..., 2] + bounds[..., 3]),
+        ],
+        dim=-1,
+    )
+    minimum = bounds[..., [0, 2]].amin(dim=1)
+    maximum = bounds[..., [1, 3]].amax(dim=1)
+    scale = (maximum - minimum).clamp_min(1e-6)
+    return 2.0 * (centers - minimum[:, None]) / scale[:, None] - 1.0
 
 
 def endpoint_improvement_loss(initial_values, final_values, margin=0.0):
@@ -186,13 +209,13 @@ class GradientFlowSelectorV85(nn.Module):
         self.metric_head = metric_head
         self.mask_flow = mask_flow
 
-    def encode_and_select(self, images, texts, budget):
+    def encode_and_select(self, images, texts, budget, region_world_bounds):
         encoded = self.backbone.encode_inputs(images, texts)
         visual = encoded["region_visual_tokens"]
         batch, regions, _ = visual.shape
         valid = torch.ones(batch, regions, dtype=torch.bool, device=visual.device)
-        positions = normalized_region_positions(
-            batch, regions, visual.device, visual.dtype
+        positions = normalized_bev_region_positions(
+            region_world_bounds, visual
         )
         selection = self.selector(
             visual_tokens=visual,

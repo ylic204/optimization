@@ -1,4 +1,4 @@
-"""Train V8.5 reliable gradient-flow distillation for visual-token selection."""
+"""Train V8.5 BEV-only gradient-flow distillation for token selection."""
 
 import argparse
 import json
@@ -19,7 +19,8 @@ from gradient_flow_selector_v85 import (
     project_capped_simplex,
 )
 from optimization_spec_v83 import METRIC_NAMES, OptimizationTask
-from planning_dataset_v84 import PlanningDatasetV84
+from planning_dataset_bev_v85 import PlanningDatasetBEVV85
+from raw_record_bev_v85 import INPUT_MODE
 
 
 def move_batch(batch, device):
@@ -204,6 +205,7 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
             batch["image"],
             task_texts(raw, batch["source_id"], args),
             budget,
+            batch["region_world_bounds"],
         )
         region_count = selection["logits"].shape[-1]
         k = max(1, min(region_count, round(args.budget * region_count)))
@@ -454,6 +456,7 @@ def validate(model, loader, args, device, tasks):
             batch["image"],
             task_texts(raw, batch["source_id"], args),
             budget,
+            batch["region_world_bounds"],
         )
         for mode in logs:
             result = evaluate_mode(
@@ -511,9 +514,17 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--output", default="checkpoints/v85_gradient_flow.pt")
-    parser.add_argument("--metrics", default="results/v85_metrics.json")
+    parser.add_argument("--output", default="checkpoints/v85_bev_gradient_flow.pt")
+    parser.add_argument("--metrics", default="results/v85_bev_metrics.json")
     parser.add_argument("--resume", default="")
+    parser.add_argument(
+        "--allow-cross-view-resume",
+        action="store_true",
+        help=(
+            "explicitly allow initialization from a checkpoint that was not "
+            "trained with the V8.5 ego-centric BEV input"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234)
     return parser.parse_args()
 
@@ -545,14 +556,18 @@ def main():
         OptimizationTask.load(args.pointnav_task),
     ]
     image_side = args.region_grid * 32
+    train_dataset = PlanningDatasetBEVV85(args.data, image_side)
+    val_dataset = PlanningDatasetBEVV85(args.val, image_side)
+    if train_dataset.bev_config_json != val_dataset.bev_config_json:
+        raise ValueError("training and validation BEV geometry must be identical")
     train_loader = DataLoader(
-        PlanningDatasetV84(args.data, image_side),
+        train_dataset,
         args.batch,
         shuffle=True,
         num_workers=args.workers,
     )
     val_loader = DataLoader(
-        PlanningDatasetV84(args.val, image_side),
+        val_dataset,
         args.batch,
         shuffle=False,
         num_workers=args.workers,
@@ -560,6 +575,13 @@ def main():
     model = build_v85_model(args, device)
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint_mode = checkpoint.get("input_mode", "legacy_first_person_rgb")
+        if checkpoint_mode != INPUT_MODE and not args.allow_cross_view_resume:
+            raise ValueError(
+                f"checkpoint input_mode={checkpoint_mode!r}; pass "
+                "--allow-cross-view-resume to explicitly initialize BEV "
+                "training from cross-view weights"
+            )
         model.selector.load_state_dict(checkpoint["selector"])
         model.metric_head.load_state_dict(checkpoint["metric_head"])
         if "mask_flow" in checkpoint:
@@ -593,6 +615,8 @@ def main():
             torch.save(
                 {
                     "args": vars(args),
+                    "input_mode": INPUT_MODE,
+                    "bev_config_json": train_dataset.bev_config_json,
                     "selector": model.selector.state_dict(),
                     "metric_head": model.metric_head.state_dict(),
                     "mask_flow": model.mask_flow.state_dict(),

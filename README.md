@@ -1,8 +1,9 @@
 # Decision-Related Visual Token Selection for VLM Planning
 
 本仓库研究面向机器人导航与路径规划的视觉 token 压缩：在固定视觉预算下，
-让 Qwen3-VL-8B 只保留对最终优化决策有用的图像区域，并用任务损失的梯度知识
-训练一个可在固定步数内执行的视觉 mask 动力系统。
+让 Qwen3-VL-8B 只保留对最终优化决策有用的 BEV 区域，并用任务损失的梯度知识
+训练一个可在固定步数内执行的视觉 mask 动力系统。本分支的 V8.5 输入已经从
+第一视角相机改为固定物理尺度的 ego-centric BEV。
 
 当前主线版本是 **V8.5：Teacher-Gradient Flow Matching + Fixed-Step
 Neurodynamics + Endpoint Improvement**。V8.5 的核心变化是：
@@ -12,17 +13,19 @@ Neurodynamics + Endpoint Improvement**。V8.5 的核心变化是：
 - ND 直接执行该向量场，不再使用 V8.4 的 `trajectory Flow -> ND refiner`
   串联结构；
 - 使用端点损失 `L_improve`，约束固定步更新后的任务损失优于初始状态；
+- nuPlan 输入不再读取 camera frame，而是地图、路线、信号灯、actors 与 2 秒历史
+  组成的单帧 ego-centric BEV；
 - V8.4 及更早版本继续保留，用于复现和消融。
 
-V8.5 复用 V8.4 的 nuPlan/PointNav 数据协议、候选轨迹、任务指标和优化 JSON，
-无需重新设计数据格式。
+V8.5 BEV 使用 schema 85；候选轨迹、任务指标、SDF 和优化 JSON 继续复用 V8.4
+规划组件，但不接受旧的第一视角 processed NPZ。
 
 ## 1. V8.5 方法概览
 
 ```text
 任务文本 ────────────────> task context c
                               │
-第一视角 RGB ─> Qwen early ViT ─> R 个完整视觉区域 z
+ego-centric BEV ─> Qwen early ViT ─> R 个完整视觉区域 z
                               │
                               ▼
                  Decision Token Selector
@@ -53,7 +56,11 @@ V8.5 复用 V8.4 的 nuPlan/PointNav 数据协议、候选轨迹、任务指标�
 ### 1.1 关键边界
 
 - Student **不输入 `graph_feat`、SDF 或 teacher candidate metrics**。
-- Qwen3-VL 的视觉输入是真实第一视角 RGB，语言输入是真实任务文本。
+- Qwen3-VL 的视觉输入是固定尺度的真实 ego-centric BEV，语言输入是真实任务文本。
+- 默认 BEV 为 `288×288`，`x∈[-16,64]m`、`y∈[-40,40]m`；每个样本禁止
+  自适应缩放。
+- 当前/历史场景要素可以绘入 BEV；未来 ego trajectory 仅作为监督保存，禁止
+  绘入视觉输入。
 - known-map 候选轨迹只进入独立的候选规划分支，不伪装成视觉 token。
 - Teacher 在训练时使用完整 early-vision regions 和真实候选指标构造任务监督。
 - Student 部署时只保留预算内的 hard Top-K regions。
@@ -207,16 +214,20 @@ per-step `L_prog`。
 | `run_v85.sh` | V8.5 训练启动脚本 |
 | `test_v85_gradient_flow.py` | 投影、rollout 和 detached baseline 测试 |
 | `README_V85_GRADIENT_FLOW.md` | V8.5 数学与实现补充说明 |
+| `bev_renderer_v85.py` | 固定物理尺度 BEV renderer 与区域坐标映射 |
+| `export_nuplan_bev_v85.py` | 无 camera 的 nuPlan DB 到 raw BEV 导出器 |
+| `raw_record_bev_v85.py` | camera-free schema 85 raw record |
+| `planning_data_bev_v85.py` | BEV raw record 到候选规划样本 |
+| `planning_dataset_bev_v85.py` | BEV-only PyTorch dataset 与尺度校验 |
+| `test_v85_bev.py` | BEV 几何、语义层和无 camera schema 测试 |
+| `README_V85_BEV_INPUT.md` | nuPlan BEV 数据处理完整说明 |
 
-### 7.2 复用的数据与规划组件
+### 7.2 复用的规划组件
 
 | 文件 | 功能 |
 |---|---|
-| `raw_record_v84.py` | nuPlan/Habitat 共用 raw record |
 | `split_planning_data_v84.py` | 按完整 log/scene 划分 train/val/test |
 | `planning_data_v84.py` | 候选轨迹、8 个指标与 SDF 构造 |
-| `process_planning_data_v84.py` | raw NPZ 转换入口 |
-| `planning_dataset_v84.py` | V8.5 复用的 PyTorch dataset |
 | `optimization_task_v83.py` | 任务文本到优化 JSON |
 | `candidate_milp_solver_v83.py` | 有限候选 MILP teacher/audit solver |
 | `qwen3vl_selector_v79.py` | 支持 ViT 内物理 token pruning 的 Qwen backbone |
@@ -253,12 +264,13 @@ Qwen3-VL-8B 权重建议存放在数据盘：
 
 代码默认 `local_files_only=True`，训练时不会自动下载模型权重。
 
-## 9. 数据协议
+## 9. BEV 数据协议
 
-V8.5 直接使用 V8.4 processed NPZ。推荐目录为：
+V8.5 只读取 `input_mode=ego_centric_bev_v85` 的 schema 85 processed NPZ。
+推荐目录为：
 
 ```text
-/data/v84/
+/data/v85_bev/processed/
 ├── train/
 │   ├── nuplan/*.npz
 │   └── pointnav/*.npz
@@ -274,7 +286,10 @@ V8.5 直接使用 V8.4 processed NPZ。推荐目录为：
 
 | 字段 | 形状 | 含义 |
 |---|---|---|
-| `image` | `[H,W,3]` | 第一视角 RGB |
+| `bev_rgb` | `[288,288,3]` | ego-centric BEV，唯一视觉输入 |
+| `bev_semantic` | `[15,288,288]` | audit-only 语义层，不输入 Student |
+| `bev_config_json` | string | 固定范围、分辨率、grid 与 history 配置 |
+| `region_world_bounds` | `[81,4]` | 每个视觉区域的物理边界 |
 | `candidate_trajectories` | `[32,16,3]` | 8–32 条真实候选，padding 到 32 |
 | `candidate_features` | `[32,8]` | 部署时可获得的候选几何特征 |
 | `candidate_metrics` | `[32,8]` | 仅用于训练监督的真实指标 |
@@ -287,9 +302,10 @@ V8.5 直接使用 V8.4 processed NPZ。推荐目录为：
 8 个 lower-is-better 指标为：`collision`、`non_traversable`、`safety_risk`、
 `route_deviation`、`lack_of_progress`、`path_length`、`discomfort`、`goal_error`。
 
-完整的下载、simulator rollout、无泄漏划分和 raw-to-processed 转换步骤见
-`README_V84_COMPLETE_PIPELINE.md` 的数据章节。V8.5 仅替换模型和训练目标，
-不改变这部分数据生成流程。
+nuPlan 导出阶段以 `include_cameras=False` 构造 scenario。完整导出、raw-to-processed
+命令、字段定义与 leakage boundary 见
+[`README_V85_BEV_INPUT.md`](dcv_v74_decision_value_bottleneck/README_V85_BEV_INPUT.md)。
+train/val/test 必须继续按完整 log 划分，不能随机拆散同一 log 的帧。
 
 ## 10. 任务优化 JSON
 
@@ -309,8 +325,8 @@ tasks/pointnav_safe_short.json
 cd /path/to/optimization/dcv_v74_decision_value_bottleneck
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-TRAIN_DATA=/data/v84/train \
-VAL_DATA=/data/v84/val \
+TRAIN_DATA=/data/v85_bev/processed/train \
+VAL_DATA=/data/v85_bev/processed/val \
 VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
 DEVICE=1 \
 BUDGET=0.15 \
@@ -327,8 +343,8 @@ LAMBDA_VALUE=0.25 \
 LAMBDA_IMPROVE=0.10 \
 IMPROVE_MARGIN=0.0 \
 bash run_v85.sh "$PWD" \
-  --output checkpoints/v85_gradient_flow.pt \
-  --metrics results/v85_training_metrics.json
+  --output checkpoints/v85_bev_gradient_flow.pt \
+  --metrics results/v85_bev_training_metrics.json
 ```
 
 `DEVICE=1` 对应 `cuda:1`。可通过 `NUPLAN_TEXT` 和 `POINTNAV_TEXT` 覆盖 NPZ
@@ -356,16 +372,16 @@ bash run_v85.sh "$PWD" \
 
 ### 11.2 从旧 checkpoint 初始化
 
-`--resume` 会加载 selector 与 candidate metric head；如果 checkpoint 中含有
-`mask_flow`，也会恢复 V8.5 动力学参数。因此可以用 V8.4 checkpoint 初始化
-共享模块，但 V8.4 的 trajectory Flow/ND 权重不会映射到 V8.5 mask field。
+checkpoint 会记录 `input_mode` 与精确的 `bev_config_json`。默认只允许恢复相同
+BEV geometry 的 checkpoint。若必须从旧第一视角权重初始化，需要显式设置
+`ALLOW_CROSS_VIEW_RESUME=1`；这只是权重迁移，不代表两个输入分布等价。
 
 ## 12. 独立评估
 
 ```bash
 python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_gradient_flow.pt \
-  --data /data/v84/test \
+  --checkpoint checkpoints/v85_bev_gradient_flow.pt \
+  --data /data/v85_bev/processed/test \
   --nuplan-task tasks/nuplan_safe_progress.json \
   --pointnav-task tasks/pointnav_safe_short.json \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
@@ -373,7 +389,7 @@ python evaluate_gradient_flow_selector_v85.py \
   --batch 1 \
   --workers 2 \
   --load-4bit \
-  --output results/v85_test_metrics.json
+  --output results/v85_bev_test_metrics.json
 ```
 
 同一 checkpoint 比较：
@@ -439,12 +455,18 @@ reference。
 
 ```bash
 python -m py_compile \
+  bev_renderer_v85.py \
+  raw_record_bev_v85.py \
+  planning_data_bev_v85.py \
+  planning_dataset_bev_v85.py \
+  export_nuplan_bev_v85.py \
   gradient_flow_selector_v85.py \
   train_gradient_flow_selector_v85.py \
   evaluate_gradient_flow_selector_v85.py \
   test_v85_gradient_flow.py
 
 bash -n run_v85.sh
+python -m unittest test_v85_bev.py -v
 pytest -q test_v85_gradient_flow.py
 ```
 
@@ -453,6 +475,8 @@ pytest -q test_v85_gradient_flow.py
 - capped-simplex 投影的预算、上下界和无效区域；
 - mask ND 每一步后的可行性；
 - `L_improve` 对初始 baseline 的梯度阻断。
+- BEV metric-pixel 往返映射、81 个区域的世界坐标边界；
+- semantic raster、dynamic obstacle 与 camera-free raw schema。
 
 ## 15. 24 GB GPU 建议
 
@@ -473,7 +497,7 @@ MASK_STEPS=4
 4. 再考虑 activation checkpointing 或把不同 Teacher forward 分阶段计算。
 
 减小 `budget` 主要减少 pruning layer 之后的计算，无法消除 early ViT 处理完整
-图像时的显存开销。
+BEV raster 时的显存开销。
 
 ## 16. 当前实现边界
 
@@ -497,8 +521,10 @@ MASK_STEPS=4
 - V8.2：已知地图与连续候选规划；
 - V8.3：任务文本到优化 JSON 与确定性求解器；
 - V8.4-r2：动态候选、full-information DGD、trajectory Flow + ND；
-- **V8.5：Teacher projected gradient matching、统一 mask flow/ND、端点
-  `L_improve`。**
+- **V8.5 BEV：Teacher projected gradient matching、统一 mask flow/ND、端点
+  `L_improve`，输入改为 camera-free ego-centric BEV。**
 
 V8.5 的详细数学说明见
-[`dcv_v74_decision_value_bottleneck/README_V85_GRADIENT_FLOW.md`](dcv_v74_decision_value_bottleneck/README_V85_GRADIENT_FLOW.md)。
+[`README_V85_GRADIENT_FLOW.md`](dcv_v74_decision_value_bottleneck/README_V85_GRADIENT_FLOW.md)，
+nuPlan BEV 数据流程见
+[`README_V85_BEV_INPUT.md`](dcv_v74_decision_value_bottleneck/README_V85_BEV_INPUT.md)。

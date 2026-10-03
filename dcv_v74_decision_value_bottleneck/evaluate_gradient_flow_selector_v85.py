@@ -1,4 +1,4 @@
-"""Evaluate a V8.5 checkpoint with full, random, and learned token masks."""
+"""Evaluate a V8.5 BEV checkpoint with full/random/learned token masks."""
 
 import argparse
 import json
@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader
 
 from gradient_flow_selector_v85 import build_v85_model
 from optimization_spec_v83 import OptimizationTask
-from planning_dataset_v84 import PlanningDatasetV84
+from planning_dataset_bev_v85 import PlanningDatasetBEVV85
+from raw_record_bev_v85 import INPUT_MODE
 from train_gradient_flow_selector_v85 import validate
 
 
@@ -24,7 +25,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--output", default="results/v85_evaluation.json")
+    parser.add_argument("--output", default="results/v85_bev_evaluation.json")
     parser.add_argument("--load-4bit", action="store_true")
     return parser.parse_args()
 
@@ -34,6 +35,11 @@ def main():
     checkpoint = torch.load(cli.checkpoint, map_location="cpu")
     if "args" not in checkpoint:
         raise ValueError("checkpoint does not contain its V8.5 architecture args")
+    if checkpoint.get("input_mode") != INPUT_MODE:
+        raise ValueError(
+            f"checkpoint is not tagged with input_mode={INPUT_MODE!r}; "
+            "cross-view evaluation is not valid"
+        )
 
     saved = dict(checkpoint["args"])
     saved.update(
@@ -64,8 +70,11 @@ def main():
         OptimizationTask.load(cli.pointnav_task),
     ]
     image_side = args.region_grid * 32
+    dataset = PlanningDatasetBEVV85(cli.data, image_side)
+    if checkpoint.get("bev_config_json") != dataset.bev_config_json:
+        raise ValueError("checkpoint and evaluation data use different BEV geometry")
     loader = DataLoader(
-        PlanningDatasetV84(cli.data, image_side),
+        dataset,
         cli.batch,
         shuffle=False,
         num_workers=cli.workers,

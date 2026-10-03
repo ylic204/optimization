@@ -3,6 +3,7 @@ import torch
 from gradient_flow_selector_v85 import (
     MaskGradientFlowND,
     endpoint_improvement_loss,
+    normalized_bev_region_positions,
     project_capped_simplex,
 )
 
@@ -64,3 +65,22 @@ def test_invalid_tokens_do_not_set_projection_bounds():
     projected = project_capped_simplex(values, valid, mass=1.0)
     assert torch.allclose(projected.sum(-1), torch.tensor([1.0]), atol=1e-5)
     assert projected[0, 2] == 0.0
+
+
+def test_bev_positions_are_x_forward_y_left():
+    bounds = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 1.0, -1.0, 0.0],
+                [-1.0, 0.0, 0.0, 1.0],
+                [-1.0, 0.0, -1.0, 0.0],
+            ]
+        ]
+    )
+    visual = torch.zeros(1, 4, 8)
+    positions = normalized_bev_region_positions(bounds, visual)
+    expected = torch.tensor(
+        [[[0.5, 0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, -0.5]]]
+    )
+    assert torch.allclose(positions, expected)
