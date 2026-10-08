@@ -1,8 +1,9 @@
-"""Train V8.5 BEV-only gradient-flow distillation for token selection."""
+"""V8.5 BEV: metric pretraining -> gradient distillation -> outcome RL."""
 
 import argparse
 import json
 import random
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -15,12 +16,16 @@ from gradient_flow_selector_v85 import (
     build_v85_model,
     endpoint_improvement_loss,
     fixed_mass_mask,
-    hard_topk_mask,
     project_capped_simplex,
 )
 from optimization_spec_v83 import METRIC_NAMES, OptimizationTask
 from planning_dataset_bev_v85 import PlanningDatasetBEVV85
 from raw_record_bev_v85 import INPUT_MODE
+from bev_geometry_v85 import SCHEMA_REVISION
+from rl_posttraining_v85 import (
+    decision_outcomes, policy_gradient_loss, sample_region_action,
+)
+from checkpoint_contract_v85 import validate_checkpoint_contract
 
 
 def move_batch(batch, device):
@@ -114,6 +119,11 @@ def planning_from_mask(model, encoded, mask, batch, task_data, temperature):
     return planning_from_fused(model, fused, batch, *task_data, temperature)
 
 
+def planning_from_topk(model, encoded, scores, valid, k, batch, task_data, temperature, straight_through=False):
+    fused, _ = model.fuse_topk(encoded, scores, valid, k, straight_through=straight_through)
+    return planning_from_fused(model, fused, batch, *task_data, temperature)
+
+
 def teacher_descent_target(
     model,
     encoded,
@@ -124,7 +134,7 @@ def teacher_descent_target(
     task_data,
     args,
 ):
-    """Full-information projected task-loss descent at one mask state."""
+    """Projected mask gradient through a fixed metric head, not an independent VLM."""
     teacher_state = state.detach().requires_grad_(True)
     teacher = planning_from_mask(
         model,
@@ -184,9 +194,132 @@ def gradient_flow_loss(
     return total, direction, magnitude, step, teacher_norm.mean()
 
 
+def selection_rollout(model, selection, positions, valid, args):
+    regions = selection["logits"].shape[-1]
+    k = max(1, min(regions, round(args.budget * regions)))
+    mass = selection["logits"].new_full((selection["logits"].shape[0],), float(k))
+    initial = fixed_mass_mask(selection["logits"], valid, mass, args.mask_temperature)
+    _, states, velocities = model.mask_flow.rollout(
+        initial, selection["z"], selection["task_context"], positions, valid, mass
+    )
+    scores = model.mask_flow.decision_scores(states, velocities, selection["logits"])
+    return initial, scores, k
+
+
+def train_metric_epoch(model, loader, optimizer, args, device, tasks):
+    """Warm up the planner on full and random physically pruned observations."""
+    model.selector.eval()
+    model.mask_flow.eval()
+    model.metric_head.train()
+    logs = {key: [] for key in ("loss", "metric", "task")}
+    for raw in tqdm(loader, desc="V8.5 metric pretraining"):
+        batch = move_batch(raw, device)
+        task_data = task_parameters(batch["source_id"], tasks, device)
+        with torch.no_grad():
+            encoded = model.backbone.encode_inputs(
+                batch["image"], task_texts(raw, batch["source_id"], args)
+            )
+            visual = encoded["region_visual_tokens"]
+            valid = torch.ones(visual.shape[:2], device=device, dtype=torch.bool)
+            regions = visual.shape[1]
+            k = max(1, min(regions, round(args.budget * regions)))
+        metric_losses, task_losses = [], []
+        # Backpropagate each frozen-Qwen outcome separately to bound memory.
+        optimizer.zero_grad(set_to_none=True)
+        for retained in (regions, k):
+            with torch.no_grad():
+                fused, _ = model.fuse_topk(encoded, torch.rand_like(valid.float()), valid, retained)
+            result = planning_from_fused(model, fused, batch, *task_data, args.decision_temperature)
+            metric = F.smooth_l1_loss(
+                result["predicted_metrics"][batch["candidate_valid"]],
+                batch["candidate_metrics"][batch["candidate_valid"]],
+            )
+            task = result["task_values"].mean()
+            loss = (args.lambda_metric * metric + task) / 2.0
+            loss.backward()
+            metric_losses.append(float(metric.detach()))
+            task_losses.append(float(task.detach()))
+        torch.nn.utils.clip_grad_norm_(model.metric_head.parameters(), args.grad_clip)
+        optimizer.step()
+        logs["metric"].append(float(np.mean(metric_losses)))
+        logs["task"].append(float(np.mean(task_losses)))
+        logs["loss"].append(args.lambda_metric * logs["metric"][-1] + logs["task"][-1])
+    return {key: float(np.mean(value)) for key, value in logs.items()}
+
+
+def train_rl_epoch(model, reference, loader, optimizer, args, device, tasks):
+    """REINFORCE with leave-one-out baseline, true hard pruning and fixed head."""
+    model.selector.train()
+    model.mask_flow.train()
+    model.metric_head.eval()
+    logs = {key: [] for key in ("loss", "policy", "reward", "regret", "violation", "improve", "kl", "entropy", "advantage_abs")}
+    for raw in tqdm(loader, desc="V8.5 outcome RL post-training"):
+        batch = move_batch(raw, device)
+        task_data = task_parameters(batch["source_id"], tasks, device)
+        budget = torch.full((batch["image"].shape[0],), args.budget, device=device)
+        encoded, selection, positions, valid = model.encode_and_select(
+            batch["image"], task_texts(raw, batch["source_id"], args),
+            budget, batch["region_world_bounds"],
+        )
+        _, scores, k = selection_rollout(model, selection, positions, valid, args)
+        with torch.no_grad():
+            ref_selection, ref_positions, ref_valid = reference.select_encoded(
+                encoded, budget, batch["region_world_bounds"]
+            )
+            _, ref_scores, _ = selection_rollout(reference, ref_selection, ref_positions, ref_valid, args)
+            baseline = planning_from_topk(
+                model, encoded, selection["logits"].detach(), valid, k, batch, task_data, args.decision_temperature
+            )
+            _, initial_regret, _ = decision_outcomes(
+                baseline["predicted_cost"], baseline["oracle_cost"], batch["candidate_valid"],
+                batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
+            )
+        rewards, logps, entropies, kls, regrets, violations, improvements = [], [], [], [], [], [], []
+        for _ in range(args.rl_group_size):
+            action, logp, entropy, kl = sample_region_action(
+                scores, valid, k, args.rl_temperature, ref_scores
+            )
+            # Qwen/head need no autograd graph in RL; cache early vision once.
+            with torch.no_grad():
+                fused = model.fuse_indices(encoded, action)
+                result = planning_from_fused(model, fused, batch, *task_data, args.decision_temperature)
+                reward, regret, violation = decision_outcomes(
+                    result["predicted_cost"], result["oracle_cost"], batch["candidate_valid"],
+                    batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
+                )
+                improve = F.relu(regret - initial_regret + args.improve_margin)
+                reward = reward - args.lambda_improve * improve
+            rewards.append(reward)
+            logps.append(logp)
+            entropies.append(entropy / k)
+            kls.append(kl / k)
+            regrets.append(regret)
+            violations.append(violation)
+            improvements.append(improve)
+        rewards, logps = torch.stack(rewards), torch.stack(logps)
+        entropies, kls = torch.stack(entropies), torch.stack(kls)
+        loss, policy, advantage = policy_gradient_loss(
+            logps, rewards, entropies, kls, args.rl_kl_weight, args.rl_entropy_weight
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        trainable = list(model.selector.parameters()) + list(model.mask_flow.parameters())
+        torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+        optimizer.step()
+        values = {
+            "loss": loss.detach(), "policy": policy.detach(), "reward": rewards.mean(),
+            "regret": torch.stack(regrets).mean(), "violation": torch.stack(violations).mean(),
+            "improve": torch.stack(improvements).mean(), "kl": kls.detach().mean(),
+            "entropy": entropies.detach().mean(), "advantage_abs": advantage.abs().mean(),
+        }
+        for key, value in values.items():
+            logs[key].append(float(value))
+    return {key: float(np.mean(value)) for key, value in logs.items()}
+
+
 def train_epoch(model, loader, optimizer, args, device, tasks):
     model.selector.train()
-    model.metric_head.train()
+    model.metric_head.eval()
     model.mask_flow.train()
     keys = (
         "loss", "task", "metric", "gfm", "direction", "magnitude",
@@ -220,7 +353,7 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         initial_mask = fixed_mass_mask(
             selection["logits"], valid, mass, args.mask_temperature
         )
-        final_mask, states, _ = model.mask_flow.rollout(
+        final_mask, states, velocities = model.mask_flow.rollout(
             initial_mask,
             selection["z"],
             selection["task_context"],
@@ -228,17 +361,19 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
             valid,
             mass,
         )
-        hard_mask = hard_topk_mask(final_mask, valid, k)
-        straight_through_mask = hard_mask + final_mask - final_mask.detach()
-
-        # The final Student task value is evaluated on the actually retained set.
-        student = planning_from_mask(
+        decision_scores = model.mask_flow.decision_scores(states, velocities, selection["logits"])
+        # Physically prune to K tokens, with unit-forward selected-only gates.
+        # The gradient is a biased surrogate; the forward equals deployment.
+        student = planning_from_topk(
             model,
             encoded,
-            straight_through_mask,
+            decision_scores,
+            valid,
+            k,
             batch,
             task_data,
             args.decision_temperature,
+            straight_through=True,
         )
         task_loss = student["task_values"].mean()
         predicted_metrics = student["predicted_metrics"]
@@ -248,12 +383,14 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         )
 
         # L_improve compares only the initial and final information states.
-        # The detached baseline prevents the model from making w0 worse.
+        # Compare the same hard-pruned path at both endpoints.
         with torch.no_grad():
-            initial = planning_from_mask(
+            initial = planning_from_topk(
                 model,
                 encoded,
-                initial_mask.detach(),
+                selection["logits"].detach(),
+                valid,
+                k,
                 batch,
                 task_data,
                 args.decision_temperature,
@@ -346,7 +483,6 @@ def train_epoch(model, loader, optimizer, args, device, tasks):
         loss.backward()
         trainable = (
             list(model.selector.parameters())
-            + list(model.metric_head.parameters())
             + list(model.mask_flow.parameters())
         )
         torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
@@ -394,7 +530,7 @@ def evaluate_mode(model, encoded, selection, positions, valid, batch, args, task
         initial = fixed_mass_mask(
             selection["logits"], valid, mass, args.mask_temperature
         )
-        scores, _, _ = model.mask_flow.rollout(
+        final_mask, states, velocities = model.mask_flow.rollout(
             initial,
             selection["z"],
             selection["task_context"],
@@ -402,7 +538,8 @@ def evaluate_mode(model, encoded, selection, positions, valid, batch, args, task
             valid,
             mass,
         )
-        mask_change = float((scores - initial).abs().mean())
+        scores = model.mask_flow.decision_scores(states, velocities, selection["logits"])
+        mask_change = float((final_mask - initial).abs().mean())
     fused, _ = model.fuse_topk(encoded, scores, valid, k)
     result = planning_from_fused(
         model,
@@ -424,6 +561,8 @@ def evaluate_mode(model, encoded, selection, positions, valid, batch, args, task
         result["predicted_metrics"][batch["candidate_valid"]]
         - batch["candidate_metrics"][batch["candidate_valid"]]
     ).abs().mean()
+    chosen_metrics = batch["candidate_metrics"][row, predicted_index]
+    violation = ((chosen_metrics > task_data[1]) & task_data[2].bool()).any(-1).float().mean()
     return {
         "regret": float(regret),
         "expected_regret": float(result["task_values"].mean()),
@@ -431,6 +570,10 @@ def evaluate_mode(model, encoded, selection, positions, valid, batch, args, task
         "mask_change": mask_change,
         "tokens": float(k),
         "token_ratio": float(k / region_count),
+        "constraint_violation_proxy": float(violation),
+        "collision_proxy": float(chosen_metrics[:, METRIC_NAMES.index("collision")].mean()),
+        "non_traversable_proxy": float(chosen_metrics[:, METRIC_NAMES.index("non_traversable")].mean()),
+        "safety_risk_proxy": float(chosen_metrics[:, METRIC_NAMES.index("safety_risk")].mean()),
     }
 
 
@@ -441,6 +584,7 @@ def validate(model, loader, args, device, tasks):
     metric_names = (
         "regret", "expected_regret", "metric_mae", "mask_change",
         "tokens", "token_ratio",
+        "constraint_violation_proxy", "collision_proxy", "non_traversable_proxy", "safety_risk_proxy",
     )
     logs = {
         mode: {key: [] for key in metric_names}
@@ -480,6 +624,7 @@ def validate(model, loader, args, device, tasks):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", choices=("metric", "distill", "rl"), default="metric")
     parser.add_argument("--data", required=True)
     parser.add_argument("--val", required=True)
     parser.add_argument("--nuplan-task", required=True)
@@ -509,20 +654,24 @@ def parse_args():
     parser.add_argument("--lambda-value", type=float, default=0.25)
     parser.add_argument("--lambda-improve", type=float, default=0.1)
     parser.add_argument("--improve-margin", type=float, default=0.0)
+    parser.add_argument("--rl-group-size", type=int, default=4)
+    parser.add_argument("--rl-temperature", type=float, default=0.15)
+    parser.add_argument("--rl-kl-weight", type=float, default=0.02)
+    parser.add_argument("--rl-entropy-weight", type=float, default=0.001)
+    parser.add_argument("--rl-violation-weight", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--output", default="checkpoints/v85_bev_gradient_flow.pt")
-    parser.add_argument("--metrics", default="results/v85_bev_metrics.json")
-    parser.add_argument("--resume", default="")
+    parser.add_argument("--output", default="")
+    parser.add_argument("--metrics", default="")
+    parser.add_argument("--resume", default="", help="initialize weights from a previous-stage checkpoint, not exact optimizer resume")
     parser.add_argument(
         "--allow-cross-view-resume",
         action="store_true",
         help=(
-            "explicitly allow initialization from a checkpoint that was not "
-            "trained with the V8.5 ego-centric BEV input"
+            "metric stage only: explicitly allow cross-view weight initialization"
         ),
     )
     parser.add_argument("--seed", type=int, default=1234)
@@ -531,9 +680,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.output = args.output or f"checkpoints/v85_bev_{args.stage}.pt"
+    args.metrics = args.metrics or f"results/v85_bev_{args.stage}.json"
+    if args.stage in ("distill", "rl") and not args.resume:
+        raise ValueError(f"stage {args.stage} requires --resume from the previous stage")
+    if args.rl_group_size < 2 or args.rl_temperature <= 0:
+        raise ValueError("RL requires group-size >= 2 and positive policy temperature")
+    if min(args.rl_kl_weight, args.rl_entropy_weight, args.rl_violation_weight) < 0:
+        raise ValueError("RL loss weights must be non-negative")
     if not 0.0 < args.budget <= 1.0:
         raise ValueError("budget must be in (0, 1]")
-    if args.lambda_gfm > 0.0 and args.mask_steps <= 0:
+    if args.stage == "distill" and args.lambda_gfm > 0.0 and args.mask_steps <= 0:
         raise ValueError("mask_steps must be positive when lambda_gfm > 0")
     if args.mask_steps < 0:
         raise ValueError("mask_steps must be non-negative")
@@ -543,6 +700,8 @@ def main():
         raise ValueError("teacher_step_size must be positive")
     if args.improve_margin < 0.0:
         raise ValueError("improve_margin must be non-negative")
+    if args.epochs <= 0 or args.batch <= 0 or args.decision_temperature <= 0:
+        raise ValueError("epochs, batch and decision_temperature must be positive")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -572,26 +731,31 @@ def main():
         shuffle=False,
         num_workers=args.workers,
     )
-    model = build_v85_model(args, device)
+    checkpoint = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
-        checkpoint_mode = checkpoint.get("input_mode", "legacy_first_person_rgb")
-        if checkpoint_mode != INPUT_MODE and not args.allow_cross_view_resume:
-            raise ValueError(
-                f"checkpoint input_mode={checkpoint_mode!r}; pass "
-                "--allow-cross-view-resume to explicitly initialize BEV "
-                "training from cross-view weights"
-            )
+        validate_checkpoint_contract(checkpoint, args, train_dataset, args.stage)
+    model = build_v85_model(args, device)
+    if checkpoint is not None:
         model.selector.load_state_dict(checkpoint["selector"])
         model.metric_head.load_state_dict(checkpoint["metric_head"])
         if "mask_flow" in checkpoint:
             model.mask_flow.load_state_dict(checkpoint["mask_flow"])
 
-    trainable = (
-        list(model.selector.parameters())
-        + list(model.metric_head.parameters())
-        + list(model.mask_flow.parameters())
-    )
+    model.backbone.eval().requires_grad_(False)
+    model.metric_head.requires_grad_(args.stage == "metric")
+    model.selector.requires_grad_(args.stage != "metric")
+    model.mask_flow.requires_grad_(args.stage != "metric")
+    reference = None
+    if args.stage == "rl":
+        # Only duplicate the small trainable modules, never the 8B backbone.
+        from gradient_flow_selector_v85 import GradientFlowSelectorV85
+        reference = GradientFlowSelectorV85(
+            model.backbone, deepcopy(model.selector), model.metric_head, deepcopy(model.mask_flow)
+        )
+        reference.selector.eval().requires_grad_(False)
+        reference.mask_flow.eval().requires_grad_(False)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
     output = Path(args.output)
     metrics_path = Path(args.metrics)
@@ -600,16 +764,19 @@ def main():
     history = []
     best = float("inf")
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, args, device, tasks
-        )
+        if args.stage == "metric":
+            train_metrics = train_metric_epoch(model, train_loader, optimizer, args, device, tasks)
+        elif args.stage == "distill":
+            train_metrics = train_epoch(model, train_loader, optimizer, args, device, tasks)
+        else:
+            train_metrics = train_rl_epoch(model, reference, train_loader, optimizer, args, device, tasks)
         validation = validate(model, val_loader, args, device, tasks)
         record = {"epoch": epoch, "train": train_metrics, "validation": validation}
         history.append(record)
         metrics_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
         print(json.dumps(record, indent=2))
 
-        learned_regret = validation["learned"]["regret"]
+        learned_regret = validation["random"]["metric_mae"] if args.stage == "metric" else validation["learned"]["regret"]
         if learned_regret < best:
             best = learned_regret
             torch.save(
@@ -617,6 +784,11 @@ def main():
                     "args": vars(args),
                     "input_mode": INPUT_MODE,
                     "bev_config_json": train_dataset.bev_config_json,
+                    "data_schema_revision": SCHEMA_REVISION,
+                    "training_stage": args.stage,
+                    "policy_kind": "plackett_luce_ordered_subset_v1" if args.stage == "rl" else "deterministic_topk",
+                    "decision_rule": "last_preprojection_scores_v1",
+                    "task_specs": [vars(task) for task in tasks],
                     "selector": model.selector.state_dict(),
                     "metric_head": model.metric_head.state_dict(),
                     "mask_flow": model.mask_flow.state_dict(),

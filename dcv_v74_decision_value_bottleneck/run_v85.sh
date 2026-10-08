@@ -16,6 +16,7 @@ if [[ "${ALLOW_CROSS_VIEW_RESUME:-0}" == "1" ]]; then
 fi
 
 python "$ROOT/train_gradient_flow_selector_v85.py" \
+  --stage "${STAGE:-metric}" \
   --data "${TRAIN_DATA:?set TRAIN_DATA}" \
   --val "${VAL_DATA:?set VAL_DATA}" \
   --nuplan-task "${NUPLAN_TASK:-$ROOT/tasks/nuplan_safe_progress.json}" \
@@ -36,5 +37,10 @@ python "$ROOT/train_gradient_flow_selector_v85.py" \
   --lambda-value "${LAMBDA_VALUE:-0.25}" \
   --lambda-improve "${LAMBDA_IMPROVE:-0.10}" \
   --improve-margin "${IMPROVE_MARGIN:-0.0}" \
+  --rl-group-size "${RL_GROUP_SIZE:-4}" \
+  --rl-temperature "${RL_TEMPERATURE:-0.15}" \
+  --rl-kl-weight "${RL_KL_WEIGHT:-0.02}" \
+  --rl-entropy-weight "${RL_ENTROPY_WEIGHT:-0.001}" \
+  --rl-violation-weight "${RL_VIOLATION_WEIGHT:-1.0}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

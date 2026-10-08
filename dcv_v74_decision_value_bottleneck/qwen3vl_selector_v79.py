@@ -318,11 +318,14 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         vision_state,
         region_mask=None,
         selected_indices=None,
+        selected_region_gates=None,
     ):
         """Run the post-pruning ViT blocks and merger.
 
         Exactly one of ``region_mask`` (soft differentiable path) and
         ``selected_indices`` (hard compute-saving path) must be supplied.
+        Optional unit-forward ``selected_region_gates`` provide a selected-only
+        surrogate gradient while retaining the physically shortened stream.
         """
         if (region_mask is None) == (selected_indices is None):
             raise ValueError(
@@ -333,6 +336,8 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         batch_size = hidden_groups.shape[0]
 
         raw_gate = None
+        if selected_region_gates is not None and selected_indices is None:
+            raise ValueError("selected_region_gates require selected_indices")
         if selected_indices is not None:
             hidden_groups = self._gather_groups(
                 hidden_groups, selected_indices
@@ -342,6 +347,11 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
                 for item in position_groups
             )
             token_indices = selected_indices
+            if selected_region_gates is not None:
+                if selected_region_gates.shape != selected_indices.shape:
+                    raise ValueError("selected gates must have shape [B,K]")
+                raw_gate = selected_region_gates.to(hidden_groups.dtype)[..., None, None]
+                hidden_groups = hidden_groups * raw_gate
         else:
             raw_gate = region_mask.to(hidden_groups.dtype)[..., None, None]
             hidden_groups = hidden_groups * raw_gate

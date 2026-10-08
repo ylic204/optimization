@@ -1,8 +1,9 @@
 # V8.5 ego-centric BEV input and nuPlan processing
 
 This branch replaces the first-person camera image with one fixed-metric,
-ego-centric bird's-eye-view raster.  It keeps the V8.5 Teacher-gradient mask
-field, fixed-step neurodynamics, and endpoint `L_improve` objective unchanged.
+ego-centric bird's-eye-view raster. It uses a shared Teacher-gradient mask
+field and fixed-step neurodynamics, followed by explicit outcome RL.
+See `README_V85_POSTTRAINING.md` for the staged training protocol and losses.
 
 The data design follows the useful input boundary of the ICLR 2026 BIRDriver
 work: use an ego-centric BEV that exposes road structure, route, traffic
@@ -50,7 +51,9 @@ the raster:
 - the route reference assembled from map roadblocks.
 
 `get_ego_future_trajectory` is used only to write
-`expert_trajectory_ego`, which supervises candidate construction and metrics.
+`expert_trajectory_ego`, which is saved for future expert-supervised work.
+Current candidate generation and metric labels use map/reference/raster
+geometry; the expert trajectory is not consumed by the V8.5 training losses.
 The renderer does not accept this future trajectory, so it cannot leak into
 `bev_rgb` or the semantic layers.
 
@@ -124,6 +127,14 @@ metrics, and SDF construction, then writes schema 85 metadata.  The temporary
 loaded model input is `bev_rgb`, and the raw record never contains a generic
 camera `image` field.
 
+**Reprocess old processed data.** Processed schema 85 revision 2 fixes a
+coordinate mismatch: BEV rows are descending x and columns descending y,
+whereas V8.4 metrics assume y rows and ascending x columns. The new adapter
+transposes/flips traversable and obstacle rasters before V8.4 processing,
+then converts the output SDF back to BEV orientation. No visual RGB is rotated.
+Old revision-1 labels and checkpoints are rejected rather than silently reused.
+Raw BEV records do not need to be exported again solely for this fix.
+
 Split by complete `log_name` before reporting results.  Do not randomly split
 individual frames from the same log across train, validation, and test.
 
@@ -132,6 +143,8 @@ individual frames from the same log across train, validation, and test.
 | Field | Shape | Meaning |
 |---|---|---|
 | `input_mode` | scalar | exactly `ego_centric_bev_v85` |
+| `schema_revision` | scalar | processed data must be revision 2 |
+| `metric_raster_layout` | scalar | `bev_x_rows_y_cols`, also the stored SDF orientation |
 | `bev_rgb` | `[288,288,3]` | only visual input consumed by the VLM |
 | `bev_semantic` | `[15,288,288]` | audit-only semantic channels |
 | `bev_config_json` | scalar string | metric bounds, size, grid, history config |
@@ -151,14 +164,18 @@ VAL_DATA=/data/v85_bev/processed/val \
 VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
 DEVICE=1 \
 LOAD_4BIT=1 \
+STAGE=metric \
 bash run_v85.sh "$PWD" \
-  --output checkpoints/v85_bev_gradient_flow.pt \
-  --metrics results/v85_bev_training_metrics.json
+  --output checkpoints/v85_bev_metric.pt
 ```
+
+Then run `STAGE=distill` with `RESUME` pointing at the metric checkpoint,
+followed by `run_v85_rl.sh` with the distilled checkpoint. The complete
+three commands are in `README_V85_POSTTRAINING.md`.
 
 ```bash
 python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_bev_gradient_flow.pt \
+  --checkpoint checkpoints/v85_bev_rl.pt \
   --data /data/v85_bev/processed/test \
   --nuplan-task tasks/nuplan_safe_progress.json \
   --pointnav-task tasks/pointnav_safe_short.json \
@@ -167,10 +184,13 @@ python evaluate_gradient_flow_selector_v85.py \
   --load-4bit
 ```
 
-Checkpoints record both `input_mode` and the exact `bev_config_json`.
+Checkpoints record `input_mode`, exact `bev_config_json`, label revision,
+training stage, architecture arguments and task specifications.
 Evaluation refuses checkpoints or data with a different view/geometry.  To
 initialize training from old first-person weights, opt in explicitly with
-`ALLOW_CROSS_VIEW_RESUME=1`; a fresh BEV run is the safer default.
+`ALLOW_CROSS_VIEW_RESUME=1` in the metric stage only. It is weight initialization,
+not a claim of a view-compatible Teacher. Distillation/RL require revised BEV
+checkpoints; a fresh BEV run is the safer default.
 
 ## 8. Validation
 
@@ -178,11 +198,12 @@ Camera-free tests that do not load Qwen weights:
 
 ```bash
 python -m unittest test_v85_bev.py -v
+python -m pytest -q test_v85_posttraining.py test_v85_gradient_flow.py
 python -m py_compile \
   bev_renderer_v85.py raw_record_bev_v85.py \
   planning_data_bev_v85.py process_planning_bev_v85.py \
   planning_dataset_bev_v85.py export_nuplan_bev_v85.py
-bash -n run_v85.sh
+bash -n run_v85.sh run_v85_rl.sh
 ```
 
 Before a full export, visually inspect samples from each nuPlan map and verify

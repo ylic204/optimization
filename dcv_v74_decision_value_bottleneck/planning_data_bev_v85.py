@@ -10,10 +10,12 @@ from planning_data_v84 import (
     process_raw_record,
 )
 from raw_record_bev_v85 import INPUT_MODE
+from bev_geometry_v85 import (
+    RASTER_LAYOUT, SCHEMA_REVISION, bev_to_legacy_raster, legacy_to_bev_raster,
+)
 
 
 SCHEMA_VERSION = 85
-SCHEMA_REVISION = 1
 
 
 def _scalar(raw, name, default):
@@ -46,6 +48,10 @@ def process_bev_raw_record(
 
     compatibility = dict(raw)
     compatibility["image"] = raw["bev_rgb"]
+    # V8.4 metrics use x-columns; BEV uses x-rows. Adapt only the metric
+    # rasters, not the visual image, route coordinates or world bounds.
+    for name in ("traversable", "dynamic_obstacle"):
+        compatibility[name] = bev_to_legacy_raster(raw[name])
     sample = process_raw_record(
         compatibility,
         lateral_span=lateral_span,
@@ -56,6 +62,8 @@ def process_bev_raw_record(
         {
             "schema_version": np.int64(SCHEMA_VERSION),
             "schema_revision": np.int64(SCHEMA_REVISION),
+            "metric_raster_layout": np.str_(RASTER_LAYOUT),
+            "sdf": legacy_to_bev_raster(sample["sdf"]),
             "input_mode": np.str_(INPUT_MODE),
             "image": np.asarray(raw["bev_rgb"], dtype=np.uint8),
             "bev_rgb": np.asarray(raw["bev_rgb"], dtype=np.uint8),

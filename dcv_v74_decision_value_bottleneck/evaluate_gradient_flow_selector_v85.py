@@ -13,6 +13,7 @@ from optimization_spec_v83 import OptimizationTask
 from planning_dataset_bev_v85 import PlanningDatasetBEVV85
 from raw_record_bev_v85 import INPUT_MODE
 from train_gradient_flow_selector_v85 import validate
+from checkpoint_contract_v85 import validate_checkpoint_contract
 
 
 def parse_args():
@@ -60,19 +61,17 @@ def main():
     device = torch.device(cli.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    model = build_v85_model(args, device)
-    model.selector.load_state_dict(checkpoint["selector"])
-    model.metric_head.load_state_dict(checkpoint["metric_head"])
-    model.mask_flow.load_state_dict(checkpoint["mask_flow"])
-
     tasks = [
         OptimizationTask.load(cli.nuplan_task),
         OptimizationTask.load(cli.pointnav_task),
     ]
     image_side = args.region_grid * 32
     dataset = PlanningDatasetBEVV85(cli.data, image_side)
-    if checkpoint.get("bev_config_json") != dataset.bev_config_json:
-        raise ValueError("checkpoint and evaluation data use different BEV geometry")
+    validate_checkpoint_contract(checkpoint, args, dataset, "evaluate")
+    model = build_v85_model(args, device)
+    model.selector.load_state_dict(checkpoint["selector"])
+    model.metric_head.load_state_dict(checkpoint["metric_head"])
+    model.mask_flow.load_state_dict(checkpoint["mask_flow"])
     loader = DataLoader(
         dataset,
         cli.batch,

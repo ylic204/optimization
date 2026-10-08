@@ -1,132 +1,89 @@
-# V8.5: Teacher-gradient flow matching with fixed-step neurodynamics
+# V8.5: Teacher-gradient matching and fixed-step neurodynamics
 
-V8.5 replaces the V8.4 serial `trajectory Flow -> ND refiner` design.  Flow
-matching and neurodynamics now refer to the same visual-mask vector field:
+Flow/gradient-field matching and ND are two views of the **same mask field**:
+gradient matching trains its local velocity, and projected ND executes it.
+There is no separately generated trajectory followed by another ND model.
 
-- the full-information Teacher differentiates the true planning task objective;
-- the Student matches the Teacher's projected descent direction;
-- fixed-step neurodynamics executes the learned Student field;
-- `L_improve` checks only whether the final state improves over the initial
-  state.  It does **not** impose per-step monotonicity.
+This revision uses explicit BEV input and three stages:
+`metric -> distill -> rl`. See
+[the full staged protocol and losses](README_V85_POSTTRAINING.md) and
+[the BEV data contract](README_V85_BEV_INPUT.md).
 
-V8.4 remains in the repository as the reproducible serial baseline.
+## Teacher direction
 
-On the `v85-bev-input` branch, every visual region comes from a fixed-metric
-ego-centric BEV rather than a first-person camera frame.  This changes the
-observation representation, not the relationship between Flow Matching and
-neurodynamics described below.  See `README_V85_BEV_INPUT.md` for the nuPlan
-export and schema contract.
+On valid regions, `C_k = {w: 0 <= w <= 1, sum(w) = k}`.
 
-## State and Teacher direction
-
-Let `w in [0, 1]^R` be the relaxed visual-region mask, with a fixed token
-budget `sum(w) = k`.  The feasible set is
-
-```text
-C_k = {w | 0 <= w_r <= 1, sum_r w_r = k}.
+```math
+w_T^+ = \Pi_{C_k}(w-\eta_T\nabla_w J_{\mathrm{relaxed}}(w)),
+\qquad v_T=(w_T^+-w)/\eta_T.
 ```
 
-For the full-information task loss `J_T(w)`, the Teacher produces a feasible
-descent velocity
+A supervised pretrained metric head is frozen during distillation and RL.
+Together with frozen Qwen and label-based expected-regret supervision it
+provides the mask-space gradient oracle. It is not an independent expert
+planner, nor a direct gradient of a physical trajectory cost. Full early
+visual features are available before selection; this is not sensor acquisition.
 
-```text
-w_T+ = Pi_Ck(w - eta_T * grad_w J_T(w))
-v_T  = (w_T+ - w) / eta_T.
-```
-
-This adapts the gradient-direction matching idea to the visual-mask state:
-the Teacher can see all early Qwen visual regions, while the deployed Student
-must decide which top-k regions survive.
-
-The Student field `v_theta(w, t, z, c)` is trained primarily by cosine
-direction matching.  Magnitude and one-step state matching stabilize the
-finite-step rollout:
+Direction, log-norm and one-step projected-state matching train the field:
 
 ```text
 L_gfm = (1 - cos(v_theta, v_T))
         + alpha * SmoothL1(log(1 + ||v_theta||), log(1 + ||v_T||))
-        + beta * SmoothL1(Pi_Ck(w + eta_theta v_theta), w_T+).
+        + beta * SmoothL1(Pi_Ck(w + eta_theta v_theta), w_T+)
 ```
 
-The same field is executed for `K` projected neurodynamic steps:
+The same field runs for S fixed iterations:
 
-```text
-w^(s+1) = Pi_Ck(w^s + eta_s * v_theta(w^s, s/K, z, c)).
+```math
+w^{s+1}=\Pi_{C_k}(w^s+\eta_s v_\theta(w^s,z,c,s/S)).
 ```
 
-There is no separately trained flow trajectory followed by a second ND model.
+Positive step sizes are learned. The projection backward centers gradients on
+free active-set coordinates, with zero gradients on saturated/invalid entries.
 
-## Endpoint improvement loss
+Top-K and the RL sampler both use the last pre-projection proposal as their
+decision scores, resolving clipped-mask ties and preserving policy gradients
+at binary final masks. Initial endpoint selection uses the selector logits;
+all intermediate ND states still satisfy the fixed budget.
 
-The requested endpoint loss is
+## Deployment-matched endpoint improvement
 
-```text
-L_improve = mean ReLU(J_T(w^K) - stopgrad(J_T(w^0)) + delta).
+```math
+L_{\mathrm{improve}}=\operatorname{ReLU}
+(J_{\mathrm{hard}}(w^S)-\operatorname{stopgrad}J_{\mathrm{hard}}(w^0)+m).
 ```
 
-`stopgrad` is important: without it, the model could reduce the hinge by
-making the initial baseline worse.  `delta >= 0` is the requested minimum
-improvement margin.  With `delta = 0`, the term is active only when the final
-selection is worse than the initial selection.
+Both endpoints physically delete unselected tokens. Training uses unit-forward
+selected-only gates to provide a biased surrogate gradient through the retained
+groups; it no longer leaves 81 zero-filled slots in the deployment objective.
+Teacher differentiation still uses a separately identified relaxed-mask proxy.
 
-The total training objective is
+This is not per-step monotonicity or a mathematical convergence guarantee.
+Zero margin permits ties. Detaching the baseline removes its direct gradient
+incentive, but shared-parameter updates may still change future baselines.
 
-```text
-L_total = L_task
-          + lambda_metric  * L_metric
-          + lambda_gfm     * L_gfm
-          + lambda_latent  * L_latent
-          + lambda_value   * L_value
-          + lambda_improve * L_improve.
-```
+The distillation objective combines task, gradient matching, latent alignment,
+set-value regression and endpoint improvement. A fixed-head metric loss is
+also logged as a constant monitor. Set-value regression is not an RL critic.
 
-The implementation evaluates `J_T(w^K)` on the straight-through hard top-k
-mask, so the forward pass matches the actually retained token set while the
-backward pass still reaches the relaxed ND state.
+## Outcome RL follows distillation
 
-## Files
+The new RL stage samples budget-valid region subsets with exact ordered-draw
+log-probabilities and evaluates actual pruning under no-grad Qwen inference.
+Independent labels determine reward. REINFORCE updates the small Selector/ND
+modules with a leave-one-out baseline and reference/entropy regularization.
 
-- `gradient_flow_selector_v85.py`: constrained mask projection, Student
-  vector field, and fixed-step ND rollout.
-- `train_gradient_flow_selector_v85.py`: Teacher-gradient construction,
-  direction matching, `L_improve`, training, and validation.
-- `evaluate_gradient_flow_selector_v85.py`: standalone full/random/learned
-  comparison for a saved checkpoint.
-- `planning_dataset_bev_v85.py`: BEV-only dataset and metric-geometry checks.
-- `run_v85.sh`: environment-variable-driven training launcher.
-- `test_v85_gradient_flow.py`: projection, rollout, and detached-baseline
-  unit tests.
+The RL stage is an offline contextual bandit, not PPO/GRPO or closed-loop
+driving. Its reward includes the analogous hard-decision endpoint penalty;
+that penalty is learned through policy gradients, not fake differentiation
+through a discrete candidate argmin.
 
-## Training
+## Entry points
 
-```bash
-TRAIN_DATA=/data/v85_bev/processed/train \
-VAL_DATA=/data/v85_bev/processed/val \
-VLM_MODEL=/path/to/Qwen3-VL-8B-Instruct \
-bash run_v85.sh /path/to/dcv_v74_decision_value_bottleneck
-```
+- `train_gradient_flow_selector_v85.py --stage metric|distill|rl`
+- `run_v85.sh` (default metric stage) and `run_v85_rl.sh`
+- `evaluate_gradient_flow_selector_v85.py`
+- `test_v85_gradient_flow.py` and `test_v85_posttraining.py`
 
-Important controls:
-
-```bash
-MASK_STEPS=4
-MASK_STEP_SIZE=0.25
-TEACHER_STEP_SIZE=0.25
-LAMBDA_GFM=1.0
-LAMBDA_IMPROVE=0.10
-IMPROVE_MARGIN=0.0
-```
-
-## Evaluation
-
-```bash
-python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_bev_gradient_flow.pt \
-  --data /data/v85_bev/processed/test \
-  --nuplan-task tasks/nuplan_safe_progress.json \
-  --pointnav-task tasks/pointnav_safe_short.json
-```
-
-Validation reports physical token counts and task regret for `full`, `random`,
-and `learned` masks.  `mask_change` additionally measures how much the learned
-fixed-step dynamics changes the initialized relaxed mask.
+The full commands, checkpoint requirements, reward definitions and remaining
+planning/safety limitations are in `README_V85_POSTTRAINING.md`.

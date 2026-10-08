@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from raw_record_bev_v85 import INPUT_MODE
+from bev_geometry_v85 import RASTER_LAYOUT, SCHEMA_REVISION
 
 
 class PlanningDatasetBEVV85(Dataset):
@@ -21,6 +22,14 @@ class PlanningDatasetBEVV85(Dataset):
             self.bev_config = json.loads(self.bev_config_json)
 
     def _validate_metadata(self, data, path):
+        revision = int(data["schema_revision"].item()) if "schema_revision" in data else 0
+        version = int(data["schema_version"].item()) if "schema_version" in data else 0
+        layout = str(data["metric_raster_layout"].item()) if "metric_raster_layout" in data else ""
+        if version != 85 or revision != SCHEMA_REVISION or layout != RASTER_LAYOUT:
+            raise ValueError(
+                f"{path} has stale BEV metric labels; reprocess raw records "
+                f"with process_planning_bev_v85.py (schema 85 revision {SCHEMA_REVISION})"
+            )
         input_mode = str(data["input_mode"].item()) if "input_mode" in data else ""
         if input_mode != INPUT_MODE:
             raise ValueError(
