@@ -4,7 +4,7 @@ import numpy as np
 
 
 RASTER_LAYOUT = "bev_x_rows_y_cols"
-SCHEMA_REVISION = 2
+SCHEMA_REVISION = 3
 
 
 def bev_to_legacy_raster(grid):

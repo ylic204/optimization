@@ -32,6 +32,7 @@ from rl_posttraining_v85 import (
 )
 from test_v85_bev import BevGeometryTest
 from train_gradient_flow_selector_v85 import train_epoch, train_metric_epoch, train_rl_epoch
+from bev_solver_environment_v85 import MODEL_SCHEMA, SELECTOR_TEXT_CONTRACT
 import train_gradient_flow_selector_v85 as trainer
 
 
@@ -220,6 +221,15 @@ class TinyPrunableBackbone(nn.Module):
     def fuse(self, input_ids, attention_mask, visual):
         return visual["visual_tokens"].mean(1)
 
+    def generate_selected_json(self, state, indices, prompt, max_new_tokens):
+        # Deterministic frozen visual stub; the real SciPy solver still runs.
+        visual = self.continue_vision(state, selected_indices=indices)["visual_tokens"]
+        speed = 1.0 + float(visual[..., 0].mean()) * 0.4
+        times = np.arange(1, 17) * 0.5
+        return json.dumps({"schema": MODEL_SCHEMA, "reference_xy": [[speed * t, 0.] for t in times],
+                           "corridor": [[-16., 64., -40., 40.]] * 16,
+                           "weights": {"tracking": 1., "smoothness": 0., "goal": 0.}, "halfspaces": []})
+
 
 class TinyMetricHead(nn.Module):
     def __init__(self):
@@ -246,6 +256,12 @@ def _tiny_setup():
         "region_world_bounds": bounds, "candidate_trajectories": torch.zeros(1, 2, 16, 3),
         "candidate_features": torch.zeros(1, 2, 8), "goal_state": torch.zeros(1, 4), "ego_state": torch.zeros(1, 8),
         "candidate_valid": torch.ones(1, 2, dtype=torch.bool), "candidate_metrics": torch.zeros(1, 2, 8),
+        "planning_time_s": torch.arange(1, 17)[None].float() * 0.5,
+        "trajectory_gt_available": torch.ones(1, dtype=torch.bool), "expert_is_fallback": torch.zeros(1, dtype=torch.bool),
+        "expert_trajectory": torch.stack([torch.arange(1, 17).float() * 0.5, torch.zeros(16)], -1)[None],
+        "map_bounds": torch.tensor([[-16., 64., -40., 40.]]),
+        "traversable": torch.ones(1, 96, 96, dtype=torch.bool), "dynamic_obstacle": torch.zeros(1, 96, 96, dtype=torch.bool),
+        "sample_id": ["tiny/scene/0"],
     }
     batch["candidate_metrics"][0, 1, 0] = 1.0
     args = SimpleNamespace(
@@ -254,6 +270,8 @@ def _tiny_setup():
         lambda_metric=1.0, lambda_gfm=1.0, lambda_latent=0.25, lambda_value=0.25,
         lambda_improve=0.1, improve_margin=0.0, grad_clip=5.0, nuplan_text="", pointnav_text="",
         rl_group_size=8, rl_temperature=1.0, rl_kl_weight=0.02, rl_entropy_weight=0.001, rl_violation_weight=1.0,
+        rl_backend="candidate_proxy", modeling_max_new_tokens=2048, solver_max_speed=15., solver_max_acceleration=4.,
+        solver_max_iterations=300, rl_ade_weight=1., rl_fde_weight=0.25, rl_failure_cost=100., seed=1234,
     )
     weights = {key: float(key == "collision") for key in METRIC_NAMES}
     tasks = [OptimizationTask("test", "nuplan", weights, {}, 1.0, "test")] * 2
@@ -327,7 +345,8 @@ def test_checkpoint_geometry_revision_and_stage_contract():
                            mask_steps=4, max_text_length=96, allow_cross_view_resume=False)
     dataset = SimpleNamespace(bev_config_json=BevConfig().to_json())
     checkpoint = dict(input_mode=INPUT_MODE, bev_config_json=dataset.bev_config_json,
-                      data_schema_revision=SCHEMA_REVISION, training_stage="distill", args=vars(args))
+                      data_schema_revision=SCHEMA_REVISION, training_stage="distill", args=vars(args),
+                      selector_text_contract=SELECTOR_TEXT_CONTRACT)
     validate_checkpoint_contract(checkpoint, args, dataset, "rl")
     for changes, message in [({"bev_config_json": "{}"}, "geometry"),
                              ({"data_schema_revision": 1}, "stale"),
@@ -343,7 +362,7 @@ def test_cli_checkpoint_chain_metric_distill_rl(tmp_path, monkeypatch):
     class TinyDataset:
         bev_config_json = BevConfig(image_size=96, region_grid=3).to_json()
 
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def __len__(self):
@@ -374,7 +393,7 @@ def test_cli_checkpoint_chain_metric_distill_rl(tmp_path, monkeypatch):
         checkpoint = torch.load(output, map_location="cpu")
         assert checkpoint["training_stage"] == stage
         assert checkpoint["data_schema_revision"] == SCHEMA_REVISION
-        assert "constraint_violation_proxy" in checkpoint["validation"]["learned"]
+        assert ("ade_m" if stage == "rl" else "constraint_violation_proxy") in checkpoint["validation"]["learned"]
         assert json.loads(metrics.read_text())[0]["epoch"] == 1
         checkpoints.append(checkpoint)
         previous = output

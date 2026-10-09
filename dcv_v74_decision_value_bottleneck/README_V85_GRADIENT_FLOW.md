@@ -70,13 +70,17 @@ also logged as a constant monitor. Set-value regression is not an RL critic.
 
 The new RL stage samples budget-valid region subsets with exact ordered-draw
 log-probabilities and evaluates actual pruning under no-grad Qwen inference.
+The primary environment now generates a validated continuous QP with frozen
+Qwen, solves it, and compares the resulting trajectory with time-aligned GT.
 Independent labels determine reward. REINFORCE updates the small Selector/ND
 modules with a leave-one-out baseline and reference/entropy regularization.
 
 The RL stage is an offline contextual bandit, not PPO/GRPO or closed-loop
 driving. Its reward includes the analogous hard-decision endpoint penalty;
 that penalty is learned through policy gradients, not fake differentiation
-through a discrete candidate argmin.
+through discrete model generation or the solver. The earlier candidate-regret
+reward remains only as the explicit `candidate_proxy` ablation. Teacher gradients
+still come from the differentiable proxy during warm-up, not the actual solver.
 
 ## Entry points
 

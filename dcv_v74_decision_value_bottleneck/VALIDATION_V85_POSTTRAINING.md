@@ -1,62 +1,48 @@
-# V8.5 BEV/RL repair validation
+# V8.5 frozen BEV modeling/solver feedback validation
 
-Reviewed upstream: `v85-bev-input` at
-`571d9feca3a63e86f40044207981763016afdcc3`.
-The isolated local snapshot tree matched upstream
-`4cc6312d2bc225510530142729c851e53c24a54d` before editing.
-
-Validation date: 2026-10-08. CPU environment: Python 3.12,
-PyTorch 2.14.1+cpu, NumPy 2.3.5, SciPy 1.17.0; CUDA unavailable.
+Validation date: 2026-10-09. Branch: `v85-bev-selector-llm-solver`.
+Base: published `v85-bev-rl-posttraining` commit `c3172386097807fae9d5a353411609d22bd62893`.
 
 ## Executed checks
 
-From `dcv_v74_decision_value_bottleneck`:
+- `python -m pytest -q`: **54 passed**, 14 non-fatal pre-norm Transformer nested-tensor warnings.
+- `python -m compileall -q .`: passed.
+- `bash -n run_v85.sh run_v85_rl.sh`: passed.
+- Training/evaluation `--help`: passed.
+- `git diff --check`: passed.
 
-```bash
-python -m pytest -q
-python train_gradient_flow_selector_v85.py --help
-python evaluate_gradient_flow_selector_v85.py --help
-```
+Environment: Python3.12, torch2.14.1+cpu, numpy2.3.5, scipy1.17.0,
+transformers4.57.1. No pretrained model or nuPlan data was downloaded.
 
-From the repository root:
+## Meaningful coverage
 
-```bash
-python -m compileall -q dcv_v74_decision_value_bottleneck
-bash -n dcv_v74_decision_value_bottleneck/run_v85.sh \
-  dcv_v74_decision_value_bottleneck/run_v85_rl.sh
-git diff --check
-```
+Existing BEV geometry, actor-center labeling, old-data rejection, capped-simplex gradcheck,
+hard-pruning/selected-gate parity, ordered no-replacement policy probabilities and stage freezing
+remain covered. New regression coverage includes:
 
-Result: **39 pytest tests passed**. Eight warnings report disabled nested-tensor
-optimization for pre-norm Transformer encoders; they are not failed assertions.
-Python compilation, launcher syntax and whitespace checks passed.
+- Actual recorded timestamps, no future extrapolation, nonuniform motion and stationary targets.
+- Timestamp-free raw cannot serve as trajectory-GT RL data; no reference-path substitute.
+- Real SciPy optimization of continuous xy; a halfspace produces a coordinate outside the candidate pool.
+- Infeasible solves expose failure and no successful trajectory; invalid/nonfinite/nonconvex JSON rejected.
+- GT/candidate-label changes leave frozen modeling output and trajectory identical, changing reward only.
+- Model failures incur the specified loss and null ADE/FDE; aggregate failure rates are explicit.
+- Actual solver-reward policy gradients update Selector/field with frozen head/reference.
+- Full/random/initial/learned use one environment and record problems/trajectories/GT JSONL.
+- Metric -> distill -> primary solver-RL CLI checkpoint chain runs with a frozen visual generation stub
+  plus the actual SciPy solver (not an argmin substitute).
+- A **real randomly initialized miniature Qwen3-VL** in Transformers4.57.1 exercises vision stem,
+  physical region gathering, DeepStack, original sparse-grid RoPE chat prefill, and cached greedy decode.
+  This tests architecture/API flow, not pretrained visual reasoning or valid optimization generation.
 
-New regressions cover:
+## Not executed and result limits
 
-- Actor at ego `(15, 1.5)` is detected by corrected BEV sampling; the old
-  direct V8.4 mapping misses the actor center.
-- BEV/legacy raster conversion, corrected processed collision labels and
-  rejection of stale revision-1 data.
-- Projection finite-difference Jacobian, zero saturated/invalid-coordinate
-  gradients and policy gradients at entirely binary projected masks.
-- Physically shortened hard-pruning streams and equality of unit-forward
-  selected gates versus deployment forward output.
-- Exact ordered-draw probability normalization, fixed budget, no replacement,
-  invalid-token exclusion, leave-one-out advantages and external-label rewards.
-- Policy-gradient update raises the rewarded action's score.
-- Small-component metric/distillation/RL loops run with finite losses;
-  the metric head stays fixed in later stages and reference parameters stay frozen.
-- CLI checkpoint chain parses arguments, trains, validates, saves and reloads
-  all three stages with revision/geometry/stage checks and safety-proxy logs.
+No pretrained Qwen3-VL-8B/4-bit CUDA run, production nuPlan export, real-data training,
+closed-loop simulator evaluation, end-to-end GPU latency/peak-memory measurement or measured
+accuracy improvement was performed. Transformers5.x is not validated by this run.
 
-## Not validated here
-
-No real Qwen3-VL checkpoint, 4-bit CUDA execution, full nuPlan export,
-production dataset training, end-to-end GPU memory/latency benchmark or
-closed-loop driving simulation was executed. Tiny substitute components test
-training and checkpoint contracts, not real-model planning quality.
-
-The stage chain is implemented, but **no trained model or measured planning
-improvement is delivered with this code commit**. Existing centerline/current-
-obstacle labels remain proxies; red-light, swept-footprint and temporal actor
-safety require further labels/simulation. See `README_V85_POSTTRAINING.md`.
+The convex QP is a bounded modeling family using point rear-axle positions and per-axis dynamics.
+Occupancy rewards are current-raster centerline proxies, not time-indexed vehicle-footprint safety.
+ADE/FDE use this repository's time-aligned rear-axle/16-point protocol, not official nuPlan scoring.
+A real-data smoke run must inspect generated JSON, failure rates and solved trajectories before
+starting expensive RL training. Old raw without timestamps requires re-export; revision2
+processed data/checkpoints require revision3 rebuilding and new warm-up training.

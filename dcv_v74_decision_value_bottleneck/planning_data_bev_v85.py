@@ -10,6 +10,7 @@ from planning_data_v84 import (
     process_raw_record,
 )
 from raw_record_bev_v85 import INPUT_MODE
+from trajectory_gt_v85 import GT_CONTRACT, aligned_expert
 from bev_geometry_v85 import (
     RASTER_LAYOUT, SCHEMA_REVISION, bev_to_legacy_raster, legacy_to_bev_raster,
 )
@@ -47,6 +48,9 @@ def process_bev_raw_record(
         raise KeyError(f"BEV raw record is missing {missing}")
 
     compatibility = dict(raw)
+    # Candidate-proxy preprocessing historically resampled GT by arc length
+    # and rejected stationary logs. Its temporary target is replaced below.
+    compatibility.pop("expert_trajectory_ego", None)
     compatibility["image"] = raw["bev_rgb"]
     # V8.4 metrics use x-columns; BEV uses x-rows. Adapt only the metric
     # rasters, not the visual image, route coordinates or world bounds.
@@ -58,10 +62,19 @@ def process_bev_raw_record(
         min_candidates=min_candidates,
         max_candidates=max_candidates,
     )
+    expert, times, has_gt = aligned_expert(raw)
     sample.update(
         {
             "schema_version": np.int64(SCHEMA_VERSION),
             "schema_revision": np.int64(SCHEMA_REVISION),
+            "gt_contract": np.str_(GT_CONTRACT),
+            "expert_trajectory": expert[:, :2],
+            "expert_heading": expert[:, 2],
+            "planning_time_s": times,
+            "trajectory_gt_available": np.bool_(has_gt),
+            "expert_is_fallback": np.bool_(not has_gt),
+            "traversable": np.asarray(raw["traversable"], dtype=bool),
+            "dynamic_obstacle": np.asarray(raw["dynamic_obstacle"], dtype=bool),
             "metric_raster_layout": np.str_(RASTER_LAYOUT),
             "sdf": legacy_to_bev_raster(sample["sdf"]),
             "input_mode": np.str_(INPUT_MODE),

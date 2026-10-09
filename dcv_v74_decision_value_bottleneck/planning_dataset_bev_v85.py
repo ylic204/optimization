@@ -9,17 +9,39 @@ from torch.utils.data import Dataset
 
 from raw_record_bev_v85 import INPUT_MODE
 from bev_geometry_v85 import RASTER_LAYOUT, SCHEMA_REVISION
+from trajectory_gt_v85 import GT_CONTRACT
 
 
 class PlanningDatasetBEVV85(Dataset):
-    def __init__(self, root, image_side=288):
+    def __init__(self, root, image_side=288, require_trajectory_gt=False):
         self.files = sorted(Path(root).rglob("*.npz"))
         if not self.files:
             raise FileNotFoundError(f"no processed BEV NPZ files under {root}")
         self.image_side = int(image_side)
+        self.require_trajectory_gt = require_trajectory_gt
         with np.load(self.files[0], allow_pickle=False) as data:
             self.bev_config_json = self._validate_metadata(data, self.files[0])
             self.bev_config = json.loads(self.bev_config_json)
+        if require_trajectory_gt:
+            for path in self.files:
+                with np.load(path, allow_pickle=False) as data:
+                    if self._validate_metadata(data, path) != self.bev_config_json:
+                        raise ValueError(f"{path} uses a different BEV geometry")
+                    self._validate_gt(data, path)
+
+    def _validate_gt(self, data, path):
+        needed = ("gt_contract", "trajectory_gt_available", "expert_is_fallback", "planning_time_s", "expert_trajectory")
+        if any(key not in data for key in needed):
+            raise ValueError(f"{path} lacks recorded GT metadata; re-export nuPlan with future timestamps")
+        if (str(data["gt_contract"].item()) != GT_CONTRACT
+                or not bool(data["trajectory_gt_available"].item())
+                or bool(data["expert_is_fallback"].item())):
+            raise ValueError(f"{path} lacks time-aligned recorded GT; re-export nuPlan with future timestamps")
+        times, expert = data["planning_time_s"], data["expert_trajectory"]
+        if (times.shape != (16,) or expert.shape != (16, 2)
+                or not np.isfinite(times).all() or not np.isfinite(expert).all()
+                or (np.diff(np.r_[0., times]) <= 0).any()):
+            raise ValueError(f"{path} has invalid trajectory GT/timestamps")
 
     def _validate_metadata(self, data, path):
         revision = int(data["schema_revision"].item()) if "schema_revision" in data else 0
@@ -70,6 +92,8 @@ class PlanningDatasetBEVV85(Dataset):
                     f"{self.image_side}x{self.image_side}; fixed metric scale forbids resizing"
                 )
             region_bounds = data["region_world_bounds"].astype(np.float32)
+            if self.require_trajectory_gt:
+                self._validate_gt(data, self.files[index])
             expected_regions = self.bev_config["region_grid"] ** 2
             if region_bounds.shape != (expected_regions, 4):
                 raise ValueError(
@@ -102,6 +126,10 @@ class PlanningDatasetBEVV85(Dataset):
                 "expert_is_fallback": torch.tensor(
                     data["expert_is_fallback"].item()
                 ).bool(),
+                "trajectory_gt_available": torch.tensor(data["trajectory_gt_available"].item()).bool(),
+                "planning_time_s": torch.from_numpy(data["planning_time_s"].astype(np.float32)),
+                "traversable": torch.from_numpy(data["traversable"].astype(bool)),
+                "dynamic_obstacle": torch.from_numpy(data["dynamic_obstacle"].astype(bool)),
                 "goal_state": torch.from_numpy(
                     data["goal_state"].astype(np.float32)
                 ),

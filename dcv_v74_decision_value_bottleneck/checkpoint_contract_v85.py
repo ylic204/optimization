@@ -2,6 +2,7 @@
 
 from bev_geometry_v85 import SCHEMA_REVISION
 from raw_record_bev_v85 import INPUT_MODE
+from bev_solver_environment_v85 import SELECTOR_TEXT_CONTRACT, ENVIRONMENT_CONTRACT
 
 
 def validate_checkpoint_contract(checkpoint, args, dataset, stage):
@@ -15,6 +16,12 @@ def validate_checkpoint_contract(checkpoint, args, dataset, stage):
             raise ValueError("checkpoint and data use different BEV geometry")
         if checkpoint.get("data_schema_revision") != SCHEMA_REVISION:
             raise ValueError("checkpoint uses stale BEV labels; regenerate data and retrain the metric stage")
+        if checkpoint.get("selector_text_contract") != SELECTOR_TEXT_CONTRACT:
+            raise ValueError("checkpoint lacks task/model requirements conditioning; retrain the metric stage")
+        if stage == "rl" and checkpoint.get("training_stage") == "rl":
+            expected = ENVIRONMENT_CONTRACT if args.rl_backend == "llm_solver" else "candidate_metric_proxy_v1"
+            if checkpoint.get("reward_environment") != expected:
+                raise ValueError("RL checkpoint reward environment mismatch")
     saved = checkpoint.get("args", {})
     for key in ("region_grid", "prune_layer", "hidden", "latent_dim", "mask_steps", "max_text_length"):
         if key in saved and saved[key] != getattr(args, key):

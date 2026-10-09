@@ -1,225 +1,106 @@
-# V8.5: corrected BEV + gradient distillation + outcome RL post-training
+# V8.5 staged Selector training with frozen modeling and solver outcomes
 
-## Audit and scope
+## Scope and audit
 
-The upstream `main` used `PlanningDatasetV84` and a generic RGB entry point.
-The upstream `v85-bev-input` branch added explicit ego-centric BEV but did
-not wire V8.5 into the older V7/V7.3 RL trainers. This revision builds on the
-BEV branch and adds a genuine policy-gradient post-training stage.
+`main` uses first-person RGB. `v85-bev-input` added BEV; `v85-bev-rl-posttraining`
+added policy gradients but still rewarded a candidate-cost argmin. This branch adds:
+**BEV subset -> frozen Qwen optimization JSON -> continuous trajectory solver -> GT feedback**.
+The only learned action is a region subset. Modeling weights and solver are frozen.
+All baselines use the same downstream environment.
 
-This is **RL post-training of the Selector and ND field on a frozen VLM**,
-not RL fine-tuning of Qwen weights or closed-loop driving RL. Given one
-offline scene, the action is a fixed-budget region subset and the outcome
-is a chosen candidate trajectory: an offline contextual-bandit formulation.
+## Stages and total losses
 
-## Full workflow
+1. Export current/past BEV; separately preserve future logged rear-axle poses and actual timestamps.
+   Process revision3. Split by full log. Primary RL rejects absent/fallback GT before loading Qwen.
+2. Metric warm-up: freeze Qwen/Selector/field, train the candidate metric proxy head on full and random
+   physically pruned observations. Loss `J_proxy + λ_metric L_metric`; select by random-mask metric MAE.
+3. Distill warm-up: freeze Qwen and proxy head; train Selector/field using the projected mask gradient
+   of label-based expected normalized candidate regret. This Teacher is a differentiable proxy,
+   not a derivative through discrete JSON generation or SLSQP.
+4. Primary RL: initialize from distillation. Freeze Qwen/head. Sample G>=2 independent fixed-budget
+   region actions; generate and solve each problem, score trajectories with GT, and update only Selector/field.
+   Reuse early vision features, execute each downstream outcome serially.
+5. Evaluate deterministic Top-K using the same modeling/solver chain; checkpoint by learned task loss
+   over all scenes including failures. Save episode models, solver statuses, trajectories and GT.
 
-1. Export current/past nuPlan map, actors, route and traffic controls into a
-   fixed-metric BEV; do not render future ego trajectories or load cameras.
-2. Convert raw records to **schema 85 revision 2**, generating candidate
-   trajectories and eight independent metric labels. Metric raster adapters
-   align x/y conventions without modifying the visual image. Old revision-1
-   processed records and BEV checkpoints must not be used for post-training.
-3. Split by entire log/scenario; adjacent frames cannot cross train/val/test.
-4. `--stage metric`: supervise the metric head on full-token and random
-   budgeted observations. Freeze Qwen, Selector and mask field. Use actual
-   token deletion, not zero-filled slots. Select checkpoints by random-mask
-   validation metric MAE.
-5. `--stage distill`: load the metric checkpoint, freeze the metric head and
-   Qwen, and train Selector/mask field. Differentiate a relaxed mask task
-   objective to obtain a local projected Teacher direction. Distill the same
-   field that fixed-step ND executes. Evaluate task loss and `L_improve` on
-   physically pruned initial/final Top-K sets. Selected-only unit-forward
-   gates provide a **biased surrogate**, not an exact discrete derivative.
-6. `--stage rl`: load the distilled checkpoint, keep Qwen/head frozen, and
-   sample G >= 2 budget-valid region subsets per scene. Run each sampled
-   subset through the actual shortened ViT/merger/LLM stream with no Qwen
-   autograd graph; reuse cached early visual features. Compute rewards using
-   metric labels, not predicted metrics as self-assigned rewards. Update
-   Selector/ND via REINFORCE with a leave-one-out baseline and a frozen
-   reference-policy anchor. Sampled outcomes are executed serially.
-7. Evaluate deterministic final Top-K against full/random baselines on a
-   held-out split. Report selected-trajectory regret, predicted metric MAE,
-   safety proxies, and actual end-to-end latency/peak memory. GPU throughput
-   and closed-loop safety require separate experiments, not unit tests.
-
-## Shared field and losses
-
-Let `C_k = {w: 0 <= w_i <= 1, sum_i w_i = k}` on valid regions.
+For valid regions C_k={0<=w<=1, sum(w)=k}:
 
 ```math
-w_T^+ = \Pi_{C_k}(w - \eta_T \nabla_w J_{\mathrm{relaxed}}(w)),
-\qquad v_T = (w_T^+ - w)/\eta_T.
+w_T^+=\Pi_{C_k}(w-\eta_T\nabla_w J_{proxy}(w)),\quad v_T=(w_T^+-w)/\eta_T,
+\qquad w^{s+1}=\Pi_{C_k}(w^s+\eta_s v_\theta(w^s,z,c,s/S)).
 ```
 
-The Teacher is a **fixed pretrained metric head plus frozen Qwen**, evaluated
-at a relaxed mask with access to full early visual features and training
-labels. It is not a separate all-token expert planner or an expert-trajectory
-flow. `J` is label-based expected normalized candidate regret, with candidate
-probabilities derived from predicted penalized costs. The Teacher direction
-is in mask space, not vehicle-control or Qwen-parameter space.
+Gradient/FM matching trains this same field; ND executes it. No trajectory-FM/ND cascade.
+`L_gfm` matches direction, log-norm and projected next state. The projection uses the active-set
+Jacobian. Deployment and RL use final pre-projection scores to avoid saturated ties/zero gradients.
 
 ```math
-w^{s+1}=\Pi_{C_k}(w^s+\eta_s v_\theta(w^s,z,c,s/S)).
+L_{distill}=L_{task,proxy}+\lambda_g L_{gfm}+\lambda_z L_{latent}
++\lambda_v L_{value}+\lambda_i L_{improve,proxy}.
 ```
 
-Gradient matching trains this field; ND executes this same field. There is
-no `trajectory Flow -> separate ND` cascade. The projection backward now
-uses its active-set tangent Jacobian rather than a detached-threshold identity.
-At active-set boundaries, the derivative is inherently nonsmooth.
+Proxy improvement is `ReLU(J_final-stopgrad(J_initial)+margin)`. Both endpoints actually gather K
+visual groups; unit-forward selected-only gates give a biased hard-selection derivative. Teacher
+gradients instead use the separate soft-mask path. Value loss is proxy set-loss regression, not
+an RL critic. The frozen metric loss remains a constant monitor. Proxy warm-up does not certify
+primary trajectory loss.
 
-Metric pretraining:
+## Primary reward and RL loss
+
+[The environment contract](README_V85_SOLVER_FEEDBACK.md) excludes candidate geometry/labels, GT,
+semantic counts and audit rasters from modeling. Selector text describes both task and model evidence needs.
+
+For success `J_raw = λ_A ADE + λ_F FDE + λ_S(collision_static + offroad_static)`,
+`J=min(J_raw,0.999 C_fail)`. Invalid models/infeasible/failed solves have `J=C_fail`, no successful
+trajectory. Defaults: 1/0.25/1, C_fail=100. ADE/FDE use identical times/rear-axle frame in meters;
+reports stay unclipped, failed errors are null. Safety terms are current-raster centerline proxies.
 
 ```math
-L_{\mathrm{metric-stage}}=J+\lambda_{\mathrm{metric}}L_{\mathrm{metric}},
+L_{improve}=ReLU(J(a)-stopgrad(J(a_0))+m),\quad r_g=-J(a_g)-\lambda_i L_{improve}(a_g).
 ```
 
-averaged over full and random budgeted observations.
+Initial Selector Top-K a_0 uses identical K and environment. This is endpoint improvement;
+margin0 allows ties and does not ensure stepwise descent. Rewards/model/solver are detached.
 
-Distillation:
+The final scores h define a Plackett-Luce ordered draw of K distinct regions:
 
 ```math
-L_{\mathrm{distill}}=L_{\mathrm{task}}
-+\lambda_{\mathrm{gfm}}L_{\mathrm{gfm}}
-+\lambda_{\mathrm{latent}}L_{\mathrm{latent}}
-+\lambda_{\mathrm{value}}L_{\mathrm{value}}
-+\lambda_{\mathrm{improve}}L_{\mathrm{improve}}.
+\log\pi_\theta(a|o)=\sum_{j=1}^K\log
+\frac{\exp(h_{a_j}/\tau)}{\sum_{i\notin\{a_1,...,a_{j-1}\}}\exp(h_i/\tau)}.
 ```
 
-The metric head is fixed here; `L_metric` is still logged/added as a constant
-monitoring term, not a metric-head training signal. `L_gfm` matches direction,
-norm and projected next state. `L_value` regresses task loss; it is not a critic
-used by the RL stage. Both endpoint costs use hard Top-K deletion:
+Order is an auxiliary action; sort spatially before Qwen. We do not claim unordered-set logp.
+No new observation, ND update or modeling call occurs between draws. With detached leave-one-out
+advantage `A_g=r_g-mean(other rewards)`:
 
 ```math
-L_{\mathrm{improve}}=\operatorname{ReLU}
-(J_{\mathrm{hard}}(w^S)-\operatorname{stopgrad}J_{\mathrm{hard}}(w^0)+m).
+L_{RL}=-mean(A_g\log\pi_\theta(a_g|o))+\beta\bar D_{conditional}-\alpha\bar H_{conditional}.
 ```
 
-This penalizes insufficient **endpoint** improvement. `m=0` allows ties;
-neither this loss nor a fixed positive step size guarantees every step descends.
-Stop-gradient removes the direct incentive to worsen the baseline, not all
-effects of future shared-parameter updates.
+KL/entropy average over K conditional draws; KL is an anchor surrogate, not exact subset KL.
+The reference copies only small modules, sharing frozen 8B backbone/head. This is offline
+contextual-bandit REINFORCE, not PPO/GRPO/closed-loop driving. Fixed K gives a constant token penalty;
+use budget sweeps and complete latency measurements to assess efficiency.
 
-## Exact sampled-action probability
+## Commands, migration and evaluation
 
-The last **pre-projection proposal** supplies scores `h` for a Plackett-Luce
-draw of K distinct regions; all ND states themselves remain projected and
-budget-feasible. The same proposal supplies deterministic deployment Top-K.
-This avoids arbitrary saturated-mask ties and a zero policy Jacobian when
-the final projected mask is entirely binary. With zero ND steps, the initial
-selector logits are used. For an ordered action `a=(a_1,...,a_k)`:
+Use [root README commands](../README.md). Training/evaluation default to `llm_solver`.
+`candidate_proxy` is an explicit historical ablation; its metrics are candidate regret/MAE,
+not trajectory ADE/FDE. A new-contract distilled checkpoint can be evaluated in solver mode before RL.
+Old timestamp-free raw requires re-export; old revision2 data/checkpoints or task-text-only checkpoints
+are rejected. Retrain metric -> distill -> RL. Resume initializes weights, not optimizer/RNG.
+Keep backbone weights, architecture, task, budget and geometry fixed across stages.
 
-```math
-\log\pi_\theta(a\mid o)=\sum_{j=1}^k
-\log\frac{\exp(h_{a_j}/\tau)}
-{\sum_{i\notin\{a_1,...,a_{j-1}\}}\exp(h_i/\tau)}.
-```
+Full/random/initial/learned use identical prompts, schema, decoder, solver, times, ego/goal and GT.
+Full uses R tokens; the other three use K. Each validation emits aggregate JSON and episode JSONL.
+Task loss includes failures. ADE/FDE are success-only, so always report success/failure rates alongside them.
+Environment time excludes early encoding/Selector/ND and is not complete inference latency.
 
-Order is an auxiliary action variable: Qwen receives the selected indices in
-spatial order. The code records the joint probability of the **ordered draw**,
-not a falsely claimed unordered-set probability. A subset's outcome is
-order-invariant, so score-function learning over draws is valid. Sampling
-without replacement is not sequential patch acquisition: there is no new
-observation, Qwen call or ND state update between individual draws.
+The frozen model can return invalid JSON; failure rate/decode budget require real-data measurement.
+The point QP has per-axis speed/acceleration, not bicycle dynamics. Generated corridors/halfspaces may
+omit hazards. Swept footprints, time-indexed actors, official red-light/comfort checks and nuPlan
+closed-loop evaluation remain extensions. No claim of measured improvement from CPU tests.
 
-Let `j(a)` be the candidate chosen by the frozen predicted-cost head. Reward
-uses independent labels for that chosen candidate:
-
-```math
-r_g=-\mathrm{regret}_{\mathrm{true}}(j(a_g))
--\lambda_{\mathrm{violation}}\mathbf1[\text{labelled limit violation}]
--\lambda_{\mathrm{improve}}\operatorname{ReLU}
-(\mathrm{regret}_g-\operatorname{stopgrad}\mathrm{regret}_{\mathrm{initial}}+m).
-```
-
-The same hard decision regret is used at both RL endpoints; this differs from
-distillation's differentiable expected-regret objective. Reward limits are
-still dataset proxies, not a safety certificate. At fixed K a token-count
-penalty is constant, so none is advertised as learning efficiency.
-
-For independently sampled outcomes, `A_g = r_g - mean_{h != g}(r_h)`.
-Rewards and advantages are detached; no learned critic is required.
-
-```math
-L_{\mathrm{RL}}=-\operatorname{mean}_g[A_g\log\pi_\theta(a_g\mid o)]
-+\beta\overline{D}_{\mathrm{conditional}}
--\alpha\overline{H}_{\mathrm{conditional}}.
-```
-
-KL and entropy are averaged over the K conditional categorical decisions
-along sampled draws; the KL is a reference-anchor surrogate, not asserted to
-be the exact unordered-set KL. The reference freezes the small modules from
-the starting distilled checkpoint; it does not duplicate the 8B backbone.
-This implementation is **REINFORCE, not PPO/GRPO**: no old-policy ratio,
-clipped multi-epoch objective or claim of GRPO reproduction is made.
-
-## Commands
-
-From `dcv_v74_decision_value_bottleneck`, after regenerating processed data:
-
-```bash
-export TRAIN_DATA=/data/v85_bev/processed/train
-export VAL_DATA=/data/v85_bev/processed/val
-export VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct
-export DEVICE=0
-export LOAD_4BIT=1
-
-STAGE=metric EPOCHS=10 bash run_v85.sh "$PWD" \
-  --output checkpoints/v85_bev_metric.pt
-
-STAGE=distill EPOCHS=20 RESUME=checkpoints/v85_bev_metric.pt \
-  bash run_v85.sh "$PWD" --output checkpoints/v85_bev_distill.pt
-
-EPOCHS=10 RESUME=checkpoints/v85_bev_distill.pt RL_GROUP_SIZE=4 \
-  bash run_v85_rl.sh "$PWD" --lr 5e-5 --output checkpoints/v85_bev_rl.pt
-
-python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_bev_rl.pt \
-  --data /data/v85_bev/processed/test \
-  --nuplan-task tasks/nuplan_safe_progress.json \
-  --pointnav-task tasks/pointnav_safe_short.json \
-  --device cuda:0 --load-4bit
-```
-
-Hyperparameters/epochs above are starting points, not measured optimal values.
-Keep model architecture, model weights, BEV geometry, budget and task JSON
-consistent between stages. `--resume` initializes weights; it does **not**
-restore optimizer/RNG/data-loader state for an exact interrupted-run resume.
-Cross-view initialization is only an explicit option for metric pretraining.
-Stage, geometry, architecture and label revision are checked before loading
-resumed modules. CLI default stage is `metric`; RL cannot silently start fresh.
-
-## Tests and remaining limits
-
-```bash
-python -m pytest -q test_v85_posttraining.py test_v85_bev.py \
-  test_v85_gradient_flow.py test_v84_data.py test_v79_spatial_paths.py
-bash -n run_v85.sh run_v85_rl.sh
-```
-
-CPU tests cover raster conversion and actor-center detection, processed-label
-alignment, stale-data/checkpoint rejection, projection finite-difference
-gradients, binary-mask policy-gradient continuity, hard-pruning forward parity,
-ordered-action probabilities and
-budget validity, external rewards, a rewarded-action policy-gradient update,
-and all three training loops with small substitute components. They do not
-load actual Qwen weights or exercise the nuPlan simulator.
-
-Remaining research limitations:
-
-- Collision labels use centerline samples and present obstacles, not swept
-  vehicle footprints or time-indexed future actor motion.
-- Traffic-light semantics are rendered, but there is no explicit red-light
-  violation label; history is not itself a dynamics predictor.
-- Discomfort is a curvature proxy, not measured acceleration/jerk.
-- Exported expert trajectories/SDF are not fed into the current main losses.
-- Soft penalty objectives do not guarantee safe feasible trajectories.
-- All regions are processed by early ViT before selection; only later ViT,
-  merger/DeepStack and LLM work can be reduced. ND and multiple RL rollouts
-  also cost compute. Memory/latency claims require actual GPU measurement.
-- Geometry repair invalidates old labels; RL cannot compensate for incorrect
-  ground truth. Better labels and closed-loop rewards are a separate extension.
-
-API background: [PyTorch score-function / distributions documentation](https://docs.pytorch.org/docs/stable/distributions.html).
-For the distinct PPO/GRPO formulation, see [DeepSeekMath](https://arxiv.org/abs/2402.03300).
+Sources: [Qwen3-VL API](https://huggingface.co/docs/transformers/model_doc/qwen3_vl),
+[SciPy SLSQP](https://docs.scipy.org/doc/scipy/reference/optimize.minimize-slsqp.html),
+[nuPlan metrics](https://github.com/motional/nuplan-devkit/blob/master/docs/metrics_description.md).

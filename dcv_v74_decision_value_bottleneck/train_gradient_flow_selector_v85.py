@@ -26,6 +26,11 @@ from rl_posttraining_v85 import (
     decision_outcomes, policy_gradient_loss, sample_region_action,
 )
 from checkpoint_contract_v85 import validate_checkpoint_contract
+from bev_solver_environment_v85 import (
+    ENVIRONMENT_CONTRACT, SELECTOR_TEXT_CONTRACT, FrozenBEVSolverEnvironment,
+    environment_losses, selector_requirement_text, summarize_outcomes,
+)
+from qwen3vl_selector_v79 import topk_region_indices
 
 
 def move_batch(batch, device):
@@ -38,7 +43,7 @@ def move_batch(batch, device):
 def task_texts(raw, source_id, args):
     overrides = (args.nuplan_text, args.pointnav_text)
     return [
-        overrides[int(domain)] or text
+        selector_requirement_text(overrides[int(domain)] or text)
         for text, domain in zip(raw["task_text"], source_id.tolist())
     ]
 
@@ -247,12 +252,15 @@ def train_metric_epoch(model, loader, optimizer, args, device, tasks):
     return {key: float(np.mean(value)) for key, value in logs.items()}
 
 
-def train_rl_epoch(model, reference, loader, optimizer, args, device, tasks):
-    """REINFORCE with leave-one-out baseline, true hard pruning and fixed head."""
+def train_rl_epoch(model, reference, loader, optimizer, args, device, tasks, environment=None):
+    """Only mask policy learns; modeling/solver are a frozen reward environment."""
+    solver_backend = args.rl_backend == "llm_solver"
+    if solver_backend and environment is None:
+        environment = FrozenBEVSolverEnvironment(model.backbone, args)
     model.selector.train()
     model.mask_flow.train()
     model.metric_head.eval()
-    logs = {key: [] for key in ("loss", "policy", "reward", "regret", "violation", "improve", "kl", "entropy", "advantage_abs")}
+    logs = {key: [] for key in ("loss", "policy", "reward", "task_loss", "violation", "improve", "kl", "entropy", "advantage_abs", "model_failure_rate", "solver_failure_rate")}
     for raw in tqdm(loader, desc="V8.5 outcome RL post-training"):
         batch = move_batch(raw, device)
         task_data = task_parameters(batch["source_id"], tasks, device)
@@ -267,26 +275,41 @@ def train_rl_epoch(model, reference, loader, optimizer, args, device, tasks):
                 encoded, budget, batch["region_world_bounds"]
             )
             _, ref_scores, _ = selection_rollout(reference, ref_selection, ref_positions, ref_valid, args)
-            baseline = planning_from_topk(
-                model, encoded, selection["logits"].detach(), valid, k, batch, task_data, args.decision_temperature
-            )
-            _, initial_regret, _ = decision_outcomes(
-                baseline["predicted_cost"], baseline["oracle_cost"], batch["candidate_valid"],
-                batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
-            )
+            if solver_backend:
+                baseline = environment.evaluate(encoded, topk_region_indices(selection["logits"], valid, k),
+                                                batch, task_texts(raw, batch["source_id"], args))
+                initial_regret = environment_losses(baseline, scores)
+            else:
+                baseline = planning_from_topk(
+                    model, encoded, selection["logits"].detach(), valid, k, batch, task_data, args.decision_temperature
+                )
+                _, initial_regret, _ = decision_outcomes(
+                    baseline["predicted_cost"], baseline["oracle_cost"], batch["candidate_valid"],
+                    batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
+                )
         rewards, logps, entropies, kls, regrets, violations, improvements = [], [], [], [], [], [], []
+        outcomes = []
         for _ in range(args.rl_group_size):
             action, logp, entropy, kl = sample_region_action(
                 scores, valid, k, args.rl_temperature, ref_scores
             )
             # Qwen/head need no autograd graph in RL; cache early vision once.
             with torch.no_grad():
-                fused = model.fuse_indices(encoded, action)
-                result = planning_from_fused(model, fused, batch, *task_data, args.decision_temperature)
-                reward, regret, violation = decision_outcomes(
-                    result["predicted_cost"], result["oracle_cost"], batch["candidate_valid"],
-                    batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
-                )
+                if solver_backend:
+                    result = environment.evaluate(encoded, action, batch, task_texts(raw, batch["source_id"], args))
+                    outcomes.extend(result)
+                    regret = environment_losses(result, scores)
+                    reward = -regret
+                    violation = scores.new_tensor([
+                        (x["collision_proxy"] or 0.) + (x["non_traversable_proxy"] or 0.)
+                        for x in result])
+                else:
+                    fused = model.fuse_indices(encoded, action)
+                    result = planning_from_fused(model, fused, batch, *task_data, args.decision_temperature)
+                    reward, regret, violation = decision_outcomes(
+                        result["predicted_cost"], result["oracle_cost"], batch["candidate_valid"],
+                        batch["candidate_metrics"], task_data[1], task_data[2], args.rl_violation_weight,
+                    )
                 improve = F.relu(regret - initial_regret + args.improve_margin)
                 reward = reward - args.lambda_improve * improve
             rewards.append(reward)
@@ -308,12 +331,14 @@ def train_rl_epoch(model, reference, loader, optimizer, args, device, tasks):
         optimizer.step()
         values = {
             "loss": loss.detach(), "policy": policy.detach(), "reward": rewards.mean(),
-            "regret": torch.stack(regrets).mean(), "violation": torch.stack(violations).mean(),
+            "task_loss": torch.stack(regrets).mean(), "violation": torch.stack(violations).mean(),
             "improve": torch.stack(improvements).mean(), "kl": kls.detach().mean(),
             "entropy": entropies.detach().mean(), "advantage_abs": advantage.abs().mean(),
         }
         for key, value in values.items():
             logs[key].append(float(value))
+        for key in ("model_failure_rate", "solver_failure_rate"):
+            logs[key].append(float(np.mean([x["status"] == key.removesuffix("_rate") for x in outcomes])) if outcomes else 0.)
     return {key: float(np.mean(value)) for key, value in logs.items()}
 
 
@@ -577,7 +602,54 @@ def evaluate_mode(model, encoded, selection, positions, valid, batch, args, task
     }
 
 
-def validate(model, loader, args, device, tasks):
+def validate_solver(model, loader, args, device, environment, outcome_path=None):
+    """Identical model prompt, solver and reward for every baseline."""
+    model.eval()
+    records = {mode: [] for mode in ("full", "random", "initial", "learned")}
+    rng = torch.Generator(device=device).manual_seed(args.seed + 71)
+    stream = None
+    if outcome_path:
+        path = Path(outcome_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = path.open("w", encoding="utf-8")
+    try:
+        with torch.no_grad():
+            for raw in tqdm(loader, desc="V8.5 frozen modeling/solver validation"):
+                batch = move_batch(raw, device)
+                budget = torch.full((batch["image"].shape[0],), args.budget, device=device)
+                texts = task_texts(raw, batch["source_id"], args)
+                encoded, selection, positions, valid = model.encode_and_select(
+                    batch["image"], texts, budget, batch["region_world_bounds"])
+                _, scores, k = selection_rollout(model, selection, positions, valid, args)
+                regions = valid.shape[-1]
+                masks = {
+                    "full": torch.arange(regions, device=device)[None].expand(len(valid), -1),
+                    "random": topk_region_indices(torch.rand(valid.shape, device=device, generator=rng), valid, k),
+                    "initial": topk_region_indices(selection["logits"], valid, k),
+                    "learned": topk_region_indices(scores, valid, k),
+                }
+                for mode, indices in masks.items():
+                    result = environment.evaluate(encoded, indices, batch, texts)
+                    records[mode].extend(result)
+                    if stream:
+                        for row, item in enumerate(result):
+                            record = dict(item, mode=mode, sample_id=raw["sample_id"][row],
+                                          gt_trajectory=batch["expert_trajectory"][row].cpu().tolist())
+                            stream.write(json.dumps(record, allow_nan=False) + "\n")
+    finally:
+        if stream:
+            stream.close()
+    summary = {mode: summarize_outcomes(values) for mode, values in records.items()}
+    for mode in summary:
+        retained = regions if mode == "full" else k
+        summary[mode].update(tokens=retained, token_ratio=retained / regions)
+    return summary
+
+
+def validate(model, loader, args, device, tasks, environment=None, outcome_path=None):
+    if getattr(args, "stage", "metric") == "rl" and args.rl_backend == "llm_solver":
+        environment = environment or FrozenBEVSolverEnvironment(model.backbone, args)
+        return validate_solver(model, loader, args, device, environment, outcome_path)
     model.selector.eval()
     model.metric_head.eval()
     model.mask_flow.eval()
@@ -636,7 +708,7 @@ def parse_args():
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--region-grid", type=int, default=9)
     parser.add_argument("--prune-layer", type=int, default=4)
-    parser.add_argument("--max-text-length", type=int, default=96)
+    parser.add_argument("--max-text-length", type=int, default=192)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--budget", type=float, default=0.15)
@@ -659,6 +731,15 @@ def parse_args():
     parser.add_argument("--rl-kl-weight", type=float, default=0.02)
     parser.add_argument("--rl-entropy-weight", type=float, default=0.001)
     parser.add_argument("--rl-violation-weight", type=float, default=1.0)
+    parser.add_argument("--rl-backend", choices=("llm_solver", "candidate_proxy"), default="llm_solver",
+                        help="candidate_proxy is a legacy ablation; primary RL uses frozen modeling + continuous solver + GT")
+    parser.add_argument("--modeling-max-new-tokens", type=int, default=2048)
+    parser.add_argument("--solver-max-speed", type=float, default=15.0, help="per-axis speed limit, m/s")
+    parser.add_argument("--solver-max-acceleration", type=float, default=4.0, help="per-axis acceleration limit, m/s^2")
+    parser.add_argument("--solver-max-iterations", type=int, default=300)
+    parser.add_argument("--rl-ade-weight", type=float, default=1.0)
+    parser.add_argument("--rl-fde-weight", type=float, default=0.25)
+    parser.add_argument("--rl-failure-cost", type=float, default=100.0)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
@@ -688,6 +769,11 @@ def main():
         raise ValueError("RL requires group-size >= 2 and positive policy temperature")
     if min(args.rl_kl_weight, args.rl_entropy_weight, args.rl_violation_weight) < 0:
         raise ValueError("RL loss weights must be non-negative")
+    if min(args.rl_ade_weight, args.rl_fde_weight) < 0 or args.rl_ade_weight + args.rl_fde_weight <= 0:
+        raise ValueError("trajectory reward needs nonnegative ADE/FDE weights and a positive total")
+    if min(args.rl_failure_cost, args.modeling_max_new_tokens, args.solver_max_speed,
+           args.solver_max_acceleration, args.solver_max_iterations) <= 0:
+        raise ValueError("model/solver configuration must be positive")
     if not 0.0 < args.budget <= 1.0:
         raise ValueError("budget must be in (0, 1]")
     if args.stage == "distill" and args.lambda_gfm > 0.0 and args.mask_steps <= 0:
@@ -715,8 +801,9 @@ def main():
         OptimizationTask.load(args.pointnav_task),
     ]
     image_side = args.region_grid * 32
-    train_dataset = PlanningDatasetBEVV85(args.data, image_side)
-    val_dataset = PlanningDatasetBEVV85(args.val, image_side)
+    needs_gt = args.stage == "rl" and args.rl_backend == "llm_solver"
+    train_dataset = PlanningDatasetBEVV85(args.data, image_side, require_trajectory_gt=needs_gt)
+    val_dataset = PlanningDatasetBEVV85(args.val, image_side, require_trajectory_gt=needs_gt)
     if train_dataset.bev_config_json != val_dataset.bev_config_json:
         raise ValueError("training and validation BEV geometry must be identical")
     train_loader = DataLoader(
@@ -747,6 +834,7 @@ def main():
     model.selector.requires_grad_(args.stage != "metric")
     model.mask_flow.requires_grad_(args.stage != "metric")
     reference = None
+    environment = FrozenBEVSolverEnvironment(model.backbone, args) if needs_gt else None
     if args.stage == "rl":
         # Only duplicate the small trainable modules, never the 8B backbone.
         from gradient_flow_selector_v85 import GradientFlowSelectorV85
@@ -769,14 +857,15 @@ def main():
         elif args.stage == "distill":
             train_metrics = train_epoch(model, train_loader, optimizer, args, device, tasks)
         else:
-            train_metrics = train_rl_epoch(model, reference, train_loader, optimizer, args, device, tasks)
-        validation = validate(model, val_loader, args, device, tasks)
+            train_metrics = train_rl_epoch(model, reference, train_loader, optimizer, args, device, tasks, environment)
+        outcome_path = str(metrics_path.with_suffix(f".epoch{epoch}.outcomes.jsonl")) if needs_gt else None
+        validation = validate(model, val_loader, args, device, tasks, environment, outcome_path)
         record = {"epoch": epoch, "train": train_metrics, "validation": validation}
         history.append(record)
         metrics_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
         print(json.dumps(record, indent=2))
 
-        learned_regret = validation["random"]["metric_mae"] if args.stage == "metric" else validation["learned"]["regret"]
+        learned_regret = validation["random"]["metric_mae"] if args.stage == "metric" else validation["learned"]["task_loss" if needs_gt else "regret"]
         if learned_regret < best:
             best = learned_regret
             torch.save(
@@ -785,6 +874,8 @@ def main():
                     "input_mode": INPUT_MODE,
                     "bev_config_json": train_dataset.bev_config_json,
                     "data_schema_revision": SCHEMA_REVISION,
+                    "selector_text_contract": SELECTOR_TEXT_CONTRACT,
+                    "reward_environment": ENVIRONMENT_CONTRACT if needs_gt else "candidate_metric_proxy_v1",
                     "training_stage": args.stage,
                     "policy_kind": "plackett_luce_ordered_subset_v1" if args.stage == "rl" else "deterministic_topk",
                     "decision_rule": "last_preprojection_scores_v1",

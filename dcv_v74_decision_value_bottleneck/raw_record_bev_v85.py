@@ -31,6 +31,8 @@ def save_bev_raw_record(
     scenario_token="",
     timestamp_us=0,
     iteration=0,
+    expert_time_s=None,
+    planning_time_s=None,
 ):
     """Save a nuPlan BEV sample; no first-person image is accepted."""
     bev_rgb = np.asarray(bev_rgb, dtype=np.uint8)
@@ -46,6 +48,12 @@ def save_bev_raw_record(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    timing = {}
+    if expert_time_s is not None and planning_time_s is not None:
+        timing = dict(expert_time_s=np.asarray(expert_time_s, dtype=np.float64),
+                      planning_time_s=np.asarray(planning_time_s, dtype=np.float64))
+    elif expert_time_s is not None or planning_time_s is not None:
+        raise ValueError("expert and planning timestamps must be supplied together")
     np.savez_compressed(
         output_path,
         raw_schema_version=np.int64(85),
@@ -75,4 +83,5 @@ def save_bev_raw_record(
         scenario_token=np.str_(scenario_token),
         timestamp_us=np.int64(timestamp_us),
         iteration=np.int64(iteration),
+        **timing,
     )

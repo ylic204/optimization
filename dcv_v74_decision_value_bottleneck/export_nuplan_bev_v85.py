@@ -264,9 +264,14 @@ def _future_expert(scenario, iteration, ego_pose, args):
             )
         )
     except (AssertionError, RuntimeError, ValueError):
-        return np.zeros((0, 3), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0)
     if len(states) < 2:
-        return np.zeros((0, 3), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0)
+    anchor = scenario.get_time_point(iteration).time_us
+    states = [state for state in states if state.time_point.time_us > anchor]
+    times = np.asarray([(state.time_point.time_us - anchor) * 1e-6 for state in states])
+    if len(times) != args.future_samples or (np.diff(times) <= 0).any():
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0)
     xy = world_to_ego(
         [[state.rear_axle.x, state.rear_axle.y] for state in states],
         ego_pose,
@@ -275,7 +280,7 @@ def _future_expert(scenario, iteration, ego_pose, args):
         [wrap_angle(state.rear_axle.heading - ego_pose[2]) for state in states],
         dtype=np.float32,
     )
-    return np.concatenate([xy, yaw[:, None]], axis=-1)
+    return np.concatenate([xy, yaw[:, None]], axis=-1), times
 
 
 def export_iteration(scenario, iteration, output_root, config, args):
@@ -308,8 +313,9 @@ def export_iteration(scenario, iteration, output_root, config, args):
     reference = _reference_path_ego(route_edges, ego_pose, config)
     if len(reference) < 2:
         return False
-    expert = _future_expert(scenario, iteration, ego_pose, args)
-    if len(expert) < 2:
+    expert, expert_times = _future_expert(scenario, iteration, ego_pose, args)
+    planning_times = np.arange(1, args.future_samples + 1) * args.future_horizon / args.future_samples
+    if len(expert) < 2 or planning_times[-1] > expert_times[-1] + 1e-7:
         return False
 
     drivable_objects = proximal.get(SemanticMapLayer.DRIVABLE_AREA, [])
@@ -385,6 +391,8 @@ def export_iteration(scenario, iteration, output_root, config, args):
         task_text=args.task_text,
         sample_id=sample_id,
         expert_trajectory_ego=expert,
+        expert_time_s=expert_times,
+        planning_time_s=planning_times,
         bev_config_json=config.to_json(),
         scene_type=scenario.scenario_type,
         log_name=scenario.log_name,
@@ -476,8 +484,8 @@ def main():
         history_seconds=args.history_seconds,
         history_samples=args.history_samples,
     )
-    if args.future_horizon <= 0.0 or args.future_samples < 2:
-        raise ValueError("future supervision requires a positive horizon and >=2 samples")
+    if args.future_horizon <= 0.0 or args.future_samples != 16:
+        raise ValueError("V8.5 processing requires a positive horizon and exactly 16 future samples")
     if args.history_seconds <= 0.0 or args.history_samples < 2:
         raise ValueError("history rendering requires a positive horizon and >=2 samples")
     scenarios = build_scenarios(args)

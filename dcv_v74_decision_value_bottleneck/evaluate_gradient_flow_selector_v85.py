@@ -28,6 +28,8 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--output", default="results/v85_bev_evaluation.json")
     parser.add_argument("--load-4bit", action="store_true")
+    parser.add_argument("--backend", choices=("llm_solver", "candidate_proxy"), default="llm_solver")
+    parser.add_argument("--outcomes", default="", help="per-scene models, solver status, trajectory and GT JSONL")
     return parser.parse_args()
 
 
@@ -52,6 +54,8 @@ def main():
             "load_4bit": cli.load_4bit or saved.get("load_4bit", False),
             "nuplan_task": cli.nuplan_task,
             "pointnav_task": cli.pointnav_task,
+            "stage": "rl",
+            "rl_backend": cli.backend,
         }
     )
     saved.setdefault("nuplan_text", "")
@@ -66,7 +70,7 @@ def main():
         OptimizationTask.load(cli.pointnav_task),
     ]
     image_side = args.region_grid * 32
-    dataset = PlanningDatasetBEVV85(cli.data, image_side)
+    dataset = PlanningDatasetBEVV85(cli.data, image_side, require_trajectory_gt=cli.backend == "llm_solver")
     validate_checkpoint_contract(checkpoint, args, dataset, "evaluate")
     model = build_v85_model(args, device)
     model.selector.load_state_dict(checkpoint["selector"])
@@ -78,7 +82,8 @@ def main():
         shuffle=False,
         num_workers=cli.workers,
     )
-    metrics = validate(model, loader, args, device, tasks)
+    outcomes = cli.outcomes or str(Path(cli.output).with_suffix(".outcomes.jsonl"))
+    metrics = validate(model, loader, args, device, tasks, outcome_path=outcomes)
     output = Path(cli.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(metrics, indent=2), encoding="utf-8")

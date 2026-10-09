@@ -1,212 +1,84 @@
-# V8.5 ego-centric BEV input and nuPlan processing
+# V8.5 BEV input and timestamped nuPlan targets (revision 3)
 
-This branch replaces the first-person camera image with one fixed-metric,
-ego-centric bird's-eye-view raster. It uses a shared Teacher-gradient mask
-field and fixed-step neurodynamics, followed by explicit outcome RL.
-See `README_V85_POSTTRAINING.md` for the staged training protocol and losses.
+## Input boundary
 
-The data design follows the useful input boundary of the ICLR 2026 BIRDriver
-work: use an ego-centric BEV that exposes road structure, route, traffic
-controls, dynamic actors, and short motion history instead of surround-camera
-frames.  This repository does **not** reproduce BIRDriver's VLM keypoint
-generation or scene-type SFT pipeline; the BEV is consumed by the existing
-decision-related token selector.
-
-## 1. Input contract
-
-The default frame is:
+One fixed-metric ego-centric RGB raster is rendered from map/route, current tracked actors,
+traffic lights, past 2-second histories, ego and map reference/goal. The exporter uses
+`include_cameras=False`. There is no first-person image or camera-to-BEV network.
+The renderer never receives expert future poses.
 
 | Property | Default |
-|---|---:|
-| Raster | `288 x 288` RGB |
-| Longitudinal range | `x in [-16, 64] m` |
-| Lateral range | `y in [-40, 40] m` |
-| Convention | `x` forward, `y` left, origin at ego rear axle |
-| Selector regions | `9 x 9 = 81` |
-| Region size | `32 x 32 px`, about `8.89 x 8.89 m` |
-| Actor history | 2 seconds, 5 samples |
+|---|---|
+| RGB | 288×288 |
+| Bounds | x∈[-16,64]m, y∈[-40,40]m |
+| Frame | current ego rear axle; x forward, y left |
+| Raster layout | rows x descending, columns y descending |
+| Regions | 9×9=81; 32px per region |
+| History | 2s, 5 samples |
+| Future target | 8s, 16 future timestamps; t0 is excluded from ADE |
 
-The extent and raster size are fixed for every sample.  The dataset rejects
-mixed geometries and never resizes BEV images, because resizing would change
-the metric meaning of each visual region.
+Geometry is fixed across splits and never resized. Region centers from `region_world_bounds`
+condition the field. Semantic layers/counts are audit labels, not policy features.
+Early ViT sees all regions; retained tokens can contain early attention context from other regions.
+Compression removes groups from later ViT/merger/DeepStack/LLM, not from sensor acquisition.
 
-The mask field receives region-center positions derived from
-`region_world_bounds` in physical `x-forward/y-left` order, normalized over
-the fixed support.  It no longer uses generic image `column/row` coordinates.
+## GT and schema
 
-The RGB BEV contains drivable area, route roadblocks, lane centerlines,
-crosswalks, the route reference, traffic-light control lines, tracked agents,
-their past tracks, ego, and the route goal.  A channel-first semantic raster is
-saved beside RGB for auditing; it is not provided to the Student as a
-privileged input.
+nuPlan supplies recorded expert future rear-axle poses, not optimization-model JSON labels.
+Exporter `_future_expert` stores `state.time_point.time_us - anchor.time_us` in seconds and
+checks sample count/order/horizon coverage. Missing or insufficient future is skipped.
+Processed revision3 interpolates by **time**, with the current pose (0,0,0) at t0;
+stationary GT is valid. There is no arc-length resampling or extrapolation of future GT.
 
-## 2. Leakage boundary
+| Field | Meaning / use |
+|---|---|
+| raw `expert_trajectory_ego [N,3]` | recorded future x,y,yaw; target only |
+| raw `expert_time_s [N]` | actual future timestamps relative to anchor |
+| raw `planning_time_s [16]` | protocol grid, default 0.5..8.0 seconds |
+| processed `expert_trajectory [16,2]` | time-interpolated GT xy |
+| `expert_heading [16]` | time-interpolated wrapped yaw |
+| `trajectory_gt_available` | true only when recorded timestamps/poses exist |
+| `expert_is_fallback` | missing GT marker; fallback never allowed in solver RL |
+| `gt_contract` | `ego_rear_axle_future_seconds_v1` |
+| `schema_version / schema_revision` | 85 / 3 |
+| `metric_raster_layout` | `bev_x_rows_y_cols` |
+| `bev_rgb / region_world_bounds` | visual/policy input and public fixed geometry |
+| `traversable / dynamic_obstacle` | current static occupancy reward labels only |
+| candidate fields | proxy warm-up labels/features, excluded from primary modeling |
 
-Only information available at the current timestamp or in the past can enter
-the raster:
+Timestamp-free old raw can still produce proxy-only revision3 samples marked unavailable,
+but primary RL/evaluation preflight rejects them. Re-export these records for primary runs.
+Old processed revision1/2 and checkpoints are rejected. Do not fabricate times from arc length.
+The raster adapter retains the revision2 geometry correction: transpose/flip metric rasters to
+V8.4 orientation before proxy labeling and convert SDF back; RGB is not rotated.
 
-- current map, route IDs, and traffic-light status;
-- current tracked objects;
-- up to two seconds of past tracked-object positions;
-- the route reference assembled from map roadblocks.
+## Export and process
 
-`get_ego_future_trajectory` is used only to write
-`expert_trajectory_ego`, which is saved for future expert-supervised work.
-Current candidate generation and metric labels use map/reference/raster
-geometry; the expert trajectory is not consumed by the V8.5 training losses.
-The renderer does not accept this future trajectory, so it cannot leak into
-`bev_rgb` or the semantic layers.
-
-## 3. Processing graph
-
-```text
-nuPlan DB + maps
-  -> export_nuplan_bev_v85.py
-  -> raw BEV NPZ (schema 85, camera-free)
-  -> process_planning_bev_v85.py
-  -> processed BEV NPZ + candidates/metrics/SDF
-  -> log-disjoint train/val/test
-  -> PlanningDatasetBEVV85
-  -> V8.5 selector + shared mask field + fixed-step ND
-```
-
-The exporter requests scenarios with `include_cameras=False`; no camera frame
-is loaded or serialized.
-
-## 4. Export raw nuPlan BEV records
-
-Run the exporter in the environment containing the pinned nuPlan devkit and
-dataset dependencies:
+Use a nuPlan devkit environment with the dataset and maps installed:
 
 ```bash
-cd /path/to/optimization/dcv_v74_decision_value_bottleneck
-
 python export_nuplan_bev_v85.py \
-  --data-root /data/nuplan/dataset \
-  --map-root /data/nuplan/maps \
+  --data-root /data/nuplan/dataset --map-root /data/nuplan/maps \
   --db-files /data/nuplan/splits/train/*.db \
-  --output-root /data/v85_bev/raw/train \
-  --frame-stride 10 \
-  --future-horizon 8.0 \
-  --future-samples 16 \
-  --history-seconds 2.0 \
-  --history-samples 5
-```
-
-Useful smoke-test options:
-
-```bash
-python export_nuplan_bev_v85.py \
-  --data-root /data/nuplan/dataset \
-  --map-root /data/nuplan/maps \
-  --db-files /data/nuplan/splits/mini/*.db \
-  --output-root /data/v85_bev/raw_smoke \
-  --limit-scenarios 20 \
-  --frame-stride 20
-```
-
-Records missing a valid route reference, expert future, or traversable raster
-are skipped and counted.  Directory identity preserves
-`log_name/scenario_token/iteration.npz`, which supports log-disjoint splits.
-
-## 5. Build candidate-planning samples
-
-Run this step in the existing planning-data environment:
-
-```bash
+  --output-root /data/v85_bev/raw_r3/train \
+  --frame-stride 10 --future-horizon 8 --future-samples 16 \
+  --history-seconds 2 --history-samples 5
 python process_planning_bev_v85.py \
-  --raw-root /data/v85_bev/raw/train \
-  --output-root /data/v85_bev/processed/train \
-  --min-candidates 8 \
-  --max-candidates 32
+  --raw-root /data/v85_bev/raw_r3/train --output-root /data/v85_bev/r3/train \
+  --min-candidates 8 --max-candidates 32
 ```
 
-`planning_data_bev_v85.py` reuses the V8.4 candidate generator, eight task
-metrics, and SDF construction, then writes schema 85 metadata.  The temporary
-`image` compatibility key exists only inside preprocessing; the stored and
-loaded model input is `bev_rgb`, and the raw record never contains a generic
-camera `image` field.
+Keep complete logs disjoint across train/val/test; preserve log/scenario/iteration identity.
+Use the same geometry and horizon for all splits. Current processed model family requires exactly
+16 future points. Smoke export can use `--limit-scenarios 20 --frame-stride 20` on mini logs.
+Inspect route direction, current actor location, traffic lines and metric bounds before training.
 
-**Reprocess old processed data.** Processed schema 85 revision 2 fixes a
-coordinate mismatch: BEV rows are descending x and columns descending y,
-whereas V8.4 metrics assume y rows and ascending x columns. The new adapter
-transposes/flips traversable and obstacle rasters before V8.4 processing,
-then converts the output SDF back to BEV orientation. No visual RGB is rotated.
-Old revision-1 labels and checkpoints are rejected rather than silently reused.
-Raw BEV records do not need to be exported again solely for this fix.
+[Root commands](../README.md) cover all stages and evaluation.
+`PlanningDatasetBEVV85(..., require_trajectory_gt=True)` checks GT and geometry before primary
+training loads Qwen. Expert labels/occupancy can be in a batch for reward; the modeling function
+uses an explicit allowlist and never forwards that batch to the LLM.
 
-Split by complete `log_name` before reporting results.  Do not randomly split
-individual frames from the same log across train, validation, and test.
-
-## 6. Processed schema additions
-
-| Field | Shape | Meaning |
-|---|---|---|
-| `input_mode` | scalar | exactly `ego_centric_bev_v85` |
-| `schema_revision` | scalar | processed data must be revision 2 |
-| `metric_raster_layout` | scalar | `bev_x_rows_y_cols`, also the stored SDF orientation |
-| `bev_rgb` | `[288,288,3]` | only visual input consumed by the VLM |
-| `bev_semantic` | `[15,288,288]` | audit-only semantic channels |
-| `bev_config_json` | scalar string | metric bounds, size, grid, history config |
-| `region_world_bounds` | `[81,4]` | `[xmin,xmax,ymin,ymax]` per visual region |
-| `region_semantic_counts` | `[81,15]` | audit-only semantic occupancy per region |
-| `scene_type` | scalar string | nuPlan scenario type for stratified analysis |
-
-The existing candidate fields remain: `candidate_trajectories`,
-`candidate_features`, `candidate_metrics`, `candidate_valid`, `goal_state`,
-`ego_state`, `sdf`, and task text.
-
-## 7. Train and evaluate
-
-```bash
-TRAIN_DATA=/data/v85_bev/processed/train \
-VAL_DATA=/data/v85_bev/processed/val \
-VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct \
-DEVICE=1 \
-LOAD_4BIT=1 \
-STAGE=metric \
-bash run_v85.sh "$PWD" \
-  --output checkpoints/v85_bev_metric.pt
-```
-
-Then run `STAGE=distill` with `RESUME` pointing at the metric checkpoint,
-followed by `run_v85_rl.sh` with the distilled checkpoint. The complete
-three commands are in `README_V85_POSTTRAINING.md`.
-
-```bash
-python evaluate_gradient_flow_selector_v85.py \
-  --checkpoint checkpoints/v85_bev_rl.pt \
-  --data /data/v85_bev/processed/test \
-  --nuplan-task tasks/nuplan_safe_progress.json \
-  --pointnav-task tasks/pointnav_safe_short.json \
-  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --device cuda:1 \
-  --load-4bit
-```
-
-Checkpoints record `input_mode`, exact `bev_config_json`, label revision,
-training stage, architecture arguments and task specifications.
-Evaluation refuses checkpoints or data with a different view/geometry.  To
-initialize training from old first-person weights, opt in explicitly with
-`ALLOW_CROSS_VIEW_RESUME=1` in the metric stage only. It is weight initialization,
-not a claim of a view-compatible Teacher. Distillation/RL require revised BEV
-checkpoints; a fresh BEV run is the safer default.
-
-## 8. Validation
-
-Camera-free tests that do not load Qwen weights:
-
-```bash
-python -m unittest test_v85_bev.py -v
-python -m pytest -q test_v85_posttraining.py test_v85_gradient_flow.py
-python -m py_compile \
-  bev_renderer_v85.py raw_record_bev_v85.py \
-  planning_data_bev_v85.py process_planning_bev_v85.py \
-  planning_dataset_bev_v85.py export_nuplan_bev_v85.py
-bash -n run_v85.sh run_v85_rl.sh
-```
-
-Before a full export, visually inspect samples from each nuPlan map and verify
-the ego marker, route direction, red-light control line, actor headings, and
-physical extent.  Also compare selected-region statistics by `scene_type` to
-detect a selector that overfits to route paint while ignoring dynamic actors.
+The reported rear-axle/16-point ADE/FDE are this repository's open-loop protocol. Official nuPlan
+planner-expert metrics interpolate at common timestamps but use their own center/horizon/sampling
+conventions. Apply that protocol explicitly before comparing official benchmark numbers.
+See [official metric implementation](https://github.com/motional/nuplan-devkit/blob/master/nuplan/planning/metrics/evaluation_metrics/common/planner_expert_average_l2_error_within_bound.py).
