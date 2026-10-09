@@ -62,9 +62,10 @@ This is not per-step monotonicity or a mathematical convergence guarantee.
 Zero margin permits ties. Detaching the baseline removes its direct gradient
 incentive, but shared-parameter updates may still change future baselines.
 
-The distillation objective combines task, gradient matching, latent alignment,
-set-value regression and endpoint improvement. A fixed-head metric loss is
-also logged as a constant monitor. Set-value regression is not an RL critic.
+The distillation objective combines task, metric prediction, gradient matching,
+latent alignment, set-value regression and endpoint improvement. Metric-head
+parameters are frozen, but the metric loss still backpropagates through its
+inputs to Selector/field. Set-value regression is not an RL critic.
 
 ## Outcome RL follows distillation
 

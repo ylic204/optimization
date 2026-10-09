@@ -35,14 +35,16 @@ Gradient/FM matching trains this same field; ND executes it. No trajectory-FM/ND
 Jacobian. Deployment and RL use final pre-projection scores to avoid saturated ties/zero gradients.
 
 ```math
-L_{distill}=L_{task,proxy}+\lambda_g L_{gfm}+\lambda_z L_{latent}
+L_{distill}=L_{task,proxy}+\lambda_m L_{metric}+\lambda_g L_{gfm}+\lambda_z L_{latent}
 +\lambda_v L_{value}+\lambda_i L_{improve,proxy}.
 ```
 
 Proxy improvement is `ReLU(J_final-stopgrad(J_initial)+margin)`. Both endpoints actually gather K
 visual groups; unit-forward selected-only gates give a biased hard-selection derivative. Teacher
 gradients instead use the separate soft-mask path. Value loss is proxy set-loss regression, not
-an RL critic. The frozen metric loss remains a constant monitor. Proxy warm-up does not certify
+an RL critic. Freezing the metric-head parameters does not detach its inputs: `L_metric`
+still backpropagates through retained tokens to Selector/field and is part of the optimized loss.
+Proxy warm-up does not certify
 primary trajectory loss.
 
 ## Primary reward and RL loss
