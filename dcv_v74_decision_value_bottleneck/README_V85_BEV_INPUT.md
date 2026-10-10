@@ -7,6 +7,15 @@ traffic lights, past 2-second histories, ego and map reference/goal. The exporte
 `include_cameras=False`. There is no first-person image or camera-to-BEV network.
 The renderer never receives expert future poses.
 
+The driving-surface mask is the union of nearby `LANE` and `LANE_CONNECTOR`
+polygons, including connecting lanes through intersections. It is a lane-based
+offroad proxy, not the complete official nuPlan drivable-area mask (which can
+also include parking and other generic drivable surfaces). The exporter queries
+only object layers: nuPlan's `DRIVABLE_AREA` has no object representation and
+must not be passed to `get_proximal_map_objects`; its raster API is separate.
+This avoids `AssertionError: Object representation for layer(s):
+[SemanticMapLayer.DRIVABLE_AREA] is unavailable` during export.
+
 | Property | Default |
 |---|---|
 | RGB | 288×288 |

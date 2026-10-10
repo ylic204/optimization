@@ -283,6 +283,23 @@ def _future_expert(scenario, iteration, ego_pose, args):
     return np.concatenate([xy, yaw[:, None]], axis=-1), times
 
 
+def _proximal_map_objects(map_api, point, radius, semantic_layer):
+    """Query nuPlan's object layers; DRIVABLE_AREA has no object getter.
+
+    The driving surface is rendered from LANE and LANE_CONNECTOR polygons.
+    DRIVABLE_AREA is available via the separate raster API, not this query.
+    """
+    layers = [
+        semantic_layer.LANE,
+        semantic_layer.LANE_CONNECTOR,
+        semantic_layer.CROSSWALK,
+        semantic_layer.STOP_LINE,
+        semantic_layer.ROADBLOCK,
+        semantic_layer.ROADBLOCK_CONNECTOR,
+    ]
+    return map_api.get_proximal_map_objects(point, radius, layers)
+
+
 def export_iteration(scenario, iteration, output_root, config, args):
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
@@ -296,17 +313,11 @@ def export_iteration(scenario, iteration, output_root, config, args):
         max(abs(config.x_min), abs(config.x_max)),
         max(abs(config.y_min), abs(config.y_max)),
     ) + 10.0
-    layers = [
-        SemanticMapLayer.DRIVABLE_AREA,
-        SemanticMapLayer.LANE,
-        SemanticMapLayer.LANE_CONNECTOR,
-        SemanticMapLayer.CROSSWALK,
-        SemanticMapLayer.STOP_LINE,
-        SemanticMapLayer.ROADBLOCK,
-        SemanticMapLayer.ROADBLOCK_CONNECTOR,
-    ]
-    proximal = scenario.map_api.get_proximal_map_objects(
-        Point2D(ego_pose[0], ego_pose[1]), query_radius, layers
+    proximal = _proximal_map_objects(
+        scenario.map_api,
+        Point2D(ego_pose[0], ego_pose[1]),
+        query_radius,
+        SemanticMapLayer,
     )
     route_ids = scenario.get_route_roadblock_ids()
     route_edges = _route_edges(scenario.map_api, route_ids, SemanticMapLayer)
@@ -318,12 +329,10 @@ def export_iteration(scenario, iteration, output_root, config, args):
     if len(expert) < 2 or planning_times[-1] > expert_times[-1] + 1e-7:
         return False
 
-    drivable_objects = proximal.get(SemanticMapLayer.DRIVABLE_AREA, [])
-    if not drivable_objects:
-        drivable_objects = (
-            proximal.get(SemanticMapLayer.LANE, [])
-            + proximal.get(SemanticMapLayer.LANE_CONNECTOR, [])
-        )
+    drivable_objects = (
+        proximal.get(SemanticMapLayer.LANE, [])
+        + proximal.get(SemanticMapLayer.LANE_CONNECTOR, [])
+    )
     route_id_set = {str(value) for value in route_ids}
     local_route_objects = [
         value
