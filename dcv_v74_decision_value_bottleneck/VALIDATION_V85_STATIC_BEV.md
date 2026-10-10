@@ -1,3 +1,30 @@
+# V8.5 object/evidence audit and quiet map rendering — revision 7
+
+Branch: `v85-bev-evidence-audit`.
+
+`python -m unittest test_v85_scene_audit test_v85_logged_gt test_v85_static_bev test_v85_bev -v`
+
+30 tests passed. Six new tests cover:
+
+- One-to-one object conversion/render accounting, out-of-view objects and bodies crossing the crop with their centers outside.
+- Identical-object and ego overdraw distinguished from missing rendering; visible region membership.
+- Multiple scene tags, sparse traffic retained, proximity to feasible swept reference bodies, missing-reference nulls.
+- Geometric path differences separated from objective conflicts, same-path re-sampling, infeasible-reference unknowns.
+- Complete mocked export, audit-only data separation, and deterministic one-row-per-scene index regeneration.
+- Invalid tracked-object geometry explicitly rejected rather than silently removed.
+
+A controlled 1440 px intersection with six vehicles, pedestrians, cones and overlapping connector lines
+was rendered and visually inspected. Objects remain distinct, connectors are pale, arrows less dense,
+and no labels/history/reference line enter the input. This is synthetic QA, not a real nuPlan screenshot.
+
+No density/conflict filter or RL training change is introduced. Dataset tags and object-to-region membership
+are diagnostics, not causal evidence labels. All baselines must use the same raster revision.
+Real mini exports, actual source object counts, GPU token savings and training still require server runs.
+
+Historical validation records follow; old default values apply only to their revisions.
+
+---
+
 # V8.5 wide BEV / logged GT boundary validation — revision 6
 
 Branch: `v85-bev-gt-boundary`.

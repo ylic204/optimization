@@ -170,15 +170,20 @@ def _agent_primitive(value, ego_pose):
     type_name = getattr(object_type, "fullname", None) or getattr(
         object_type, "name", "generic_object"
     )
+    geometry = [center.x, center.y, center.heading, value.box.length, value.box.width]
+    if not np.isfinite(geometry).all() or value.box.length <= 0 or value.box.width <= 0:
+        raise ValueError("Invalid tracked-object geometry; refusing to silently drop an object")
+    token = getattr(value, "track_token", None) or getattr(value, "token", None)
     return dict(center=world_to_ego([[center.x, center.y]], ego_pose)[0],
                 heading=float(wrap_angle(center.heading - ego_pose[2])),
                 length=float(value.box.length), width=float(value.box.width),
-                type=str(type_name).lower())
+                track_token=str(token) if token is not None else None,
+                source_type=str(type_name), type=str(type_name).lower())
 
 
 def _current_agents(scenario, iteration, ego_pose):
-    return [_agent_primitive(value, ego_pose) for value in _tracked_list(
-        scenario.get_tracked_objects_at_iteration(iteration))]
+    values = _tracked_list(scenario.get_tracked_objects_at_iteration(iteration))
+    return [dict(_agent_primitive(value, ego_pose), source_index=i) for i, value in enumerate(values)]
 
 
 def _agents_and_histories(scenario, iteration, ego_pose, args):
@@ -504,7 +509,9 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
     polygons = dict(drivable=[lane["polygon"] for lane in lanes],
                     road_holes=[hole for lane in lanes for hole in lane["holes"]],
                     crosswalk=_object_polygons(proximal.get(SemanticMapLayer.CROSSWALK, []), ego_pose))
-    lines = {"lane_center": [lane["baseline"] for lane in lanes]}
+    polygons["lane_boundary"] = [lane["polygon"] for lane in lanes if lane["kind"] == "lane"]
+    lines = {"lane_center": [lane["baseline"] for lane in lanes if lane["kind"] == "lane"],
+             "connector_center": [lane["baseline"] for lane in lanes if lane["kind"] == "connector"]}
     agents = _current_agents(scenario, iteration, ego_pose)
     hazards = hazard_polygons(agents, args.hazard_buffer_m)
     planner_config = RoadPlanningConfig(station_step_m=args.station_step_m,
@@ -515,6 +522,8 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
                                         pedestrian_scale_m=args.pedestrian_scale_m,
                                         lane_change_policy=args.lane_change_policy)
     scene = RoadScene(lanes, agents, hazards, config.bounds, geometry, planner_config)
+    lines["road_outline"] = [np.asarray(p.exterior.coords) for p in
+                             getattr(scene.road, "geoms", [scene.road]) if hasattr(p, "exterior")]
     if args.goal_xy is not None:
         x, y = args.goal_xy
         if not (config.x_min+args.goal_margin_m <= x <= config.x_max-args.goal_margin_m
@@ -570,6 +579,13 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
     folder.mkdir(parents=True)
     audit = folder / "audit"
     audit.mkdir()
+    from bev_scene_audit_v85 import audit_scene, compare_references
+    object_audit, features = audit_scene(scene, rendered, references, tasks, scene_id,
+                                        near_distance_m=args.audit_near_distance_m,
+                                        multi_vehicle_min=args.audit_multi_vehicle_min)
+    comparison = compare_references(references, tasks, cross_cost)
+    write_json(audit / "objects.json", object_audit)
+    write_json(audit / "scene_features.json", dict(features, reference_comparison=comparison))
     write_json(audit / "scene_geometry.json", scene.to_dict())
     if graph is not None:
         graph.save(audit / "planning_graph.npz")
@@ -597,6 +613,9 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
         graph_nodes=len(graph.poses) if graph is not None else 0, graph_edges=len(graph.edges) if graph is not None else 0, task_order=[t["id"] for t in tasks],
         reference_status=[r["status"] for r in references],
         reference_cost=[r["cost"] for r in references], cross_task_cost=cross_cost,
+        cross_task_feasible=[[bool(np.isfinite(v)) for v in row] if ref["status"] == "optimal_on_graph"
+                             else [None]*len(tasks) for ref, row in zip(references, cross_cost)],
+        comparison=comparison,
         note="Rows: reference paths. Columns: task objectives. Null means infeasible/unavailable. "
              "Costs have different task units; compare within a column. No task-contrast filtering."))
     if args.save_preview:
@@ -684,6 +703,10 @@ def parse_args(argv=None):
     parser.add_argument("--gt-sample-interval-s", type=float, default=.1)
     parser.add_argument("--skip-numeric-reference", action="store_true",
                         help="GT boundary mode: export GT/images without building the numeric reference graph")
+    parser.add_argument("--audit-near-distance-m", type=float, default=3.,
+                        help="audit only: maximum footprint distance to road/reference sweep")
+    parser.add_argument("--audit-multi-vehicle-min", type=int, default=5,
+                        help="audit only: visible non-ego vehicle count defining multi_vehicle")
     parser.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"),
                         help="optional goal in local meters; invalid/unreachable scenes are skipped")
     parser.add_argument("--goal-min-distance", type=float, default=18.)
@@ -724,6 +747,8 @@ def parse_args(argv=None):
     args.task_text = DEFAULT_TASK if args.task_text is None else args.task_text
     args.tasks = list(dict.fromkeys(args.tasks))
     if static:
+        if not np.isfinite(args.audit_near_distance_m) or args.audit_near_distance_m < 0 or args.audit_multi_vehicle_min < 2:
+            parser.error("audit distance must be finite/nonnegative; multi-vehicle threshold must be >=2")
         positive = (args.goal_min_distance, args.goal_max_distance, args.goal_margin_m,
                     args.goal_min_forward_m, args.station_step_m, args.collision_step_m,
                     args.min_turn_radius_m, args.pedestrian_scale_m, args.nominal_speed,
@@ -790,6 +815,10 @@ def main():
         write_json(root / "export_summary.json", dict(written_scenes=written, skipped_scenes=skipped,
                    skip_reasons=getattr(args, "skip_reasons", {}), args=vars(args),
                    note="Logged GT (when available) and static numeric references are distinct; not closed-loop nuPlan evaluation."))
+        from bev_scene_audit_v85 import write_dataset_index
+        report = write_dataset_index(root)
+        print("Scene groups:", report["scene_tag_counts"])
+        print("Object audit warnings:", report["warning_counts"])
         print("Skip reasons:", getattr(args, "skip_reasons", {}))
 
 

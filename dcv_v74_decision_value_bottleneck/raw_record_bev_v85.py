@@ -40,7 +40,7 @@ def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
             raise ValueError("logged GT endpoint/timestamps must match the exported task")
     np.savez_compressed(
         output_path,
-        raw_schema_version=np.int64(85), schema_revision=np.int64(6),
+        raw_schema_version=np.int64(85), schema_revision=np.int64(7),
         input_mode=np.str_(STATIC_INPUT_MODE),
         planning_mode=np.str_("static_multitask"),
         metric_raster_layout=np.str_("bev_x_rows_y_cols"),

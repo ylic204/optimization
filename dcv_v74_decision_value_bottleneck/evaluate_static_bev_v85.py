@@ -21,8 +21,8 @@ MODEL_INPUT_KEYS = (
 
 def model_inputs(record):
     """Explicit allowlist: no masks, graph, future states or numeric references."""
-    if str(record["input_mode"].item()) != STATIC_INPUT_MODE or int(record["schema_revision"]) not in (5, 6):
-        raise ValueError("expected static BEV schema85 revision5/6; re-export older records")
+    if str(record["input_mode"].item()) != STATIC_INPUT_MODE or int(record["schema_revision"]) not in (5, 6, 7):
+        raise ValueError("expected static BEV schema85 revision5/6/7; re-export older records")
     return {key: np.asarray(record[key]).copy() for key in MODEL_INPUT_KEYS}
 
 

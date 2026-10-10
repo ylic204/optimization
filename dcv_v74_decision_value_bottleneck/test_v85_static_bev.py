@@ -108,7 +108,7 @@ class StaticRoadTest(unittest.TestCase):
             for name in ("shortest", "pedestrian_clearance", "avoid_hazards"):
                 path = folder/f"{name}.npz"
                 with np.load(path, allow_pickle=False) as record:
-                    self.assertEqual(record["schema_revision"].item(), 6)
+                    self.assertEqual(record["schema_revision"].item(), 7)
                     self.assertFalse(record["trajectory_gt_available"].item())
                     self.assertNotIn("reference_path_ego", record)
                     self.assertNotIn("expert_trajectory_ego", record)

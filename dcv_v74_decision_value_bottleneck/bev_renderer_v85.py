@@ -96,6 +96,28 @@ RGB = {
 }
 
 
+# Shared by rendering and audit so class counts cannot drift from the raster.
+AGENT_LAYERS = {"vehicle": "vehicle", "pedestrian": "pedestrian", "bicycle": "bicycle",
+                "traffic_cone": "static_obstacle", "barrier": "static_obstacle",
+                "czone_sign": "static_obstacle", "generic_object": "static_obstacle"}
+
+
+def agent_layer(kind):
+    return AGENT_LAYERS.get(str(kind).lower(), "static_obstacle")
+
+
+def _fill_pixel_count(points, size):
+    # Match Pillow's integer polygon coordinates, then count on a clipped crop.
+    points = np.asarray(points).astype(int)
+    lower = np.maximum(points.min(0), 0)
+    upper = np.minimum(points.max(0), size-1)
+    if (upper < lower).any():
+        return 0
+    mask = Image.new("L", tuple((upper-lower+1).tolist()), 0)
+    _draw_polygon(ImageDraw.Draw(mask), points-lower, 255)
+    return int(np.count_nonzero(np.asarray(mask)))
+
+
 def _points(values):
     array = np.asarray(values, dtype=np.float32)
     if array.size == 0:
@@ -281,29 +303,38 @@ def render_bev(
     polygon_layer("crosswalk", map_polygons.get("crosswalk", []))
     if static_scene:
         polygon_layer("hazard", hazard_polygons)
-        # Map boundaries and arrows describe all lanes, never a chosen route.
-        for value in map_polygons.get("drivable", []):
+        # Separate connector geometry avoids a dense mesh of overlapping borders.
+        for value in map_lines.get("road_outline", []):
+            _draw_line(rgb_draw, ego_to_pixel(value, config), (146, 166, 178),
+                       max(1, config.image_size // 720))
+        for value in map_polygons.get("lane_boundary", []):
             points = ego_to_pixel(value, config)
-            _draw_line(rgb_draw, np.concatenate([points, points[:1]]), (115, 129, 139),
-                       max(1, config.image_size // 360))
-    line_layer("lane_center", map_lines.get("lane_center", []), width=1)
-    if static_scene:
-        for line in map_lines.get("lane_center", []):
-            line = np.asarray(line)
-            if len(line) < 2:
-                continue
-            length = np.linalg.norm(np.diff(line, axis=0), axis=1)
-            station = np.r_[0., np.cumsum(length)]
-            for s in np.arange(5., station[-1], 10.):
-                i = min(np.searchsorted(station, s, side="right")-1, len(length)-1)
-                if length[i] < 1e-6:
+            _draw_line(rgb_draw, np.concatenate([points, points[:1]]), (183, 200, 209), 1)
+        lanes = map_lines.get("lane_center", [])
+        connectors = map_lines.get("connector_center", [])
+        for values, color, spacing in ((lanes, (161, 180, 190), 18.),
+                                        (connectors, (194, 208, 215), 30.)):
+            for line in values:
+                line = np.asarray(line)
+                pixel = ego_to_pixel(line, config)
+                _draw_line(rgb_draw, pixel, color, 1)
+                _draw_line(semantic_draw[indices["lane_center"]], pixel, 255, 1)
+                if len(line) < 2:
                     continue
-                direction = (line[i+1]-line[i])/length[i]
-                tip = line[i] + (s-station[i])*direction
-                normal = np.array([-direction[1], direction[0]])
-                arrow = np.array([tip-.65*direction+.3*normal, tip, tip-.65*direction-.3*normal])
-                _draw_line(rgb_draw, ego_to_pixel(arrow, config), (100, 112, 125),
-                           max(1, config.image_size // 360))
+                length = np.linalg.norm(np.diff(line, axis=0), axis=1)
+                station = np.r_[0., np.cumsum(length)]
+                for s in np.arange(7., station[-1], spacing):
+                    i = min(np.searchsorted(station, s, side="right")-1, len(length)-1)
+                    if length[i] < 1e-6:
+                        continue
+                    direction = (line[i+1]-line[i])/length[i]
+                    tip = line[i] + (s-station[i])*direction
+                    normal = np.array([-direction[1], direction[0]])
+                    arrow = np.array([tip-.65*direction+.3*normal, tip, tip-.65*direction-.3*normal])
+                    _draw_line(rgb_draw, ego_to_pixel(arrow, config), color,
+                               max(1, config.image_size // 720))
+    else:
+        line_layer("lane_center", map_lines.get("lane_center", []), width=1)
     if not static_scene:
         line_layer("reference", map_lines.get("reference", []), width=3)
         if reference_path is not None and len(reference_path):
@@ -319,17 +350,11 @@ def render_bev(
     if not static_scene:
         line_layer("history", histories, width=2)
 
-    type_map = {
-        "vehicle": "vehicle",
-        "pedestrian": "pedestrian",
-        "bicycle": "bicycle",
-        "traffic_cone": "static_obstacle",
-        "barrier": "static_obstacle",
-        "czone_sign": "static_obstacle",
-        "generic_object": "static_obstacle",
-    }
-    for agent in agents:
-        layer = type_map.get(str(agent["type"]).lower(), "static_obstacle")
+    instance_image = Image.new("I", (config.image_size, config.image_size), 0) if static_scene else None
+    instance_draw = ImageDraw.Draw(instance_image) if static_scene else None
+    object_raster_audit = []
+    for object_index, agent in enumerate(agents):
+        layer = agent_layer(agent["type"])
         corners = oriented_box_corners(
             agent["center"],
             agent["heading"],
@@ -339,8 +364,13 @@ def render_bev(
         pixel = ego_to_pixel(corners, config)
         _draw_polygon(rgb_draw, pixel, RGB[layer])
         if static_scene:
-            _draw_line(rgb_draw, np.concatenate([pixel, pixel[:1]]), (27, 45, 62),
-                       max(1, config.image_size // 360))
+            outline_width = max(1, config.image_size // 720)
+            outline = np.concatenate([pixel, pixel[:1]])
+            _draw_line(rgb_draw, outline, (27, 45, 62), outline_width)
+            _draw_polygon(instance_draw, pixel, object_index+1)
+            _draw_line(instance_draw, outline, object_index+1, outline_width)
+            object_raster_audit.append(dict(object_index=object_index, layer=layer,
+                fill_pixels_before_overdraw=_fill_pixel_count(pixel, config.image_size)))
         _draw_polygon(semantic_draw[indices[layer]], pixel, 255)
         if layer in ("vehicle", "bicycle"):
             center = np.asarray(agent["center"], dtype=np.float32)
@@ -351,8 +381,11 @@ def render_bev(
                 rgb_draw,
                 ego_to_pixel(np.stack([center, front]), config),
                 (250, 250, 250),
-                1,
+                max(1, config.image_size // 720) if static_scene else 1,
             )
+            if static_scene:
+                _draw_line(instance_draw, ego_to_pixel(np.stack([center, front]), config),
+                           object_index+1, max(1, config.image_size // 720))
 
     ego_corners = oriented_box_corners(
         ego_center_xy, 0.0, float(ego_size[0]), float(ego_size[1])
@@ -371,6 +404,9 @@ def render_bev(
         tip = np.asarray([max(float(ego_size[0]) * 0.7, 2.0), 0.0])
         arrow = np.asarray([tip, tip + [-1.3, 0.7], tip + [-1.3, -0.7]])
         _draw_polygon(rgb_draw, ego_to_pixel(arrow, config), (255, 255, 255))
+        _draw_polygon(instance_draw, ego_pixel, 0)
+        _draw_polygon(instance_draw, ego_to_pixel(arrow, config), 0)
+        _draw_line(instance_draw, ego_to_pixel([[0., 0.], [ego_size[0]*.7, 0.]], config), 0, 2)
 
     if goal_xy is not None:
         center = ego_to_pixel([goal_xy], config)[0]
@@ -378,6 +414,8 @@ def render_bev(
         goal = _star(center, outer=radius, inner=radius*.46) if static_scene else _star(center)
         _draw_polygon(rgb_draw, goal, RGB["goal"])
         _draw_polygon(semantic_draw[SEMANTIC_INDEX["goal"]], goal, 255)
+        if static_scene:
+            _draw_polygon(instance_draw, goal, 0)
 
     semantic = np.stack(
         [np.asarray(image, dtype=np.uint8) > 0 for image in semantic_images]
@@ -388,7 +426,18 @@ def render_bev(
     ]
     traversable = semantic[SEMANTIC_INDEX["drivable"]].astype(bool)
     dynamic_obstacle = semantic[dynamic_indices].any(axis=0)
+    if static_scene:
+        owners = np.asarray(instance_image)
+        visible = np.bincount(owners.ravel(), minlength=len(agents)+1)
+        patch_size = config.image_size // config.region_grid
+        for entry in object_raster_audit:
+            owner = entry["object_index"]+1
+            entry["visible_owned_pixels"] = int(visible[owner])
+            entry["visible_region_ids"] = [
+                r*config.region_grid+c for r in range(config.region_grid) for c in range(config.region_grid)
+                if np.any(owners[r*patch_size:(r+1)*patch_size, c*patch_size:(c+1)*patch_size] == owner)]
     return {
+        **({"object_raster_audit": object_raster_audit} if static_scene else {}),
         "bev_rgb": np.asarray(rgb, dtype=np.uint8),
         "bev_semantic": semantic,
         "traversable": traversable,

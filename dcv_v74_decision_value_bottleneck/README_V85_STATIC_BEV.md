@@ -1,8 +1,11 @@
-# V8.5 静态车辆多任务 BEV（revision 6）
+# V8.5 静态车辆多任务 BEV（revision 7）
 
-分支：`v85-bev-gt-boundary`。本版扩大视野，以日志 GT 在视野内边缘的首次交点为终点，保存对应 GT 前缀。
+分支：`v85-bev-evidence-audit`。保留扩大后的视野与 GT 边缘目标，新增对象核对、场景分组和任务参考比较，淡化地图线条。
 研究流程仍是 **同一 BEV/起终点 + 不同任务文本 → 区域选择 → 冻结 VLM 建模 → 求解器**。
 本次实现数据导出、数值参考求解和独立几何评价，不训练 VLM；旧 route/GT 的 RL 入口尚未接入此契约。
+
+**主要研究目标是视觉 token 预算与规划质量的权衡，以及所选区域是否保留建模证据。**
+不要求各任务产生不同路径，不按任务冲突或对象数量筛掉已有效导出的场景。
 
 ## 1. 图像与坐标
 
@@ -13,7 +16,7 @@
 | 坐标 | 当前自车后轴中心为 (0,0,0)，x 前向、y 左向；图上方是 +x |
 | 起点 | 橙色真实车身 + 白色朝向箭头；位于图像下方约 3/4 处，前方留 72 m |
 | 终点 | 金色星形；目标位置和 GT 朝向另存在任务文本/数值字段中 |
-| 道路 | 淡蓝底色、细灰边界与方向箭头；显示所有附近车道，不显示选定路线 |
+| 道路 | 淡蓝底色；道路外轮廓与普通车道细边界；连接段淡灰中心线；不显示选定路线 |
 | 对象 | 蓝色车辆、棕色行人、粉色自行车、黑色障碍，全部冻结在当前帧 |
 | 危险区 | 桃色；施工标志、路障、交通锥轮廓外扩 3 m 的操作性定义，不是原始风险 GT |
 | 区域 | 9×9=81，每区域 160×160 像素；区域数不等于模型实际视觉 token 数 |
@@ -23,6 +26,8 @@
 模型实际视觉 token 和显存取决于处理器是否缩放，不能假定代价不变。
 `bev_preview.png` 与 NPZ 的 `bev_rgb` 完全一致，不是带注释的另一张图。
 背景空白仍表示非道路，不会为了填满图片而拉伸道路或制造对象。
+revision7 不再逐一描绘所有路口连接段多边形边框，以免产生密集网格；连接段中心线和方向仍保留。
+普通车道箭头约每 18 m、连接段约每 30 m 绘制；对象位于地图线条上层，轮廓减细，避免小行人被边框盖住。
 如需其他视野，必须同时设置 x/y 等跨度范围，并在所有 baseline 上使用同一协议。
 模型处理器可能再次缩放图片；接入训练时应记录实际像素和 token 数，不能只按 PNG 大小声称效率收益。
 
@@ -121,15 +126,15 @@ python export_nuplan_bev_v85.py \
   --data-root /data/planning_sources/nuplan/data/cache \
   --map-root /data/planning_sources/nuplan/maps \
   --db-files /data/planning_sources/nuplan/data/cache/mini/*.db \
-  --output-root /data/v85_static_bev/mini_gt_boundary_r6 \
+  --output-root /data/v85_static_bev/mini_evidence_r7 \
   --goal-source logged_gt_boundary \
   --gt-horizon-s 20 --gt-sample-interval-s 0.1 \
-  --skip-numeric-reference \
   --limit-scenarios 20 --frame-stride 20
 ```
 
-上述命令先导出扩大后的图片与 GT，便于检查；如需各任务数值参考，删除 `--skip-numeric-reference`，
-并使用另一新目录重新导出。扩大后的道路图建图和碰撞检查会更耗时。
+上述命令计算全部三个任务的数值参考，同时保存 GT、对象核对、场景标签和路径差异。
+若只想先检查图片，可加 `--skip-numeric-reference`；此时参考路径、参考通道距离及任务冲突
+均标记为未计算/未知，不能当作无解或无冲突。扩大后的道路图建图和碰撞检查会更耗时。
 
 使用**新的输出目录**；若帧目录已存在，导出器拒绝覆盖，避免混入旧数据或残缺结果。
 静态导出不需要 actor 过去 2 秒轨迹或相机文件，不读取 route、交通灯。
@@ -142,12 +147,14 @@ GT 模式只为确定目标和保存对照读取未来 ego trajectory；模型�
 每个有效帧输出：
 
 ```text
-mini_gt_boundary_r6/<log>/<scenario>/<iteration>/
+mini_evidence_r7/<log>/<scenario>/<iteration>/
   bev_preview.png                  # 唯一模型输入图片，无文字/路径
   shortest.npz
   pedestrian_clearance.npz
   avoid_hazards.npz
   audit/
+    objects.json                   # 逐对象转换/可见性/覆盖/区域归属/空间接近检查
+    scene_features.json            # 多标签场景分组与参考路径比较
     scene_geometry.json            # 完整环境，评价器专用
     logged_gt.png                  # 绿色未来 GT，仅供核查；输入图不包含这条线
     logged_gt_summary.json         # 截断参数、可用时长和静态几何诊断
@@ -158,14 +165,16 @@ mini_gt_boundary_r6/<log>/<scenario>/<iteration>/
     reference_avoid_hazards.png
 ```
 
-输出根目录还有 `export_summary.json`，记录参数及跳过原因。
+输出根目录还有 `export_summary.json`（参数/跳过原因）、`scene_index.jsonl`（一帧一行）
+和 `dataset_audit_summary.json`（对象总数、分组、参考状态与检查异常汇总）。
+已有的 GT 不足/地图缺失等有效性检查继续生效；新增统计不引入对象数量或任务差异筛选。
 
 ## 6. 查看参考解或评价自己的求解结果
 
 设置下面 `RECORD` 为实际导出的一条 NPZ 的完整路径：
 
 ```bash
-RECORD=/data/v85_static_bev/mini_gt_boundary_r6/<log>/<scenario>/<iteration>/shortest.npz
+RECORD=/data/v85_static_bev/mini_evidence_r7/<log>/<scenario>/<iteration>/shortest.npz
 python evaluate_static_bev_v85.py --record "$RECORD" --logged-gt
 # 计算过数值参考的记录，可复核其参考路径
 python evaluate_static_bev_v85.py --record "$RECORD"
@@ -183,13 +192,13 @@ python evaluate_static_bev_v85.py --record "$RECORD" --trajectory /data/predicte
 
 ## 7. 输入边界与训练兼容性
 
-数据为 `raw_schema_version=85, schema_revision=6, input_mode=ego_centric_static_bev_v85`。
+数据为 `raw_schema_version=85, schema_revision=7, input_mode=ego_centric_static_bev_v85`。
 `evaluate_static_bev_v85.model_inputs(record)` 使用显式白名单返回：
 RGB、任务文本与公开目标/约束、坐标范围、区域边界、起终姿态和车身尺寸。
 
 以下均是评价/教师专用，**不能直接传给被评估的建模器**：
 `bev_semantic`、区域语义计数、占据/危险/行人掩码、距离图、完整车道拓扑、图边、
-数值参考轨迹、参考成本、目标车道编号、参考解状态、完整 logged GT 及其时间戳/可行性。所有 baseline 共用同一输入协议和求解协议。
+数值参考轨迹、参考成本、目标车道编号、参考解状态、完整 logged GT 及其时间戳/可行性、对象统计/区域归属和场景标签。所有 baseline 共用同一输入协议和求解协议。
 
 两类路径分开保存：
 
@@ -203,7 +212,7 @@ RGB、任务文本与公开目标/约束、坐标范围、区域边界、起终�
 | `logged_gt_is_task_optimum` | 固定 false；不把日志行为当作所有任务最优解 |
 | `reference_trajectory_ego` / `reference_status` / `reference_cost` | 独立求出的有限图数值参考及状态/成本 |
 
-模型输入白名单支持 revision5/6，但生成上述 GT 必须从原始日志重新导出。
+模型输入白名单支持 revision5/6/7，但生成上述 GT 必须从原始日志重新导出。
 两类路径都是变长 [N,3]，不能混用旧 16 点时序协议。
 旧 `planning_free`/圆形代理连通掩码已移除，它们不能表达车身朝向相关的可行域。
 `pedestrian_distance_m` 仅是栅格点到行人的诊断距离，真正成本使用车身距离。
@@ -213,13 +222,84 @@ RGB、任务文本与公开目标/约束、坐标范围、区域边界、起终�
 后续接入应使用这里的白名单与任务成本评价，不能直接复用旧 ADE/FDE 奖励。
 旧实验继续显式传 `--planning-mode route_tracking`，参见 [旧文档](README_V85_BEV_INPUT.md)。
 
-## 8. 验证范围
+## 8. 对象核对、场景组织与参考比较
+
+这些文件只用于评价和排查，不向模型输入额外文字或结构化场景答案，也不改变求解器约束。
+
+### 对象核对
+
+`audit/objects.json` 包含原始类别、track token（若提供）、原始对象序号、尺寸和位置，以及：
+
+| 字段 | 用途 |
+|---|---|
+| `raw_count` / `converted_count` / `submitted_to_renderer_count` | 当前 API 返回的非自车对象数、转换数、提交绘制数；逐对象一一对应 |
+| `raw_type_counts` / `raw_category_counts` | 原始类型和渲染类别统计；未知类型保留并按静态障碍绘制，另行标记 |
+| `in_view_counts` / `outside_view_count` | 按对象轮廓与视野相交判断，不只看中心点；跨边界对象不会漏计 |
+| `raw_footprint_in_view` | 未做最小尺寸扩张的原始轮廓是否在视野内 |
+| `rasterized_counts` / `visible_counts` | 有填充像素的对象数，以及最终仍有像素可见的对象数 |
+| `fill_pixels_before_overdraw` / `visible_owned_pixels` | 对象填充像素数、计入轮廓/朝向并扣除后续对象及自车/目标覆盖后的像素数 |
+| `visible_region_ids` | 对象最终可见像素涉及的 row-major BEV 区域编号（默认 0–80），仅供核查选择器覆盖 |
+| `warning_counts` | 视野内没有填充像素、完全被覆盖、未知类型等诊断 |
+
+原始数指 nuPlan API 当前帧给出的对象，不代表物理世界所有对象。尺寸或坐标异常时明确报错，
+不静默删除。当前渲染和静态碰撞模型都将极小对象扩张到至少 0.8×0.6 m，
+因此同时记录原始轮廓和扩张后轮廓的视野判定。可见像素包含轮廓/朝向，可能多于填充像素，不能直接相除作为遮挡率。
+
+排查没有车辆时：先看原始 `vehicle` 数；若有但视野内为 0，属于裁剪；
+若视野内有而栅格化/可见数减少，再看对应对象的诊断和区域编号。
+逐类别计数不能仅通过彩色像素总量反推；重叠对象的语义掩码也不能表示各自是否仍可见。
+
+### 预先定义的场景标签
+
+- `sparse_traffic`：视野内其他车辆 0–1 辆。
+- `moderate_traffic`：2–4 辆；`multi_vehicle`：至少 5 辆。
+- `pedestrian_present`、`bicycle_present`、`static_obstacle_present`：相应类别存在。
+- `construction_present`：视野内施工类对象，或施工对象生成的危险区与视野相交。
+
+标签可以重叠，稀疏交通场景也可能包含行人和施工区。
+`--audit-multi-vehicle-min` 可调整多车阈值，需实验前确定并在各方法/数据划分间统一。
+
+`near_road_counts` 使用对象轮廓到道路区域的距离；道路不一定存在可行路径。
+`near_feasible_reference_counts` 使用对象轮廓到各任务**已验证可行的参考轨迹车身扫掠区域**的距离，
+缺少可行参考时为 null。距离阈值默认 3 m（`--audit-near-distance-m`），每对象保存实际距离。
+这些是空间接近统计，不能证明对象对决策有因果作用；也不刻画全部可行通道。
+
+`scene_index.jsonl` 保存一帧一行，所有任务变体共用该行；无需把场景复制到多个文件夹。
+在已导出的 revision7 数据上重建索引：
 
 ```bash
-python -m unittest test_v85_logged_gt test_v85_static_bev test_v85_bev -v
+python bev_scene_audit_v85.py --output-root /data/v85_static_bev/mini_evidence_r7
 ```
 
-24 项测试通过，覆盖 GT 首次边界交点、侧向出界、朝向跨 ±π、停车和真实时间戳保留、
+### 参考路径和任务冲突
+
+`audit/reference_summary.json` 继续保存每任务可行性、成本、跨任务成本矩阵，新增：
+
+- `cross_task_feasible`：行参考路径在列任务下是否可行；行参考缺失时为 null。
+- `comparison.pairs`：每对可行参考按归一化弧长采样 101 点，计算平均/最大空间偏差（米）。
+  `different_geometry` 默认以最大偏差 >0.5 m 判断；这不是时间对齐 ADE/FDE。
+- `cost_conflict`：把彼此参考路径代入对方任务，出现不可行或成本高于该列自身参考成本（容差为 1e-5×max(1,|成本|)）。
+  只在同一目标列内比较，不混用不同任务的成本单位。
+- `all_tasks_no_cost_conflict`：所有任务对都有参考可比较时才给 true/false，否则为 null。
+  不同几何路径也可能是等成本解，因此路径差异不自动等于任务冲突。
+
+以上结果不会用于挑选终点或保留场景。它们只是有限参考图上的诊断，不证明连续空间全局最优。
+
+### 用于视觉 token 实验
+
+主结果按预算报告规划成功率、约束违反、任务成本、实际视觉 token 数和端到端延迟。
+分组统计用于解释在哪些环境下能节省 token，不把对象计数或几何接近当作最终成绩。
+`visible_region_ids` 可检查被选区域覆盖了哪些对象，但它不是“关键证据 GT”，也不覆盖道路连接等全部证据。
+所有方法共用同一 revision7 图像和求解协议；即使不同任务参考路径相同，也保留样本并评价。
+
+## 9. 验证范围
+
+```bash
+python -m unittest test_v85_scene_audit test_v85_logged_gt test_v85_static_bev test_v85_bev -v
+```
+
+30 项测试通过；新增跨边界对象、覆盖诊断、多标签分组、参考距离未知值、
+等成本不同路径、稀疏场景完整导出与索引幂等性、模型输入隔离及非法几何拒绝；原有测试覆盖 GT 首次边界交点、侧向出界、朝向跨 ±π、停车和真实时间戳保留、
 短 GT 跳过、精确目标不吸附、超出旧目标范围的完整导出、有/无数值参考与防止 GT 输入泄露；
 亦覆盖旧道路目标模式无 future 调用、无 route/history 调用、无文字渲染、三任务共享输入、前向目标、无效目标不替换、
 大坐标精度、车身边角与段间碰撞、逆行/横移/曲率拒绝、明确相邻换道、断开车道拒绝、
