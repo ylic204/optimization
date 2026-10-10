@@ -12,13 +12,14 @@ STATIC_INPUT_MODE = "ego_centric_static_bev_v85"
 
 
 def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
-                               scene_id, metadata, evaluation):
-    """Static task record: no logged route, future GT or candidate trajectory.
+                               scene_id, metadata, evaluation, reference):
+    """Static car task: numeric references are evaluator-only, not human GT.
 
     Only RGB, task specification and fixed geometry are model inputs. All
     masks, distances and reachability diagnostics are evaluator-only fields.
     """
     import json
+    from static_road_planner_v85 import json_ready
 
     rgb = np.asarray(rendered["bev_rgb"], dtype=np.uint8)
     semantic = np.asarray(rendered["bev_semantic"], dtype=np.uint8)
@@ -33,7 +34,7 @@ def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        raw_schema_version=np.int64(85), schema_revision=np.int64(4),
+        raw_schema_version=np.int64(85), schema_revision=np.int64(5),
         input_mode=np.str_(STATIC_INPUT_MODE),
         planning_mode=np.str_("static_multitask"),
         metric_raster_layout=np.str_("bev_x_rows_y_cols"),
@@ -48,6 +49,14 @@ def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
         task_spec_json=np.str_(json.dumps(task, sort_keys=True)),
         scene_id=np.str_(scene_id), sample_id=np.str_(f"{scene_id}/{task['id']}"),
         trajectory_gt_available=np.bool_(False),
+        reference_solution_available=np.bool_(reference["status"] == "optimal_on_graph"),
+        reference_status=np.str_(reference["status"]),
+        reference_trajectory_ego=np.asarray(reference["poses"], dtype=np.float64),
+        reference_edge_ids=np.asarray(reference["edge_ids"], dtype=np.int64),
+        reference_cost=np.float64(reference["cost"] if reference["cost"] is not None else np.inf),
+        reference_metrics_json=np.str_(json.dumps(
+            json_ready(reference["metrics"]),
+            sort_keys=True, allow_nan=False)),
         **{key: np.asarray(value) for key, value in metadata.items()},
         **{key: np.asarray(value) for key, value in evaluation.items()},
     )

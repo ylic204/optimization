@@ -1,136 +1,180 @@
-# V8.5 静态、多任务 BEV 导出（revision 4）
+# V8.5 静态车辆多任务 BEV（revision 5）
 
-本版用于验证：同一环境在不同任务需求下，视觉区域选择能否保持最终优化结果质量。
-`export_nuplan_bev_v85.py` 默认 `--planning-mode static_multitask`。
-这是一种利用 nuPlan 地图与当前对象构造的静态路径规划实验，不是 nuPlan 闭环驾驶评测。
+分支：`v85-static-bev-road-reference`。本版一起修正渲染、道路约束、目标和参考解。
+研究流程仍是 **同一 BEV/起终点 + 不同任务文本 → 区域选择 → 冻结 VLM 建模 → 求解器**。
+本次实现数据导出、数值参考求解和独立几何评价，不训练 VLM；旧 route/GT 的 RL 入口尚未接入此契约。
 
-## 图像与任务
+## 1. 图像与坐标
 
-输入只包含当前地图、当前对象、起点 S 和目标 G。没有紫色参考线、路线高亮、
-绿色历史轨迹，也不读取或绘制未来 GT。灰色车道中心线是所有附近车道的地图几何，
-不是选定的路径。静态模式不绘制信号灯：本任务没有交通灯时序和让行决策。
-
-| 属性 | 默认值 |
+| 项目 | 默认配置 |
 |---|---|
-| 图像 | 288×288 RGB；不将网格或预览坐标轴写入模型输入 |
-| 物理范围 | x、y 均为 [-40,40] 米 |
-| 坐标 | 当前自车 rear axle 为 S=(0,0)，x 向前、y 向左 |
-| 图像方向 | 上方 +x、左侧 +y；起点在图像中央 |
-| 视觉区域 | 9×9=81 个区域，每个 32×32 像素 |
-| 目标 | 当前地图上可达、图内距边界至少 3 米的点；默认距 S 为 18–32 米 |
-| 目标随机性 | 固定 seed + log/scenario/iteration 的 SHA256；可复现 |
-| 对象 | 当前车辆、自行车、行人及静态障碍，全部冻结 |
-| 规划代理 | 半径 1 米的圆形代理，不采用完整车辆运动学 |
-| 危险区域 | 当前施工标志、路障、交通锥的外接框向各侧扩展 3 米 |
+| 图像 | 原生 720×720 RGB；无文字、坐标轴、边框、图例、历史或参考路径 |
+| 范围 | x∈[-12,36] m，y∈[-24,24] m；统一 48×48 m，不按单图拉伸 |
+| 坐标 | 当前自车后轴中心为 (0,0,0)，x 前向、y 左向；图上方是 +x |
+| 起点 | 橙色真实车身 + 白色朝向箭头；位于图像下方约 3/4 处，前方留 36 m |
+| 终点 | 金色星形；目标位置和车道朝向另存在任务文本/数值字段中 |
+| 道路 | 淡蓝底色、细灰边界与方向箭头；显示所有附近车道，不显示选定路线 |
+| 对象 | 蓝色车辆、棕色行人、粉色自行车、黑色障碍，全部冻结在当前帧 |
+| 危险区 | 桃色；施工标志、路障、交通锥轮廓外扩 3 m 的操作性定义，不是原始风险 GT |
+| 区域 | 9×9=81，每区域 80×80 像素；区域数不等于模型实际视觉 token 数 |
 
-蓝色填充是 LANE 与 LANE_CONNECTOR 多边形并集，白色背景不可通行；
-车辆蓝色、行人棕色、自行车粉色、施工对象黑色、危险区域桃色。
-自车为橙色，S 和白色方向箭头标识起点；金色星形 G 是任务终点。
-自车车身按真实中心绘制，坐标原点仍在 rear axle。
+相较 revision4（288 像素、80 m），每米像素从约 3.6 增加到 15。
+`bev_preview.png` 与 NPZ 的 `bev_rgb` 完全一致，不是带注释的另一张图。
+背景空白仍表示非道路，不会为了填满图片而拉伸道路或制造对象。
+如需其他视野，必须同时设置 x/y 等跨度范围，并在所有 baseline 上使用同一协议。
+模型处理器可能再次缩放图片；接入训练时应记录实际像素和 token 数，不能只按 PNG 大小声称效率收益。
 
-危险区域是**实验操作性标注**，不是 nuPlan 风险 GT。当前版本不随机制造危险标签。
-没有施工对象的场景仍可导出，但对应任务的 `task_applicable=false`。
-没有行人的场景同理；统计时要分别报告有相关对象和无相关对象的结果。
-对象存在不保证不同任务的最优路径不同，任务冲突与有效性还需下游求解分析。
+BEV 来自地图及当前对象标注，不读取相机；查看原始前视序列需要另下载对应 sensor blobs。
+全球坐标在减去自车原点前保留 float64，避免 UTM 大坐标的 float32 舍入破坏车道细节。
 
-同一帧导出以下三个任务。RGB、S/G 和评价地图完全一致，变化的是任务文本与目标/约束定义。
+## 2. 静态车辆约束与有向规划图
 
-| task_id | 优化定义 |
+`static_road_planner_v85.py` 独立于 nuPlan，输入为车道、多边形、对象和真实车身尺寸。
+
+- 按车道基线正向每 4 m 采样，横向偏移默认 {-0.5,0,0.5} m；同车道允许向前跨 1–2 个站点。
+- 跨车道连接使用地图的 `outgoing_edges`，不因两个车道距离近就自动连接。
+- 默认允许地图明确标注、相互确认的相邻车道间换道。候选换道向前延伸 8–16 m，
+  朝向相近，且必须通过相同车身/曲率检查。`--lane-change-policy outgoing_only` 可关闭侧向换道。
+- 每条运动边是带起终朝向的三次 Hermite 曲线；仅向前，不允许横向平移或倒车。
+- 默认最小转弯半径 5.5 m；在曲线上检查解析曲率，并对输出采样轨迹再次检查。
+- 自车采用 nuPlan 真实长、宽、后轴到车身中心的偏移。安全边距默认 0.15 m。
+- 检查整个车身及相邻姿态间的扫掠包络，不能只检查后轴点或两个端点。
+  默认检查间隔不大于 0.25 m，旋转包络附加弓高缓冲；道路外、对象内和视野外均不可行。
+- 后轴必须始终位于方向兼容、拓扑连续的车道走廊内。车道孔洞保留为非道路。
+
+这是**低速、静态、几何车辆规划**。地图邻接不等价于完整的交通法规许可：
+本版不解析实线禁跨、让行、信号时序、动态车辆交互、速度/加速度及转向速率。
+曲率与扫掠检查是记录了分辨率的数值验证，不宣称连续空间的形式化安全保证。
+不能用本版结果替代 nuPlan 官方闭环驾驶成绩。
+
+## 3. 目标不再随机落在空闲像素上
+
+先构建带车辆约束的有向图，再从基础最短路可达的车道中心状态中选择目标：
+
+- 距起点 18–28 m、前向 x 至少 8 m、距视野边缘至少 3 m。
+- 每条车道取范围内最下游的有效站点，优先选择下游出口车道，而非内部连接段。
+- seed + log/scenario/iteration 确定性选择一个道路目标；**不按不同任务的收益差来挑目标**。
+- 目标含位置和车道朝向；全车可达并在图内。不会出现普通前进任务的后方终点。
+- 同一帧所有任务共用同一 BEV、车辆参数和目标。
+
+这里的“出口”是当前局部视野内的道路目标，不是整个城市导航的最终目的地，也不是日志未来轨迹终点。
+`--goal-xy X Y` 可指定精确位置：必须位于建模的车道走廊内、前方、距离范围内且有向可达。
+不会把无效请求吸附到别处或偷偷改成随机点；无有效目标时跳过并汇总原因。
+
+## 4. 任务与数值参考解
+
+| task_id | 目标/额外约束 |
 |---|---|
-| `shortest` | 恒定名义速度 v=1 m/s，最小化 L/v；等价于最短路，不是动态最快到达 |
-| `pedestrian_clearance` | 最小化沿路径的积分 ∫[1+4 exp(-d/4)]ds；d 是到最近行人轮廓的米制距离 |
-| `avoid_hazards` | 在共同碰撞/道路约束上增加危险区域及代理半径缓冲的禁止进入约束，最小化 L |
+| `shortest` | 最小化 L/v，默认 v=1 m/s；恒速下等价于最短路，不是动态时间最优 |
+| `pedestrian_clearance` | 最小化 ∫[1+4 exp(-d/4)]ds；d 是**加安全边距的车身**到最近行人轮廓的距离 |
+| `avoid_hazards` | 整个加边距车身不进入危险区；在可行路径中最小化 L |
 
-数值目标在 `task_spec_json` 中给出，任务文本同时解释目标与图例。
-任务说明包含目标坐标、代理半径和公开权重；不包含对象坐标、占据图或参考路径。
-不存在行人时，距离图为 +inf，行人附加代价自然为 0。
+三者共享车辆、道路和对象碰撞约束。无行人时附加代价为 0；无相关危险区时危险约束不改变问题。
+`task_applicable` 标记相关对象是否存在，不保证它们影响最优解。
 
-## 目标与可行性
+在同一有向图上分别运行 Dijkstra，输出每个任务的参考轨迹、边序列、目标成本和几何诊断。
+随后独立重查拼接路径的朝向、道路拓扑、车身扫掠、曲率和数值成本；验证不一致会报错。
 
-先用当前完整地图构造评价栅格。把所有对象轮廓与非道路区域视为障碍，通过距离变换
-施加圆形代理半径间距；视野外也是障碍。4 邻接连通检查避免对角穿越障碍角点。
-目标采样只使用从 S 可达的栅格；默认导出危险规避任务，因此还要求存在不进入危险区域
-缓冲的连通路径。没有合适目标、起点被占据或道路断开时跳过，不绘制不存在的终点。
-目标采样并不输出选定的路线，连通性图只属于评价信息。
+- `optimal_on_graph`：对保存的**有限图及采样边成本**最优；不是连续自由空间全局最优，也不是人类 GT。
+- `infeasible_on_graph`：该任务在此图上不可达；不能据此断言连续空间中一定无解。
+- 危险规避任务无解时保存空参考轨迹、成本 +inf 和无解状态，**不更换目标、不给零成本伪答案**。
+- 同时保存各任务参考路径在其他任务下的成本矩阵，用于区分任务冲突和无冲突场景。
+  行是参考路径，列是评价任务；不同列单位/目标不同，只在同一列内比较。
+- 参考路径只画在 `audit/reference_*.png`，绝不覆盖模型输入。
 
-`--goal-xy X Y` 可以指定米制目标。超出图内边距、过近、位于障碍或不可达时跳过场景，
-不会偷偷替换目标。它不需要等于原驾驶日志的目的地。
-静态道路并集按无向可通行区域处理，不施加单行规则或自行车模型；不能当作车辆驾驶安全验证。
+保留 `trajectory_gt_available=false`：修改终点、任务及对象运动后，原始人类轨迹不再是新任务的答案。
+优先报告成功率、碰撞/越界/危险约束违反、同任务成本和计算效率。
+对连续求解器仅报告 `cost_gap_to_graph_reference`，它可能为负，不能强称非负最优 regret。
+先按参考可行性和任务适用性分层，再统计任务结果；不要将缺失参考记为成功或零误差。
 
-## 在现有服务器上重新导出
+## 5. 在你的服务器上重新导出
 
-先按完整 log 划分 train/val/test，三个任务版本与相邻帧必须处于同一 split。
-下面是 mini 数据的预览导出，不是训练/测试划分：
+本版需要 Shapely，nuPlan 环境通常已有；缺少时安装：
 
 ```bash
 conda activate nuplan
+python -m pip install 'shapely>=1.8,<3'
 cd /home/lyi/neurodynamic/optimization/dcv_v74_decision_value_bottleneck
 python export_nuplan_bev_v85.py \
   --planning-mode static_multitask \
   --data-root /data/planning_sources/nuplan/data/cache \
   --map-root /data/planning_sources/nuplan/maps \
   --db-files /data/planning_sources/nuplan/data/cache/mini/*.db \
-  --output-root /data/v85_static_bev/mini_preview \
-  --limit-scenarios 20 --frame-stride 20 \
-  --goal-seed 7
+  --output-root /data/v85_static_bev/mini_r5 \
+  --limit-scenarios 20 --frame-stride 20 --goal-seed 7
 ```
 
-不要传入原来的 `--history-seconds 2 --history-samples 5`，静态模式会拒绝它们。
-`--future-horizon/--future-samples` 仅用于旧 route_tracking 模式，在静态模式中不参与导出。
-旧 raw/processed 数据不能靠改名变成静态数据，必须重新导出并放在新的目录。
+使用**新的输出目录**；若帧目录已存在，导出器拒绝覆盖，避免混入旧数据或残缺结果。
+静态导出不需要 actor 过去 2 秒轨迹，不需要相机文件，不读取 route、交通灯或未来 ego trajectory。
+`--no-preview` 关闭 PNG；数值参考仍生成。`--tasks shortest pedestrian_clearance` 可指定任务。
+`--agent-radius-m` 已移除，改用真实车身 + `--safety-margin-m`。
+改变图分辨率不会改变几何参考规划；改变站点间隔、偏移或转弯半径则定义了不同的参考图，须记录并统一。
+按完整 log 划分 train/val/test，不能让同一帧的任务变体或相邻帧跨 split。
 
 每个有效帧输出：
 
 ```text
-mini_preview/<log>/<scenario>/<iteration>/
+mini_r5/<log>/<scenario>/<iteration>/
+  bev_preview.png                  # 唯一模型输入图片，无文字/路径
   shortest.npz
   pedestrian_clearance.npz
   avoid_hazards.npz
-  bev_preview.png
+  audit/
+    scene_geometry.json            # 完整环境，评价器专用
+    planning_graph.npz             # 节点、边、各边姿态及成本，评价器专用
+    reference_summary.json         # 状态、成本和跨任务成本矩阵
+    reference_shortest.png         # 只供人工检查；无解任务不生成
+    reference_pedestrian_clearance.png
+    reference_avoid_hazards.png
 ```
 
-`bev_preview.png` 可直接打开，带米制坐标、方向说明和图例。
-NPZ 内 `bev_rgb` 是不带外围注释的真正模型输入。
-`--no-preview` 可以关闭预览；`--tasks shortest pedestrian_clearance` 可以选择导出的任务。
+输出根目录还有 `export_summary.json`，记录参数及跳过原因。
 
-## 数据契约与边界
+## 6. 查看参考解或评价自己的求解结果
 
-| 字段 | 用途 |
-|---|---|
-| `input_mode` | `ego_centric_static_bev_v85` |
-| `raw_schema_version / schema_revision` | 85 / 4，与旧时序 revision3 分开 |
-| `bev_rgb` | 视觉输入 |
-| `task_text / task_spec_json` | 任务输入与可计算的公开目标/约束 |
-| `start_xy / goal_xy / map_bounds / region_world_bounds` | 固定几何及任务条件 |
-| `scene_id / sample_id / log_name / scenario_token` | 分组、划分与追踪来源 |
-| `bev_semantic` | 16 层：保留旧 15 层编号并追加 hazard；route/reference/history/信号层恒为零 |
-| `region_semantic_counts` | [81,16]，仅评价/审计标签 |
-| `traversable / static_obstacle / planning_free` | 道路、当前冻结对象及代理半径膨胀后的可行域；仅评价 |
-| `hazard_mask / hazard_exclusion` | 施工缓冲区及代理间距禁止区域；仅评价 |
-| `pedestrian_mask / pedestrian_distance_m` | 行人轮廓和距离代价；仅评价 |
-| `reachable / hazard_free_reachable` | 目标生成诊断；仅评价 |
-| `trajectory_gt_available` | false；不写入任何伪造的专家轨迹 |
+设置下面 `RECORD` 为实际导出的一条 NPZ 的完整路径：
 
-没有 `reference_path_ego`、`expert_trajectory_ego` 或未来时间网格。
-评价目标为到达成功、约束违反、任务成本以及计算效率，不把与原驾驶轨迹的距离当作主奖励。
-模型输入要采用明确 allowlist；完整标签用于评价器和全信息数值参考，不能直接给被评估的建模器。
-保留 token 方案与全图方案必须共用同一冻结 VLM、问题族、求解器和评价地图。
+```bash
+RECORD=/data/v85_static_bev/mini_r5/<log>/<scenario>/<iteration>/shortest.npz
+python evaluate_static_bev_v85.py --record "$RECORD"
+# 自己的输出：float array [N,3]，每行为后轴 x/y/heading（米/米/弧度）
+python evaluate_static_bev_v85.py --record "$RECORD" --trajectory /data/predicted_path.npy
+```
 
-**本次更新完成的是静态导出与数据契约。旧 `process_planning_bev_v85.py`、
-`run_v85.sh`、`run_v85_rl.sh`、旧评估脚本仍是参考路线/候选/时序 ADE-FDE 流程，
-不支持这些静态记录。** 旧处理器会给出明确错误，避免训练目标被静默替换。
-下游接入必须按 `task_spec_json` 实现静态问题、完整路径段的碰撞检查和任务成本评价，
-再接入选择器后训练；不能复用旧 GT 奖励宣称完成新实验。
+不传 `--trajectory` 时复核保存的数值参考。无解记录返回失败和无参考状态。
+评价器检查起点、目标位置/朝向、车身碰撞、道路/方向/拓扑、曲率、危险区，并报告任务成本。
+终点位置容差 0.75 m、朝向容差 0.15 rad；参考图自身到达精确目标节点。
+轨迹是无时间参数的几何路径，不接受横移、倒车或重复零长度点；本版不计算动态舒适性。
 
-旧实验复现时明确使用 `--planning-mode route_tracking`，见
-[旧 BEV 与 GT 文档](README_V85_BEV_INPUT.md)。
+## 7. 输入边界与训练兼容性
 
-## 验证
+数据为 `raw_schema_version=85, schema_revision=5, input_mode=ego_centric_static_bev_v85`。
+`evaluate_static_bev_v85.model_inputs(record)` 使用显式白名单返回：
+RGB、任务文本与公开目标/约束、坐标范围、区域边界、起终姿态和车身尺寸。
+
+以下均是评价/教师专用，**不能直接传给被评估的建模器**：
+`bev_semantic`、区域语义计数、占据/危险/行人掩码、距离图、完整车道拓扑、图边、
+参考轨迹、参考成本、目标车道编号和参考解状态。所有 baseline 共用同一输入协议和求解协议。
+
+新的 `reference_trajectory_ego` 是 [N,3] 变长几何轨迹，不是旧 16 点时间对齐 GT。
+旧 `planning_free`/圆形代理连通掩码已移除，它们不能表达车身朝向相关的可行域。
+`pedestrian_distance_m` 仅是栅格点到行人的诊断距离，真正成本使用车身距离。
+
+旧 `process_planning_bev_v85.py`、`run_v85.sh`、`run_v85_rl.sh` 仍采用 route/GT 时序协议，
+会明确拒绝静态记录。**本次没有将新静态任务接入 Selector 的 RL 训练入口**。
+后续接入应使用这里的白名单与任务成本评价，不能直接复用旧 ADE/FDE 奖励。
+旧实验继续显式传 `--planning-mode route_tracking`，参见 [旧文档](README_V85_BEV_INPUT.md)。
+
+## 8. 验证范围
 
 ```bash
 python -m unittest test_v85_static_bev test_v85_bev -v
 ```
 
-覆盖无路线/历史/未来 API 调用、三任务共享图像、图内可达目标、不可达目标跳过、
-障碍间距、禁止对角穿障、静态/旧模式隔离及旧导出回归。
-验证使用 nuPlan API 形状的模拟对象；未在本地运行真实 nuPlan mini 数据导出。
+覆盖无 route/history/future 调用、无文字渲染、三任务共享输入、前向目标、无效目标不替换、
+大坐标精度、车身边角与段间碰撞、逆行/横移/曲率拒绝、明确相邻换道、断开车道拒绝、
+Dijkstra 直线成本、行人任务改变参考解、危险任务无解状态、完整导出后重算成本和旧模式回归。
+验证采用模拟 nuPlan API 和受控几何；本地未安装 nuPlan/下载真实 mini 数据，
+未运行真实 mini 导出、Qwen 权重或 RL 训练。真实场景数量与渲染效果需用上述服务器命令确认。
+
+详细验证记录见 [VALIDATION_V85_STATIC_BEV.md](VALIDATION_V85_STATIC_BEV.md)。

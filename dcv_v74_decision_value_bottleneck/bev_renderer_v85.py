@@ -105,7 +105,9 @@ def _points(values):
 
 def world_to_ego(points, ego_pose):
     """Transform global xy to x-forward/y-left coordinates at ego rear axle."""
-    points = _points(points)
+    # UTM coordinates can be millions of meters. Subtract the origin before
+    # converting to float32, otherwise lane details are rounded by decimeters.
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     x, y, heading = np.asarray(ego_pose, dtype=np.float64)
     delta = points.astype(np.float64) - np.asarray([x, y])
     cosine, sine = math.cos(heading), math.sin(heading)
@@ -270,12 +272,38 @@ def render_bev(
             )
 
     polygon_layer("drivable", map_polygons.get("drivable", []))
+    for hole in map_polygons.get("road_holes", []):
+        pixel = ego_to_pixel(hole, config)
+        _draw_polygon(rgb_draw, pixel, RGB["background"])
+        _draw_polygon(semantic_draw[indices["drivable"]], pixel, 0)
     if not static_scene:
         polygon_layer("route", map_polygons.get("route", []))
-    else:
-        polygon_layer("hazard", hazard_polygons)
     polygon_layer("crosswalk", map_polygons.get("crosswalk", []))
+    if static_scene:
+        polygon_layer("hazard", hazard_polygons)
+        # Map boundaries and arrows describe all lanes, never a chosen route.
+        for value in map_polygons.get("drivable", []):
+            points = ego_to_pixel(value, config)
+            _draw_line(rgb_draw, np.concatenate([points, points[:1]]), (115, 129, 139),
+                       max(1, config.image_size // 360))
     line_layer("lane_center", map_lines.get("lane_center", []), width=1)
+    if static_scene:
+        for line in map_lines.get("lane_center", []):
+            line = np.asarray(line)
+            if len(line) < 2:
+                continue
+            length = np.linalg.norm(np.diff(line, axis=0), axis=1)
+            station = np.r_[0., np.cumsum(length)]
+            for s in np.arange(5., station[-1], 10.):
+                i = min(np.searchsorted(station, s, side="right")-1, len(length)-1)
+                if length[i] < 1e-6:
+                    continue
+                direction = (line[i+1]-line[i])/length[i]
+                tip = line[i] + (s-station[i])*direction
+                normal = np.array([-direction[1], direction[0]])
+                arrow = np.array([tip-.65*direction+.3*normal, tip, tip-.65*direction-.3*normal])
+                _draw_line(rgb_draw, ego_to_pixel(arrow, config), (100, 112, 125),
+                           max(1, config.image_size // 360))
     if not static_scene:
         line_layer("reference", map_lines.get("reference", []), width=3)
         if reference_path is not None and len(reference_path):
@@ -310,6 +338,9 @@ def render_bev(
         )
         pixel = ego_to_pixel(corners, config)
         _draw_polygon(rgb_draw, pixel, RGB[layer])
+        if static_scene:
+            _draw_line(rgb_draw, np.concatenate([pixel, pixel[:1]]), (27, 45, 62),
+                       max(1, config.image_size // 360))
         _draw_polygon(semantic_draw[indices[layer]], pixel, 255)
         if layer in ("vehicle", "bicycle"):
             center = np.asarray(agent["center"], dtype=np.float32)
@@ -335,21 +366,18 @@ def render_bev(
         (255, 255, 255),
         2,
     )
-    # A triangular arrow and S identify the start; the rear axle remains (0,0).
+    # A triangular arrow identifies heading; no text is baked into the image.
     if static_scene:
         tip = np.asarray([max(float(ego_size[0]) * 0.7, 2.0), 0.0])
         arrow = np.asarray([tip, tip + [-1.3, 0.7], tip + [-1.3, -0.7]])
         _draw_polygon(rgb_draw, ego_to_pixel(arrow, config), (255, 255, 255))
-        start_pixel = ego_to_pixel([[0, 0]], config)[0]
-        rgb_draw.text((float(start_pixel[0] + 8), float(start_pixel[1])), "S", fill=(20, 20, 20))
 
     if goal_xy is not None:
         center = ego_to_pixel([goal_xy], config)[0]
-        goal = _star(center)
+        radius = max(5., .75 * (config.image_size-1) / (config.x_max-config.x_min))
+        goal = _star(center, outer=radius, inner=radius*.46) if static_scene else _star(center)
         _draw_polygon(rgb_draw, goal, RGB["goal"])
         _draw_polygon(semantic_draw[SEMANTIC_INDEX["goal"]], goal, 255)
-        if static_scene:
-            rgb_draw.text((float(center[0] + 7), float(center[1])), "G", fill=(20, 20, 20))
 
     semantic = np.stack(
         [np.asarray(image, dtype=np.uint8) > 0 for image in semantic_images]

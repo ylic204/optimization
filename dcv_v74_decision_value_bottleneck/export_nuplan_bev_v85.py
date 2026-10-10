@@ -7,6 +7,7 @@ or future ego states are requested. Legacy route/GT export is opt-in via
 
 import argparse
 import math
+import json
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ import numpy as np
 from bev_renderer_v85 import BevConfig, render_bev, world_to_ego, wrap_angle
 from raw_record_bev_v85 import save_bev_raw_record, save_static_bev_raw_record
 from static_bev_tasks_v85 import (
-    hazard_polygons, static_evaluation_layers, select_goal, task_variants,
+    hazard_polygons, static_evaluation_layers, task_variants,
 )
 
 
@@ -32,7 +33,7 @@ def _geometry_polygons(geometry):
     for item in geometries:
         exterior = getattr(item, "exterior", None)
         if exterior is not None:
-            result.append(np.asarray(exterior.coords, dtype=np.float32)[:, :2])
+            result.append(np.asarray(exterior.coords, dtype=np.float64)[:, :2])
     return result
 
 
@@ -49,7 +50,7 @@ def _baseline(item):
     line = getattr(path, "linestring", None)
     if line is None:
         return np.zeros((0, 2), dtype=np.float32)
-    return np.asarray(line.coords, dtype=np.float32)[:, :2]
+    return np.asarray(line.coords, dtype=np.float64)[:, :2]
 
 
 def _route_object(map_api, object_id, semantic_layer):
@@ -434,79 +435,134 @@ def _export_route_tracking(scenario, iteration, output_root, config, args):
 
 
 def _save_preview(rendered, goal, config, output_path):
-    """Preview annotations are outside the model raster; no grid is baked in."""
-    from PIL import Image, ImageDraw
+    """Exactly the model RGB: no text, axes, legend, padding or reference."""
+    from PIL import Image
+    Image.fromarray(rendered["bev_rgb"]).save(output_path)
 
-    size, border = config.image_size, 48
-    preview = Image.new("RGB", (size + 2 * border, size + 140), "white")
-    preview.paste(Image.fromarray(rendered["bev_rgb"]), (border, border))
-    draw = ImageDraw.Draw(preview)
-    draw.text((border, 8), "STATIC BEV - up: +x; left: +y (meters)", fill="black")
-    for value in np.linspace(config.x_min, config.x_max, 5):
-        row = (config.x_max - value) / (config.x_max - config.x_min) * (size - 1)
-        draw.text((4, border + int(row) - 5), f"x={value:g}", fill="black")
-    for value in np.linspace(config.y_max, config.y_min, 5):
-        col = (config.y_max - value) / (config.y_max - config.y_min) * (size - 1)
-        draw.text((border + int(col) - 15, border + size + 4), f"{value:g}", fill="black")
-    lines = [f"S=(0,0)  G=({goal[0]:.1f},{goal[1]:.1f}); horizontal ticks: y",
-             "Orange S / gold G; blue road / blue cars",
-             "Brown pedestrians; pink bicycles; black obstacles",
-             "Peach: construction hazard; no route or history"]
-    for i, line in enumerate(lines):
-        draw.text((8, border + size + 24 + i * 13), line, fill="black")
-    preview.save(output_path)
+
+def _skip_static(args, reason):
+    counts = getattr(args, "skip_reasons", {})
+    counts[reason] = counts.get(reason, 0) + 1
+    args.skip_reasons = counts
+    return False
+
+
+def _road_lanes(proximal, ego_pose, semantic_layer):
+    """Keep all local directed lanes, not the logged route or future intent."""
+    result = []
+    for kind, layer in (("lane", semantic_layer.LANE), ("connector", semantic_layer.LANE_CONNECTOR)):
+        next_kind = "connector" if kind == "lane" else "lane"
+        for lane in proximal.get(layer, []):
+            baseline = _baseline(lane)
+            polygons = _geometry_polygons(lane.polygon)
+            if (len(baseline) < 2 or len(polygons) != 1 or not np.isfinite(baseline).all()
+                    or np.linalg.norm(np.diff(baseline, axis=0), axis=1).sum() < .1):
+                continue
+            result.append(dict(id=f"{kind}:{lane.id}", kind=kind,
+                               polygon=world_to_ego(polygons[0], ego_pose).tolist(),
+                               holes=[world_to_ego(np.asarray(h.coords, dtype=np.float64)[:, :2], ego_pose).tolist()
+                                      for h in getattr(lane.polygon, "interiors", ())],
+                               baseline=world_to_ego(baseline, ego_pose).tolist(),
+                               outgoing=[f"{next_kind}:{edge.id}" for edge in lane.outgoing_edges],
+                               adjacent=[f"lane:{edge.id}" for edge in
+                                         (lane.adjacent_edges if kind == "lane" else ()) if edge is not None]))
+    return result
 
 
 def _export_static_multitask(scenario, iteration, output_root, config, args):
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+    from static_road_planner_v85 import RoadScene, RoadGraph, RoadPlanningConfig, write_json, task_cost
 
     ego = scenario.get_ego_state_at_iteration(iteration)
     ego_pose = np.asarray([ego.rear_axle.x, ego.rear_axle.y, ego.rear_axle.heading])
     radius = math.hypot(max(abs(config.x_min), abs(config.x_max)),
                         max(abs(config.y_min), abs(config.y_max))) + 10.
-    proximal = _proximal_map_objects(scenario.map_api, Point2D(*ego_pose[:2]),
-                                     radius, SemanticMapLayer)
-    lanes = proximal.get(SemanticMapLayer.LANE, []) + proximal.get(SemanticMapLayer.LANE_CONNECTOR, [])
-    polygons = dict(drivable=_object_polygons(lanes, ego_pose),
+    proximal = _proximal_map_objects(scenario.map_api, Point2D(*ego_pose[:2]), radius, SemanticMapLayer)
+    lanes = _road_lanes(proximal, ego_pose, SemanticMapLayer)
+    if not lanes:
+        return _skip_static(args, "no_directed_lane_geometry")
+    polygons = dict(drivable=[lane["polygon"] for lane in lanes],
+                    road_holes=[hole for lane in lanes for hole in lane["holes"]],
                     crosswalk=_object_polygons(proximal.get(SemanticMapLayer.CROSSWALK, []), ego_pose))
-    lines = {"lane_center": [world_to_ego(line, ego_pose) for line in
-                            (_baseline(lane) for lane in lanes) if len(line) >= 2]}
+    lines = {"lane_center": [lane["baseline"] for lane in lanes]}
     agents = _current_agents(scenario, iteration, ego_pose)
     hazards = hazard_polygons(agents, args.hazard_buffer_m)
     vehicle = scenario.ego_vehicle_parameters
-    # nuPlan positions are rear-axle anchored; draw the body at its actual center.
-    center = getattr(ego, "center", None)
-    ego_center = (world_to_ego([[center.x, center.y]], ego_pose)[0]
-                  if center is not None else np.zeros(2))
-
-    def render(goal):
-        return render_bev(polygons, lines, agents, [], {}, None, goal, config=config,
+    center = ego.center
+    ego_center = world_to_ego([[center.x, center.y]], ego_pose)[0]
+    geometry = dict(length=float(vehicle.length), width=float(vehicle.width),
+                    rear_axle_to_center=float(ego_center[0]))
+    planner_config = RoadPlanningConfig(station_step_m=args.station_step_m,
+                                        lateral_offsets_m=tuple(args.lateral_offsets_m),
+                                        collision_step_m=args.collision_step_m,
+                                        min_turn_radius_m=args.min_turn_radius_m,
+                                        safety_margin_m=args.safety_margin_m,
+                                        pedestrian_scale_m=args.pedestrian_scale_m,
+                                        lane_change_policy=args.lane_change_policy)
+    scene = RoadScene(lanes, agents, hazards, config.bounds, geometry, planner_config)
+    if args.goal_xy is not None:
+        x, y = args.goal_xy
+        if not (config.x_min+args.goal_margin_m <= x <= config.x_max-args.goal_margin_m
+                and config.y_min+args.goal_margin_m <= y <= config.y_max-args.goal_margin_m
+                and x >= args.goal_min_forward_m
+                and args.goal_min_distance <= np.linalg.norm(args.goal_xy) <= args.goal_max_distance):
+            return _skip_static(args, "invalid_explicit_goal")
+    graph = RoadGraph(scene).build(args.goal_xy)
+    base_task = dict(objective="length", pedestrian_weight=0., forbid_hazards=False)
+    base_solution = graph.solve(base_task)
+    scene_id = f"{scenario.log_name}/{scenario.token}/{iteration:04d}"
+    target = graph.choose_goal(base_solution[0], args, scene_id)
+    if target is None:
+        return _skip_static(args, "no_forward_reachable_road_goal")
+    goal_pose = graph.poses[target]
+    goal = goal_pose[:2]
+    rendered = render_bev(polygons, lines, agents, [], {}, None, goal, config=config,
                           ego_size=(vehicle.length, vehicle.width), static_scene=True,
                           hazard_polygons=hazards, ego_center_xy=ego_center)
-
-    rendered = render(None)
-    evaluation = static_evaluation_layers(rendered, config, args.agent_radius_m)
-    scene_id = f"{scenario.log_name}/{scenario.token}/{iteration:04d}"
-    goal = select_goal(evaluation, config, scene_id, args)
-    if goal is None:
-        return False
-    rendered = render(goal)
+    evaluation = static_evaluation_layers(rendered, config)
+    tasks = task_variants(goal_pose, args, evaluation, geometry)
+    references = [graph.reference(target, graph.solve(task), task) for task in tasks]
+    # Cross-task evaluation records task conflict; it does not select/filter goals.
+    cross_cost = [[task_cost(ref["metrics"], task) if ref["metrics"] else np.inf
+                   for task in tasks] for ref in references]
     metadata = dict(scene_type=np.str_(scenario.scenario_type),
                     log_name=np.str_(scenario.log_name), scenario_token=np.str_(scenario.token),
                     timestamp_us=np.int64(scenario.get_time_point(iteration).time_us),
                     iteration=np.int64(iteration), goal_seed=np.int64(args.goal_seed),
-                    goal_source=np.str_("explicit_local_goal" if args.goal_xy is not None
-                                        else "current_map_reachable_cells"),
+                    goal_source=np.str_("explicit_road_goal" if args.goal_xy is not None else "forward_downstream_lane_station"),
+                    goal_lane_id=np.str_(graph.node_lane[target]), goal_node_id=np.int64(target),
+                    goal_pose=np.asarray(goal_pose), start_pose=np.zeros(3),
+                    vehicle_geometry_json=np.str_(json.dumps(geometry, sort_keys=True)),
+                    planner_config_json=np.str_(json.dumps(scene.to_dict()["config"], sort_keys=True)),
                     hazard_source=np.str_("construction_object_buffer_not_dataset_risk_gt"),
-                    hazard_buffer_m=np.float32(args.hazard_buffer_m))
+                    hazard_buffer_m=np.float32(args.hazard_buffer_m),
+                    reference_scope=np.str_("finite_directed_road_graph_sampled_cost"))
     folder = Path(output_root) / scenario.log_name / scenario.token / f"{iteration:04d}"
-    tasks = task_variants(goal, args, evaluation)
-    if not tasks:
-        raise ValueError("at least one task is required")
-    for task in tasks:
+    if folder.exists():
+        raise FileExistsError(f"Refusing to mix or overwrite exports: {folder}; choose a new --output-root")
+    folder.mkdir(parents=True)
+    audit = folder / "audit"
+    audit.mkdir()
+    write_json(audit / "scene_geometry.json", scene.to_dict())
+    graph.save(audit / "planning_graph.npz")
+    for task, reference in zip(tasks, references):
         save_static_bev_raw_record(folder / f"{task['id']}.npz", rendered, config,
-                                   goal, task, scene_id, metadata, evaluation)
+                                   goal, task, scene_id, metadata, evaluation, reference)
+        if args.save_preview and reference["status"] == "optimal_on_graph":
+            from PIL import Image, ImageDraw
+            from bev_renderer_v85 import ego_to_pixel
+            image = Image.fromarray(rendered["bev_rgb"])
+            ImageDraw.Draw(image).line([tuple(p) for p in ego_to_pixel(reference["poses"][:, :2], config)],
+                                       fill=(132, 43, 169), width=max(2, config.image_size//180))
+            image.save(audit / f"reference_{task['id']}.png")
+    write_json(audit / "reference_summary.json", dict(
+        scene_id=scene_id, goal_pose=goal_pose, reference_scope=str(metadata["reference_scope"]),
+        graph_nodes=len(graph.poses), graph_edges=len(graph.edges), task_order=[t["id"] for t in tasks],
+        reference_status=[r["status"] for r in references],
+        reference_cost=[r["cost"] for r in references], cross_task_cost=cross_cost,
+        note="Rows: reference paths. Columns: task objectives. Null means infeasible/unavailable. "
+             "Costs have different task units; compare within a column. No task-contrast filtering."))
     if args.save_preview:
         _save_preview(rendered, goal, config, folder / "bev_preview.png")
     return True
@@ -577,22 +633,29 @@ def parse_args(argv=None):
     parser.add_argument("--history-seconds", type=float, default=None,
                         help="route_tracking only; defaults to 2s there")
     parser.add_argument("--history-samples", type=int, default=None)
-    parser.add_argument("--image-size", type=int, default=288)
+    parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--region-grid", type=int, default=9)
     parser.add_argument("--x-min", type=float, default=None)
     parser.add_argument("--x-max", type=float, default=None)
-    parser.add_argument("--y-min", type=float, default=-40.0)
-    parser.add_argument("--y-max", type=float, default=40.0)
+    parser.add_argument("--y-min", type=float, default=None)
+    parser.add_argument("--y-max", type=float, default=None)
     parser.add_argument("--task-text", default=None, help="route_tracking only")
     parser.add_argument("--tasks", nargs="+", choices=("shortest", "pedestrian_clearance", "avoid_hazards"),
                         default=["shortest", "pedestrian_clearance", "avoid_hazards"])
     parser.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"),
                         help="optional goal in local meters; invalid/unreachable scenes are skipped")
     parser.add_argument("--goal-min-distance", type=float, default=18.)
-    parser.add_argument("--goal-max-distance", type=float, default=32.)
+    parser.add_argument("--goal-max-distance", type=float, default=28.)
     parser.add_argument("--goal-margin-m", type=float, default=3.)
     parser.add_argument("--goal-seed", type=int, default=7)
-    parser.add_argument("--agent-radius-m", type=float, default=1.)
+    parser.add_argument("--goal-min-forward-m", type=float, default=8.)
+    parser.add_argument("--station-step-m", type=float, default=4.)
+    parser.add_argument("--lateral-offsets-m", type=float, nargs="+", default=[-.5, 0., .5])
+    parser.add_argument("--collision-step-m", type=float, default=.25)
+    parser.add_argument("--min-turn-radius-m", type=float, default=5.5)
+    parser.add_argument("--safety-margin-m", type=float, default=.15)
+    parser.add_argument("--lane-change-policy", choices=("adjacent", "outgoing_only"), default="adjacent",
+                        help="adjacent permits curvature/footprint-checked changes between explicit map neighbors")
     parser.add_argument("--hazard-buffer-m", type=float, default=3.)
     parser.add_argument("--pedestrian-weight", type=float, default=4.)
     parser.add_argument("--pedestrian-scale-m", type=float, default=4.)
@@ -606,15 +669,26 @@ def parse_args(argv=None):
         parser.error("static_multitask uses defined task objectives; select --tasks instead of --task-text")
     args.history_seconds = 0. if static else (2. if args.history_seconds is None else args.history_seconds)
     args.history_samples = 0 if static else (5 if args.history_samples is None else args.history_samples)
-    args.x_min = (-40. if static else -16.) if args.x_min is None else args.x_min
-    args.x_max = (40. if static else 64.) if args.x_max is None else args.x_max
+    args.image_size = (720 if static else 288) if args.image_size is None else args.image_size
+    args.y_min = (-24. if static else -40.) if args.y_min is None else args.y_min
+    args.y_max = (24. if static else 40.) if args.y_max is None else args.y_max
+    args.x_min = (-12. if static else -16.) if args.x_min is None else args.x_min
+    args.x_max = (36. if static else 64.) if args.x_max is None else args.x_max
     args.task_text = DEFAULT_TASK if args.task_text is None else args.task_text
     args.tasks = list(dict.fromkeys(args.tasks))
     if static:
         positive = (args.goal_min_distance, args.goal_max_distance, args.goal_margin_m,
-                    args.agent_radius_m, args.pedestrian_scale_m, args.nominal_speed)
+                    args.goal_min_forward_m, args.station_step_m, args.collision_step_m,
+                    args.min_turn_radius_m, args.pedestrian_scale_m, args.nominal_speed)
         if not all(np.isfinite(v) and v > 0 for v in positive):
-            parser.error("goal distances, margin, agent radius, scale and speed must be finite and positive")
+            parser.error("goal distances, margins, planning steps, radius, scale and speed must be finite and positive")
+        if args.goal_xy is not None and not np.isfinite(args.goal_xy).all():
+            parser.error("goal must be finite")
+        if (not np.isfinite(args.safety_margin_m) or args.safety_margin_m < 0
+                or not np.isfinite(args.lateral_offsets_m).all() or 0. not in args.lateral_offsets_m
+                or len(set(args.lateral_offsets_m)) != len(args.lateral_offsets_m)
+                or args.collision_step_m > args.station_step_m):
+            parser.error("invalid safety margin, offsets or collision step")
         if args.goal_max_distance < args.goal_min_distance:
             parser.error("goal-max-distance must be >= goal-min-distance")
         if (not np.isfinite(args.hazard_buffer_m) or args.hazard_buffer_m < 0 or
@@ -660,6 +734,13 @@ def main():
     print(f"{args.planning_mode}: wrote {written} scenes; skipped {skipped} invalid/unreachable scenes")
     if args.planning_mode == "static_multitask":
         print(f"{written * len(set(args.tasks))} task records; same RGB/goal across tasks in each scene")
+        from static_road_planner_v85 import write_json
+        root = Path(args.output_root)
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(root / "export_summary.json", dict(written_scenes=written, skipped_scenes=skipped,
+                   skip_reasons=getattr(args, "skip_reasons", {}), args=vars(args),
+                   note="Static car planning export, not logged human GT or closed-loop nuPlan evaluation."))
+        print("Skip reasons:", getattr(args, "skip_reasons", {}))
 
 
 if __name__ == "__main__":
