@@ -1,3 +1,37 @@
+# V8.5 wide BEV / logged GT boundary validation — revision 6
+
+Branch: `v85-bev-gt-boundary`.
+
+`python -m unittest test_v85_logged_gt test_v85_static_bev test_v85_bev -v`
+
+24 tests passed on Python 3.12 / Shapely 2.2. New coverage:
+
+- 1440 px / 96 m static defaults; legacy route defaults unchanged.
+- First boundary intersection, side exit, later re-entry ignored, shortest-angle heading interpolation.
+- Logged time retained including stationary samples; invalid time rejected, large-coordinate precision retained.
+- Exact GT goal pose retained rather than snapped to a lane baseline or tangent.
+- Full mocked export beyond the old 28 m goal limit, with and without numeric references.
+- GT kept out of model input allowlist and input raster; audit overlay saved separately.
+- Short GT skipped explicitly with no replacement goal or manufactured trajectory.
+
+Official nuPlan `get_ego_future_trajectory` was inspected: future state timestamps are used directly;
+requested horizon/sample count are not treated as proof of returned coverage. No extrapolation is done.
+The default road-graph mode test still rejects any future access; GT mode intentionally reads future ego
+for the public goal and held-out trajectory only. The remaining revision5 geometry tests still pass.
+
+A 1440×1440 synthetic straight-road export was visually inspected: no text, visible start/goal,
+and the green GT prefix ends at the inset boundary. This is controlled test geometry, not nuPlan data.
+Its standalone `--logged-gt` shortest-task evaluation succeeded with length 67.8359995 m and
+`reference_status=not_computed`, without inventing a reference cost.
+
+Real nuPlan mini, Python 3.9, Qwen inference and RL training were not run locally. Static GT feasibility
+is assessed independently: a recorded dynamic trajectory can collide with frozen actors or violate
+new task constraints. It is never declared a per-task optimum. ADE/FDE computation is not added here.
+
+The following is the historical revision5 validation record; its old default values are not revision6 defaults.
+
+---
+
 # V8.5 static road reference validation — revision 5
 
 Branch: `v85-static-bev-road-reference`.

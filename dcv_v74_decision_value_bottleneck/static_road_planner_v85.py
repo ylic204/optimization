@@ -335,6 +335,29 @@ class RoadGraph:
                 if self.node_lane[source] == key and .1 <= station-self.station[source] <= 3*self.scene.config.station_step_m:
                     self.add_edge(source, target, [key])
 
+    def add_pose_goal(self, pose):
+        """Exact logged endpoint, including heading, without snapping to a lane.
+
+        An unmatched or blocked goal remains an unreachable node. The GT must
+        not be relocated or suppressed just because the static graph cannot solve it.
+        """
+        pose = np.asarray(pose, dtype=float)
+        matches = sorted(self.scene.lane_matches(pose))
+        key = matches[0] if matches else ""
+        station = self.scene.lines[key].project(Point(pose[:2])) if key else 0.
+        target = self.add_node(pose.copy(), key, station, 0.)
+        for source in range(1, target):
+            source_lane = self.node_lane[source]
+            delta = pose[:2] - self.poses[source][:2]
+            forward = np.dot(delta, [math.cos(self.poses[source][2]), math.sin(self.poses[source][2])])
+            if not .1 < forward <= 3*self.scene.config.station_step_m:
+                continue
+            permitted = {source_lane} | set(self.scene.lanes[source_lane]["outgoing"] + self.scene.adjacent(source_lane))
+            for goal_lane in matches:
+                if goal_lane in permitted:
+                    self.add_edge(source, target, sorted({source_lane, goal_lane}))
+        return target
+
     def solve(self, task):
         distance = np.full(len(self.poses), np.inf)
         parent = np.full(len(self.poses), -1, dtype=np.int64)

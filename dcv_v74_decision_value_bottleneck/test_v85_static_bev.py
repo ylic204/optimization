@@ -81,7 +81,7 @@ class StaticRoadTest(unittest.TestCase):
     def test_default_geometry_and_legacy_opt_in(self):
         args = arguments()
         self.assertEqual((args.image_size, args.x_min, args.x_max, args.y_min, args.y_max),
-                         (720, -12., 36., -24., 24.))
+                         (1440, -24., 72., -48., 48.))
         self.assertEqual(args.history_seconds, 0.)
         legacy = arguments("--planning-mode", "route_tracking")
         self.assertEqual((legacy.image_size, legacy.x_min, legacy.x_max, legacy.history_seconds), (288,-16.,64.,2.))
@@ -108,7 +108,7 @@ class StaticRoadTest(unittest.TestCase):
             for name in ("shortest", "pedestrian_clearance", "avoid_hazards"):
                 path = folder/f"{name}.npz"
                 with np.load(path, allow_pickle=False) as record:
-                    self.assertEqual(record["schema_revision"].item(), 5)
+                    self.assertEqual(record["schema_revision"].item(), 6)
                     self.assertFalse(record["trajectory_gt_available"].item())
                     self.assertNotIn("reference_path_ego", record)
                     self.assertNotIn("expert_trajectory_ego", record)

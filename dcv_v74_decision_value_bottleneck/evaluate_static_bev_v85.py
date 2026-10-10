@@ -21,8 +21,8 @@ MODEL_INPUT_KEYS = (
 
 def model_inputs(record):
     """Explicit allowlist: no masks, graph, future states or numeric references."""
-    if str(record["input_mode"].item()) != STATIC_INPUT_MODE or int(record["schema_revision"]) != 5:
-        raise ValueError("expected static BEV schema85 revision5; re-export older records")
+    if str(record["input_mode"].item()) != STATIC_INPUT_MODE or int(record["schema_revision"]) not in (5, 6):
+        raise ValueError("expected static BEV schema85 revision5/6; re-export older records")
     return {key: np.asarray(record[key]).copy() for key in MODEL_INPUT_KEYS}
 
 
@@ -60,12 +60,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--record", required=True)
     parser.add_argument("--trajectory", help=".npy array [N,3] in ego-frame meters/radians")
+    parser.add_argument("--logged-gt", action="store_true", help="check the saved logged GT against static task constraints")
     args = parser.parse_args()
+    if args.logged_gt and args.trajectory:
+        parser.error("choose --logged-gt or --trajectory")
     if args.trajectory:
         trajectory = np.load(args.trajectory, allow_pickle=False)
     else:
         with np.load(args.record, allow_pickle=False) as record:
-            trajectory = record["reference_trajectory_ego"]
+            if args.logged_gt:
+                if not bool(record["trajectory_gt_available"]):
+                    parser.error("this record has no logged GT")
+                from logged_gt_goal_v85 import geometric_gt
+                trajectory = geometric_gt(record["logged_gt_trajectory_ego"])
+            else:
+                trajectory = record["reference_trajectory_ego"]
     print(json.dumps(evaluate_record(args.record, trajectory), indent=2, allow_nan=False))
 
 

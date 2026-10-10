@@ -12,14 +12,14 @@ STATIC_INPUT_MODE = "ego_centric_static_bev_v85"
 
 
 def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
-                               scene_id, metadata, evaluation, reference):
+                               scene_id, metadata, evaluation, reference, logged_gt=None):
     """Static car task: numeric references are evaluator-only, not human GT.
 
     Only RGB, task specification and fixed geometry are model inputs. All
     masks, distances and reachability diagnostics are evaluator-only fields.
     """
     import json
-    from static_road_planner_v85 import json_ready
+    from static_road_planner_v85 import json_ready, task_cost
 
     rgb = np.asarray(rendered["bev_rgb"], dtype=np.uint8)
     semantic = np.asarray(rendered["bev_semantic"], dtype=np.uint8)
@@ -32,9 +32,15 @@ def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
             raise ValueError(f"static BEV must not contain {name}")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    gt_cost = task_cost(logged_gt["static_metrics"], task) if logged_gt is not None else np.inf
+    if logged_gt is not None:
+        if (not np.allclose(logged_gt["poses"][-1, :2], goal_xy, atol=1e-6)
+                or len(logged_gt["times"]) != len(logged_gt["poses"])
+                or (np.diff(logged_gt["times"]) <= 0).any()):
+            raise ValueError("logged GT endpoint/timestamps must match the exported task")
     np.savez_compressed(
         output_path,
-        raw_schema_version=np.int64(85), schema_revision=np.int64(5),
+        raw_schema_version=np.int64(85), schema_revision=np.int64(6),
         input_mode=np.str_(STATIC_INPUT_MODE),
         planning_mode=np.str_("static_multitask"),
         metric_raster_layout=np.str_("bev_x_rows_y_cols"),
@@ -48,7 +54,15 @@ def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
         task_id=np.str_(task["id"]), task_text=np.str_(task["text"]),
         task_spec_json=np.str_(json.dumps(task, sort_keys=True)),
         scene_id=np.str_(scene_id), sample_id=np.str_(f"{scene_id}/{task['id']}"),
-        trajectory_gt_available=np.bool_(False),
+        trajectory_gt_available=np.bool_(logged_gt is not None),
+        logged_gt_trajectory_ego=np.asarray(logged_gt["poses"] if logged_gt is not None else np.empty((0,3)), dtype=np.float64),
+        logged_gt_time_s=np.asarray(logged_gt["times"] if logged_gt is not None else [], dtype=np.float64),
+        logged_gt_source=np.str_(logged_gt["source"] if logged_gt is not None else "unavailable"),
+        logged_gt_end_interpolated=np.bool_(logged_gt["end_interpolated"] if logged_gt is not None else False),
+        logged_gt_boundary_inset_m=np.float64(logged_gt["boundary_inset_m"] if logged_gt is not None else np.nan),
+        logged_gt_static_task_feasible=np.bool_(np.isfinite(gt_cost)),
+        logged_gt_static_task_cost=np.float64(gt_cost),
+        logged_gt_is_task_optimum=np.bool_(False),
         reference_solution_available=np.bool_(reference["status"] == "optimal_on_graph"),
         reference_status=np.str_(reference["status"]),
         reference_trajectory_ego=np.asarray(reference["poses"], dtype=np.float64),

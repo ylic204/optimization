@@ -1,7 +1,7 @@
 # V8.5 BEV input and timestamped nuPlan targets (revision 3)
 
 This page documents the legacy `--planning-mode route_tracking` experiment.
-The exporter now defaults to route-free static vehicle multi-task revision5; see
+The exporter now defaults to route-free static vehicle multi-task revision6 with logged-GT boundary goals; see
 [README_V85_STATIC_BEV.md](README_V85_STATIC_BEV.md). These contracts must not be mixed.
 
 ## Input boundary

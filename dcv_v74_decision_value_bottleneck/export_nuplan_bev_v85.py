@@ -1,7 +1,8 @@
 """Export camera-free ego-centric BEV records directly from nuPlan DBs.
 
-Default: static, route-free multi-task planning snapshots. No actor histories
-or future ego states are requested. Legacy route/GT export is opt-in via
+Default: wide static snapshots with a goal on the truncated logged future GT.
+GT is saved for evaluation, never rendered in the model input. No actor histories
+are requested. Legacy route/GT export is opt-in via
 --planning-mode route_tracking and uses a distinct record contract.
 """
 
@@ -476,6 +477,24 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
 
     ego = scenario.get_ego_state_at_iteration(iteration)
     ego_pose = np.asarray([ego.rear_axle.x, ego.rear_axle.y, ego.rear_axle.heading])
+    logged_gt = None
+    gt_mode = args.goal_source == "logged_gt_boundary"
+    vehicle = scenario.ego_vehicle_parameters
+    center = ego.center
+    ego_center = world_to_ego([[center.x, center.y]], ego_pose)[0]
+    geometry = dict(length=float(vehicle.length), width=float(vehicle.width),
+                    rear_axle_to_center=float(ego_center[0]))
+    if gt_mode:
+        from logged_gt_goal_v85 import load_logged_future, boundary_inset, truncate_at_boundary
+        try:
+            poses, times = load_logged_future(scenario, iteration, ego_pose,
+                                             args.gt_horizon_s, args.gt_sample_interval_s)
+            inset = boundary_inset(geometry, args.safety_margin_m, args.goal_margin_m)
+            logged_gt = truncate_at_boundary(poses, times, config.bounds, inset)
+        except (AssertionError, RuntimeError, ValueError) as error:
+            return _skip_static(args, "logged_gt_unavailable_or_invalid:"+type(error).__name__)
+        if logged_gt is None:
+            return _skip_static(args, "logged_gt_does_not_reach_boundary")
     radius = math.hypot(max(abs(config.x_min), abs(config.x_max)),
                         max(abs(config.y_min), abs(config.y_max))) + 10.
     proximal = _proximal_map_objects(scenario.map_api, Point2D(*ego_pose[:2]), radius, SemanticMapLayer)
@@ -488,11 +507,6 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
     lines = {"lane_center": [lane["baseline"] for lane in lanes]}
     agents = _current_agents(scenario, iteration, ego_pose)
     hazards = hazard_polygons(agents, args.hazard_buffer_m)
-    vehicle = scenario.ego_vehicle_parameters
-    center = ego.center
-    ego_center = world_to_ego([[center.x, center.y]], ego_pose)[0]
-    geometry = dict(length=float(vehicle.length), width=float(vehicle.width),
-                    rear_axle_to_center=float(ego_center[0]))
     planner_config = RoadPlanningConfig(station_step_m=args.station_step_m,
                                         lateral_offsets_m=tuple(args.lateral_offsets_m),
                                         collision_step_m=args.collision_step_m,
@@ -508,21 +522,32 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
                 and x >= args.goal_min_forward_m
                 and args.goal_min_distance <= np.linalg.norm(args.goal_xy) <= args.goal_max_distance):
             return _skip_static(args, "invalid_explicit_goal")
-    graph = RoadGraph(scene).build(args.goal_xy)
-    base_task = dict(objective="length", pedestrian_weight=0., forbid_hazards=False)
-    base_solution = graph.solve(base_task)
     scene_id = f"{scenario.log_name}/{scenario.token}/{iteration:04d}"
-    target = graph.choose_goal(base_solution[0], args, scene_id)
-    if target is None:
-        return _skip_static(args, "no_forward_reachable_road_goal")
-    goal_pose = graph.poses[target]
+    graph = None
+    target = -1
+    if gt_mode:
+        goal_pose = logged_gt["poses"][-1].copy()
+        from logged_gt_goal_v85 import geometric_gt
+        logged_gt["static_metrics"] = scene.assess(geometric_gt(logged_gt["poses"]))
+        if not args.skip_numeric_reference:
+            graph = RoadGraph(scene).build()
+            target = graph.add_pose_goal(goal_pose)
+    else:
+        graph = RoadGraph(scene).build(args.goal_xy)
+        base_task = dict(objective="length", pedestrian_weight=0., forbid_hazards=False)
+        base_solution = graph.solve(base_task)
+        target = graph.choose_goal(base_solution[0], args, scene_id)
+        if target is None:
+            return _skip_static(args, "no_forward_reachable_road_goal")
+        goal_pose = graph.poses[target]
     goal = goal_pose[:2]
     rendered = render_bev(polygons, lines, agents, [], {}, None, goal, config=config,
                           ego_size=(vehicle.length, vehicle.width), static_scene=True,
                           hazard_polygons=hazards, ego_center_xy=ego_center)
     evaluation = static_evaluation_layers(rendered, config)
     tasks = task_variants(goal_pose, args, evaluation, geometry)
-    references = [graph.reference(target, graph.solve(task), task) for task in tasks]
+    references = ([graph.reference(target, graph.solve(task), task) for task in tasks] if graph is not None else
+                  [dict(status="not_computed", cost=None, poses=np.empty((0,3)), edge_ids=[], metrics={}) for _ in tasks])
     # Cross-task evaluation records task conflict; it does not select/filter goals.
     cross_cost = [[task_cost(ref["metrics"], task) if ref["metrics"] else np.inf
                    for task in tasks] for ref in references]
@@ -530,8 +555,9 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
                     log_name=np.str_(scenario.log_name), scenario_token=np.str_(scenario.token),
                     timestamp_us=np.int64(scenario.get_time_point(iteration).time_us),
                     iteration=np.int64(iteration), goal_seed=np.int64(args.goal_seed),
-                    goal_source=np.str_("explicit_road_goal" if args.goal_xy is not None else "forward_downstream_lane_station"),
-                    goal_lane_id=np.str_(graph.node_lane[target]), goal_node_id=np.int64(target),
+                    goal_source=np.str_("logged_gt_boundary" if gt_mode else
+                                        "explicit_road_goal" if args.goal_xy is not None else "forward_downstream_lane_station"),
+                    goal_lane_id=np.str_(graph.node_lane[target] if graph is not None else ""), goal_node_id=np.int64(target),
                     goal_pose=np.asarray(goal_pose), start_pose=np.zeros(3),
                     vehicle_geometry_json=np.str_(json.dumps(geometry, sort_keys=True)),
                     planner_config_json=np.str_(json.dumps(scene.to_dict()["config"], sort_keys=True)),
@@ -545,10 +571,20 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
     audit = folder / "audit"
     audit.mkdir()
     write_json(audit / "scene_geometry.json", scene.to_dict())
-    graph.save(audit / "planning_graph.npz")
+    if graph is not None:
+        graph.save(audit / "planning_graph.npz")
+    if logged_gt is not None:
+        write_json(audit / "logged_gt_summary.json", {k:v for k,v in logged_gt.items() if k not in ("poses", "times")})
+        if args.save_preview:
+            from PIL import Image, ImageDraw
+            from bev_renderer_v85 import ego_to_pixel
+            image = Image.fromarray(rendered["bev_rgb"])
+            ImageDraw.Draw(image).line([tuple(p) for p in ego_to_pixel(logged_gt["poses"][:,:2], config)],
+                                       fill=(34, 145, 75), width=max(2, config.image_size//240))
+            image.save(audit / "logged_gt.png")
     for task, reference in zip(tasks, references):
         save_static_bev_raw_record(folder / f"{task['id']}.npz", rendered, config,
-                                   goal, task, scene_id, metadata, evaluation, reference)
+                                   goal, task, scene_id, metadata, evaluation, reference, logged_gt=logged_gt)
         if args.save_preview and reference["status"] == "optimal_on_graph":
             from PIL import Image, ImageDraw
             from bev_renderer_v85 import ego_to_pixel
@@ -558,7 +594,7 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
             image.save(audit / f"reference_{task['id']}.png")
     write_json(audit / "reference_summary.json", dict(
         scene_id=scene_id, goal_pose=goal_pose, reference_scope=str(metadata["reference_scope"]),
-        graph_nodes=len(graph.poses), graph_edges=len(graph.edges), task_order=[t["id"] for t in tasks],
+        graph_nodes=len(graph.poses) if graph is not None else 0, graph_edges=len(graph.edges) if graph is not None else 0, task_order=[t["id"] for t in tasks],
         reference_status=[r["status"] for r in references],
         reference_cost=[r["cost"] for r in references], cross_task_cost=cross_cost,
         note="Rows: reference paths. Columns: task objectives. Null means infeasible/unavailable. "
@@ -642,6 +678,12 @@ def parse_args(argv=None):
     parser.add_argument("--task-text", default=None, help="route_tracking only")
     parser.add_argument("--tasks", nargs="+", choices=("shortest", "pedestrian_clearance", "avoid_hazards"),
                         default=["shortest", "pedestrian_clearance", "avoid_hazards"])
+    parser.add_argument("--goal-source", choices=("logged_gt_boundary", "road_graph"), default=None,
+                        help="default: logged GT first exit; explicit --goal-xy implies road_graph")
+    parser.add_argument("--gt-horizon-s", type=float, default=20.)
+    parser.add_argument("--gt-sample-interval-s", type=float, default=.1)
+    parser.add_argument("--skip-numeric-reference", action="store_true",
+                        help="GT boundary mode: export GT/images without building the numeric reference graph")
     parser.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"),
                         help="optional goal in local meters; invalid/unreachable scenes are skipped")
     parser.add_argument("--goal-min-distance", type=float, default=18.)
@@ -669,19 +711,27 @@ def parse_args(argv=None):
         parser.error("static_multitask uses defined task objectives; select --tasks instead of --task-text")
     args.history_seconds = 0. if static else (2. if args.history_seconds is None else args.history_seconds)
     args.history_samples = 0 if static else (5 if args.history_samples is None else args.history_samples)
-    args.image_size = (720 if static else 288) if args.image_size is None else args.image_size
-    args.y_min = (-24. if static else -40.) if args.y_min is None else args.y_min
-    args.y_max = (24. if static else 40.) if args.y_max is None else args.y_max
-    args.x_min = (-12. if static else -16.) if args.x_min is None else args.x_min
-    args.x_max = (36. if static else 64.) if args.x_max is None else args.x_max
+    args.goal_source = ("road_graph" if args.goal_xy is not None else "logged_gt_boundary") if args.goal_source is None else args.goal_source
+    if static and args.goal_source == "logged_gt_boundary" and args.goal_xy is not None:
+        parser.error("GT boundary goal cannot be overridden by --goal-xy; use --goal-source road_graph")
+    if args.skip_numeric_reference and (not static or args.goal_source != "logged_gt_boundary"):
+        parser.error("--skip-numeric-reference requires static logged_gt_boundary mode")
+    args.image_size = (1440 if static else 288) if args.image_size is None else args.image_size
+    args.y_min = (-48. if static else -40.) if args.y_min is None else args.y_min
+    args.y_max = (48. if static else 40.) if args.y_max is None else args.y_max
+    args.x_min = (-24. if static else -16.) if args.x_min is None else args.x_min
+    args.x_max = (72. if static else 64.) if args.x_max is None else args.x_max
     args.task_text = DEFAULT_TASK if args.task_text is None else args.task_text
     args.tasks = list(dict.fromkeys(args.tasks))
     if static:
         positive = (args.goal_min_distance, args.goal_max_distance, args.goal_margin_m,
                     args.goal_min_forward_m, args.station_step_m, args.collision_step_m,
-                    args.min_turn_radius_m, args.pedestrian_scale_m, args.nominal_speed)
+                    args.min_turn_radius_m, args.pedestrian_scale_m, args.nominal_speed,
+                    args.gt_horizon_s, args.gt_sample_interval_s)
         if not all(np.isfinite(v) and v > 0 for v in positive):
             parser.error("goal distances, margins, planning steps, radius, scale and speed must be finite and positive")
+        if args.gt_horizon_s < args.gt_sample_interval_s:
+            parser.error("GT horizon must be at least one sampling interval")
         if args.goal_xy is not None and not np.isfinite(args.goal_xy).all():
             parser.error("goal must be finite")
         if (not np.isfinite(args.safety_margin_m) or args.safety_margin_m < 0
@@ -739,7 +789,7 @@ def main():
         root.mkdir(parents=True, exist_ok=True)
         write_json(root / "export_summary.json", dict(written_scenes=written, skipped_scenes=skipped,
                    skip_reasons=getattr(args, "skip_reasons", {}), args=vars(args),
-                   note="Static car planning export, not logged human GT or closed-loop nuPlan evaluation."))
+                   note="Logged GT (when available) and static numeric references are distinct; not closed-loop nuPlan evaluation."))
         print("Skip reasons:", getattr(args, "skip_reasons", {}))
 
 
