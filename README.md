@@ -1,5 +1,19 @@
 # V8.5 — BEV Selector with Frozen LLM Modeling and Solver Feedback
 
+## 当前：静态多任务 BEV 导出
+
+新分支 `v85-static-bev-multitask` 根据最新实验设定修改了 BEV 导出：
+**同一静态场景与目标 → 不同任务文本/约束 → 视觉选择 → 冻结 VLM 建模 → 求解器**。
+默认去掉参考路线、路线高亮、历史轨迹和信号灯；起点位于 80m×80m 图中央，
+目标由当前静态可行域选择，不使用路线或未来 GT。每帧输出最短路、远离行人、避开危险区
+三个任务记录及一张带坐标的预览。危险区明确来自施工对象缓冲，不是数据集风险 GT。
+
+[静态导出命令、任务定义及字段说明](dcv_v74_decision_value_bottleneck/README_V85_STATIC_BEV.md)。
+新记录为 `ego_centric_static_bev_v85` revision4。此次完成导出部分；下面的旧训练链路
+仍采用 route/GT 奖励，不能直接训练这些静态记录。旧处理器会明确拒绝，需后续接入静态任务成本评价。
+
+## 旧 route/GT 实验复现
+
 本分支 `v85-bev-selector-llm-solver` 在 `v85-bev-rl-posttraining` 基础上补齐主链路：
 **选择 BEV 区域 → 冻结 LLM 生成优化实例 → 连续轨迹求解器 → 与时间对齐 GT 比较 → 更新区域选择策略**。
 GitHub `main` 仍是旧第一视角版本，请切换到本分支运行。
@@ -65,6 +79,7 @@ cd dcv_v74_decision_value_bottleneck
 pip install -r requirements.txt
 # nuPlan devkit 单独安装；按完整 log 划分 train/val/test 后分别导出。
 python export_nuplan_bev_v85.py \
+  --planning-mode route_tracking \
   --data-root /data/nuplan/dataset --map-root /data/nuplan/maps \
   --db-files /data/nuplan/splits/train/*.db \
   --output-root /data/v85_bev/raw_r3/train --future-horizon 8 --future-samples 16

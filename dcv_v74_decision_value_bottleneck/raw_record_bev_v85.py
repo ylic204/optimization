@@ -4,10 +4,53 @@ from pathlib import Path
 
 import numpy as np
 
-from bev_renderer_v85 import SEMANTIC_NAMES
+from bev_renderer_v85 import SEMANTIC_NAMES, STATIC_SEMANTIC_NAMES
 
 
 INPUT_MODE = "ego_centric_bev_v85"
+STATIC_INPUT_MODE = "ego_centric_static_bev_v85"
+
+
+def save_static_bev_raw_record(output_path, rendered, config, goal_xy, task,
+                               scene_id, metadata, evaluation):
+    """Static task record: no logged route, future GT or candidate trajectory.
+
+    Only RGB, task specification and fixed geometry are model inputs. All
+    masks, distances and reachability diagnostics are evaluator-only fields.
+    """
+    import json
+
+    rgb = np.asarray(rendered["bev_rgb"], dtype=np.uint8)
+    semantic = np.asarray(rendered["bev_semantic"], dtype=np.uint8)
+    if rgb.shape != (config.image_size, config.image_size, 3):
+        raise ValueError("invalid static BEV RGB shape")
+    if semantic.shape != (len(STATIC_SEMANTIC_NAMES), *rgb.shape[:2]):
+        raise ValueError("invalid static semantic shape")
+    for name in ("route", "reference", "history", "traffic_red", "traffic_yellow", "traffic_green"):
+        if semantic[SEMANTIC_NAMES.index(name)].any():
+            raise ValueError(f"static BEV must not contain {name}")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        raw_schema_version=np.int64(85), schema_revision=np.int64(4),
+        input_mode=np.str_(STATIC_INPUT_MODE),
+        planning_mode=np.str_("static_multitask"),
+        metric_raster_layout=np.str_("bev_x_rows_y_cols"),
+        bev_rgb=rgb, bev_semantic=semantic,
+        bev_semantic_names=np.asarray(STATIC_SEMANTIC_NAMES, dtype="U32"),
+        bev_config_json=np.str_(config.to_json()),
+        region_world_bounds=rendered["region_world_bounds"],
+        region_semantic_counts=rendered["region_semantic_counts"],
+        map_bounds=config.bounds, start_xy=np.zeros(2, dtype=np.float32),
+        goal_xy=np.asarray(goal_xy, dtype=np.float32),
+        task_id=np.str_(task["id"]), task_text=np.str_(task["text"]),
+        task_spec_json=np.str_(json.dumps(task, sort_keys=True)),
+        scene_id=np.str_(scene_id), sample_id=np.str_(f"{scene_id}/{task['id']}"),
+        trajectory_gt_available=np.bool_(False),
+        **{key: np.asarray(value) for key, value in metadata.items()},
+        **{key: np.asarray(value) for key, value in evaluation.items()},
+    )
 
 
 def save_bev_raw_record(

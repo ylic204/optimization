@@ -1,5 +1,9 @@
 # V8.5 BEV input and timestamped nuPlan targets (revision 3)
 
+This page documents the legacy `--planning-mode route_tracking` experiment.
+The exporter now defaults to route-free static multi-task revision4; see
+[README_V85_STATIC_BEV.md](README_V85_STATIC_BEV.md). These contracts must not be mixed.
+
 ## Input boundary
 
 One fixed-metric ego-centric RGB raster is rendered from map/route, current tracked actors,
@@ -67,6 +71,7 @@ Use a nuPlan devkit environment with the dataset and maps installed:
 
 ```bash
 python export_nuplan_bev_v85.py \
+  --planning-mode route_tracking \
   --data-root /data/nuplan/dataset --map-root /data/nuplan/maps \
   --db-files /data/nuplan/splits/train/*.db \
   --output-root /data/v85_bev/raw_r3/train \

@@ -9,7 +9,7 @@ from planning_data_v84 import (
     MIN_CANDIDATES,
     process_raw_record,
 )
-from raw_record_bev_v85 import INPUT_MODE
+from raw_record_bev_v85 import INPUT_MODE, STATIC_INPUT_MODE
 from trajectory_gt_v85 import GT_CONTRACT, aligned_expert
 from bev_geometry_v85 import (
     RASTER_LAYOUT, SCHEMA_REVISION, bev_to_legacy_raster, legacy_to_bev_raster,
@@ -31,6 +31,12 @@ def process_bev_raw_record(
     max_candidates=MAX_CANDIDATES,
 ):
     input_mode = str(_scalar(raw, "input_mode", ""))
+    if input_mode == STATIC_INPUT_MODE:
+        raise ValueError(
+            "static_multitask records have task objectives, not logged route/GT targets. "
+            "Do not use the legacy candidate/ADE processor or run_v85_rl.sh on these records. "
+            "See README_V85_STATIC_BEV.md for the static export contract."
+        )
     if input_mode != INPUT_MODE:
         raise ValueError(
             f"expected {INPUT_MODE!r}, got {input_mode!r}; "

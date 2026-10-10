@@ -133,7 +133,8 @@ class BevGeometryTest(unittest.TestCase):
             ego_vehicle_parameters=SimpleNamespace(length=4.8, width=2.),
             log_name="log", token="scenario", scenario_type="test",
         )
-        args = SimpleNamespace(future_samples=16, future_horizon=4., task_text="drive safely")
+        args = SimpleNamespace(planning_mode="route_tracking", future_samples=16,
+                               future_horizon=4., task_text="drive safely")
         times = np.arange(1, 17) * .25
         expert = np.column_stack([times, np.zeros((16, 2))])
         config = BevConfig()

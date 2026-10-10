@@ -32,6 +32,7 @@ SEMANTIC_NAMES = (
     "goal",
 )
 SEMANTIC_INDEX = {name: index for index, name in enumerate(SEMANTIC_NAMES)}
+STATIC_SEMANTIC_NAMES = SEMANTIC_NAMES + ("hazard",)
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ RGB = {
     "static_obstacle": (30, 30, 30),
     "ego": (235, 126, 35),
     "goal": (232, 178, 25),
+    "hazard": (240, 168, 125),
 }
 
 
@@ -185,7 +187,7 @@ def region_semantic_counts(semantic, config):
                 row * patch : (row + 1) * patch,
                 column * patch : (column + 1) * patch,
             ]
-            channels.append(crop.reshape(len(SEMANTIC_NAMES), -1).mean(-1))
+            channels.append(crop.reshape(semantic.shape[0], -1).mean(-1))
     return np.asarray(channels, dtype=np.float32)
 
 
@@ -225,6 +227,9 @@ def render_bev(
     goal_xy,
     config=None,
     ego_size=(5.176, 2.297),
+    static_scene=False,
+    hazard_polygons=(),
+    ego_center_xy=(0.0, 0.0),
 ):
     """Render one scene from ego-frame primitives.
 
@@ -233,15 +238,20 @@ def render_bev(
     Agent dictionaries require center, heading, length, width and type.
     History entries are ego-frame xy polylines.  Traffic-line keys are
     red/yellow/green/unknown; unknown is deliberately rendered as lane gray.
+    ``static_scene`` suppresses route/reference/history/traffic layers even if
+    supplied, and adds a hazard channel. ``ego_center_xy`` locates the body;
+    the start coordinate remains the rear-axle origin.
     """
     config = config or BevConfig()
+    names = STATIC_SEMANTIC_NAMES if static_scene else SEMANTIC_NAMES
+    indices = {name: index for index, name in enumerate(names)}
     rgb = Image.new(
         "RGB", (config.image_size, config.image_size), RGB["background"]
     )
     rgb_draw = ImageDraw.Draw(rgb)
     semantic_images = [
         Image.new("L", (config.image_size, config.image_size), 0)
-        for _ in SEMANTIC_NAMES
+        for _ in names
     ]
     semantic_draw = [ImageDraw.Draw(image) for image in semantic_images]
 
@@ -249,32 +259,37 @@ def render_bev(
         for value in values:
             pixel = ego_to_pixel(value, config)
             _draw_polygon(rgb_draw, pixel, RGB[color or name])
-            _draw_polygon(semantic_draw[SEMANTIC_INDEX[name]], pixel, 255)
+            _draw_polygon(semantic_draw[indices[name]], pixel, 255)
 
     def line_layer(name, values, width=2, color=None):
         for value in values:
             pixel = ego_to_pixel(value, config)
             _draw_line(rgb_draw, pixel, RGB[color or name], width)
             _draw_line(
-                semantic_draw[SEMANTIC_INDEX[name]], pixel, 255, width
+                semantic_draw[indices[name]], pixel, 255, width
             )
 
     polygon_layer("drivable", map_polygons.get("drivable", []))
-    polygon_layer("route", map_polygons.get("route", []))
+    if not static_scene:
+        polygon_layer("route", map_polygons.get("route", []))
+    else:
+        polygon_layer("hazard", hazard_polygons)
     polygon_layer("crosswalk", map_polygons.get("crosswalk", []))
     line_layer("lane_center", map_lines.get("lane_center", []), width=1)
-    line_layer("reference", map_lines.get("reference", []), width=3)
-    if reference_path is not None and len(reference_path):
-        line_layer("reference", [np.asarray(reference_path)[:, :2]], width=3)
+    if not static_scene:
+        line_layer("reference", map_lines.get("reference", []), width=3)
+        if reference_path is not None and len(reference_path):
+            line_layer("reference", [np.asarray(reference_path)[:, :2]], width=3)
 
-    for status in ("red", "yellow", "green"):
+    for status in (() if static_scene else ("red", "yellow", "green")):
         line_layer(
             f"traffic_{status}", traffic_lines.get(status, []), width=4
         )
-    for value in traffic_lines.get("unknown", []):
+    for value in ([] if static_scene else traffic_lines.get("unknown", [])):
         _draw_line(rgb_draw, ego_to_pixel(value, config), RGB["lane_center"], 3)
 
-    line_layer("history", histories, width=2)
+    if not static_scene:
+        line_layer("history", histories, width=2)
 
     type_map = {
         "vehicle": "vehicle",
@@ -295,7 +310,7 @@ def render_bev(
         )
         pixel = ego_to_pixel(corners, config)
         _draw_polygon(rgb_draw, pixel, RGB[layer])
-        _draw_polygon(semantic_draw[SEMANTIC_INDEX[layer]], pixel, 255)
+        _draw_polygon(semantic_draw[indices[layer]], pixel, 255)
         if layer in ("vehicle", "bicycle"):
             center = np.asarray(agent["center"], dtype=np.float32)
             front = center + 0.65 * float(agent["length"]) * np.asarray(
@@ -309,7 +324,7 @@ def render_bev(
             )
 
     ego_corners = oriented_box_corners(
-        [0.0, 0.0], 0.0, float(ego_size[0]), float(ego_size[1])
+        ego_center_xy, 0.0, float(ego_size[0]), float(ego_size[1])
     )
     ego_pixel = ego_to_pixel(ego_corners, config)
     _draw_polygon(rgb_draw, ego_pixel, RGB["ego"])
@@ -320,12 +335,21 @@ def render_bev(
         (255, 255, 255),
         2,
     )
+    # A triangular arrow and S identify the start; the rear axle remains (0,0).
+    if static_scene:
+        tip = np.asarray([max(float(ego_size[0]) * 0.7, 2.0), 0.0])
+        arrow = np.asarray([tip, tip + [-1.3, 0.7], tip + [-1.3, -0.7]])
+        _draw_polygon(rgb_draw, ego_to_pixel(arrow, config), (255, 255, 255))
+        start_pixel = ego_to_pixel([[0, 0]], config)[0]
+        rgb_draw.text((float(start_pixel[0] + 8), float(start_pixel[1])), "S", fill=(20, 20, 20))
 
     if goal_xy is not None:
         center = ego_to_pixel([goal_xy], config)[0]
         goal = _star(center)
         _draw_polygon(rgb_draw, goal, RGB["goal"])
         _draw_polygon(semantic_draw[SEMANTIC_INDEX["goal"]], goal, 255)
+        if static_scene:
+            rgb_draw.text((float(center[0] + 7), float(center[1])), "G", fill=(20, 20, 20))
 
     semantic = np.stack(
         [np.asarray(image, dtype=np.uint8) > 0 for image in semantic_images]

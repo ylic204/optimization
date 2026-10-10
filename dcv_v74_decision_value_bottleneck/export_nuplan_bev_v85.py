@@ -1,8 +1,8 @@
 """Export camera-free ego-centric BEV records directly from nuPlan DBs.
 
-Run this script in the pinned nuPlan-devkit environment.  It uses current
-map/tracked-object/traffic-light state plus two seconds of past tracks.  Future
-ego poses are saved only as supervision and are never rendered into the BEV.
+Default: static, route-free multi-task planning snapshots. No actor histories
+or future ego states are requested. Legacy route/GT export is opt-in via
+--planning-mode route_tracking and uses a distinct record contract.
 """
 
 import argparse
@@ -12,7 +12,10 @@ from pathlib import Path
 import numpy as np
 
 from bev_renderer_v85 import BevConfig, render_bev, world_to_ego, wrap_angle
-from raw_record_bev_v85 import save_bev_raw_record
+from raw_record_bev_v85 import save_bev_raw_record, save_static_bev_raw_record
+from static_bev_tasks_v85 import (
+    hazard_polygons, static_evaluation_layers, select_goal, task_variants,
+)
 
 
 DEFAULT_TASK = (
@@ -159,6 +162,23 @@ def _object_token(value):
     )
 
 
+def _agent_primitive(value, ego_pose):
+    center = value.center
+    object_type = getattr(value, "tracked_object_type", None)
+    type_name = getattr(object_type, "fullname", None) or getattr(
+        object_type, "name", "generic_object"
+    )
+    return dict(center=world_to_ego([[center.x, center.y]], ego_pose)[0],
+                heading=float(wrap_angle(center.heading - ego_pose[2])),
+                length=float(value.box.length), width=float(value.box.width),
+                type=str(type_name).lower())
+
+
+def _current_agents(scenario, iteration, ego_pose):
+    return [_agent_primitive(value, ego_pose) for value in _tracked_list(
+        scenario.get_tracked_objects_at_iteration(iteration))]
+
+
 def _agents_and_histories(scenario, iteration, ego_pose, args):
     current_objects = _tracked_list(
         scenario.get_tracked_objects_at_iteration(iteration)
@@ -300,7 +320,7 @@ def _proximal_map_objects(map_api, point, radius, semantic_layer):
     return map_api.get_proximal_map_objects(point, radius, layers)
 
 
-def export_iteration(scenario, iteration, output_root, config, args):
+def _export_route_tracking(scenario, iteration, output_root, config, args):
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
@@ -413,6 +433,93 @@ def export_iteration(scenario, iteration, output_root, config, args):
     return True
 
 
+def _save_preview(rendered, goal, config, output_path):
+    """Preview annotations are outside the model raster; no grid is baked in."""
+    from PIL import Image, ImageDraw
+
+    size, border = config.image_size, 48
+    preview = Image.new("RGB", (size + 2 * border, size + 140), "white")
+    preview.paste(Image.fromarray(rendered["bev_rgb"]), (border, border))
+    draw = ImageDraw.Draw(preview)
+    draw.text((border, 8), "STATIC BEV - up: +x; left: +y (meters)", fill="black")
+    for value in np.linspace(config.x_min, config.x_max, 5):
+        row = (config.x_max - value) / (config.x_max - config.x_min) * (size - 1)
+        draw.text((4, border + int(row) - 5), f"x={value:g}", fill="black")
+    for value in np.linspace(config.y_max, config.y_min, 5):
+        col = (config.y_max - value) / (config.y_max - config.y_min) * (size - 1)
+        draw.text((border + int(col) - 15, border + size + 4), f"{value:g}", fill="black")
+    lines = [f"S=(0,0)  G=({goal[0]:.1f},{goal[1]:.1f}); horizontal ticks: y",
+             "Orange S / gold G; blue road / blue cars",
+             "Brown pedestrians; pink bicycles; black obstacles",
+             "Peach: construction hazard; no route or history"]
+    for i, line in enumerate(lines):
+        draw.text((8, border + size + 24 + i * 13), line, fill="black")
+    preview.save(output_path)
+
+
+def _export_static_multitask(scenario, iteration, output_root, config, args):
+    from nuplan.common.actor_state.state_representation import Point2D
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+
+    ego = scenario.get_ego_state_at_iteration(iteration)
+    ego_pose = np.asarray([ego.rear_axle.x, ego.rear_axle.y, ego.rear_axle.heading])
+    radius = math.hypot(max(abs(config.x_min), abs(config.x_max)),
+                        max(abs(config.y_min), abs(config.y_max))) + 10.
+    proximal = _proximal_map_objects(scenario.map_api, Point2D(*ego_pose[:2]),
+                                     radius, SemanticMapLayer)
+    lanes = proximal.get(SemanticMapLayer.LANE, []) + proximal.get(SemanticMapLayer.LANE_CONNECTOR, [])
+    polygons = dict(drivable=_object_polygons(lanes, ego_pose),
+                    crosswalk=_object_polygons(proximal.get(SemanticMapLayer.CROSSWALK, []), ego_pose))
+    lines = {"lane_center": [world_to_ego(line, ego_pose) for line in
+                            (_baseline(lane) for lane in lanes) if len(line) >= 2]}
+    agents = _current_agents(scenario, iteration, ego_pose)
+    hazards = hazard_polygons(agents, args.hazard_buffer_m)
+    vehicle = scenario.ego_vehicle_parameters
+    # nuPlan positions are rear-axle anchored; draw the body at its actual center.
+    center = getattr(ego, "center", None)
+    ego_center = (world_to_ego([[center.x, center.y]], ego_pose)[0]
+                  if center is not None else np.zeros(2))
+
+    def render(goal):
+        return render_bev(polygons, lines, agents, [], {}, None, goal, config=config,
+                          ego_size=(vehicle.length, vehicle.width), static_scene=True,
+                          hazard_polygons=hazards, ego_center_xy=ego_center)
+
+    rendered = render(None)
+    evaluation = static_evaluation_layers(rendered, config, args.agent_radius_m)
+    scene_id = f"{scenario.log_name}/{scenario.token}/{iteration:04d}"
+    goal = select_goal(evaluation, config, scene_id, args)
+    if goal is None:
+        return False
+    rendered = render(goal)
+    metadata = dict(scene_type=np.str_(scenario.scenario_type),
+                    log_name=np.str_(scenario.log_name), scenario_token=np.str_(scenario.token),
+                    timestamp_us=np.int64(scenario.get_time_point(iteration).time_us),
+                    iteration=np.int64(iteration), goal_seed=np.int64(args.goal_seed),
+                    goal_source=np.str_("explicit_local_goal" if args.goal_xy is not None
+                                        else "current_map_reachable_cells"),
+                    hazard_source=np.str_("construction_object_buffer_not_dataset_risk_gt"),
+                    hazard_buffer_m=np.float32(args.hazard_buffer_m))
+    folder = Path(output_root) / scenario.log_name / scenario.token / f"{iteration:04d}"
+    tasks = task_variants(goal, args, evaluation)
+    if not tasks:
+        raise ValueError("at least one task is required")
+    for task in tasks:
+        save_static_bev_raw_record(folder / f"{task['id']}.npz", rendered, config,
+                                   goal, task, scene_id, metadata, evaluation)
+    if args.save_preview:
+        _save_preview(rendered, goal, config, folder / "bev_preview.png")
+    return True
+
+
+def export_iteration(scenario, iteration, output_root, config, args):
+    if args.planning_mode == "static_multitask":
+        return _export_static_multitask(scenario, iteration, output_root, config, args)
+    if args.planning_mode == "route_tracking":
+        return _export_route_tracking(scenario, iteration, output_root, config, args)
+    raise ValueError(f"unknown planning mode: {args.planning_mode}")
+
+
 def build_scenarios(args):
     from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
         NuPlanScenarioBuilder,
@@ -440,7 +547,7 @@ def build_scenarios(args):
         timestamp_threshold_s=None,
         ego_displacement_minimum_m=None,
         expand_scenarios=False,
-        remove_invalid_goals=True,
+        remove_invalid_goals=args.planning_mode == "route_tracking",
         shuffle=False,
         ego_start_speed_threshold=None,
         ego_stop_speed_threshold=None,
@@ -452,7 +559,7 @@ def build_scenarios(args):
     return builder.get_scenarios(scenario_filter, Sequential())
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--map-root", required=True)
@@ -460,21 +567,60 @@ def parse_args():
     parser.add_argument("--db-files", nargs="+", required=True)
     parser.add_argument("--map-version", default="nuplan-maps-v1.0")
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--planning-mode", choices=("static_multitask", "route_tracking"),
+                        default="static_multitask")
     parser.add_argument("--limit-scenarios", type=int)
     parser.add_argument("--scenario-types", nargs="+")
     parser.add_argument("--frame-stride", type=int, default=10)
     parser.add_argument("--future-horizon", type=float, default=8.0)
     parser.add_argument("--future-samples", type=int, default=16)
-    parser.add_argument("--history-seconds", type=float, default=2.0)
-    parser.add_argument("--history-samples", type=int, default=5)
+    parser.add_argument("--history-seconds", type=float, default=None,
+                        help="route_tracking only; defaults to 2s there")
+    parser.add_argument("--history-samples", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=288)
     parser.add_argument("--region-grid", type=int, default=9)
-    parser.add_argument("--x-min", type=float, default=-16.0)
-    parser.add_argument("--x-max", type=float, default=64.0)
+    parser.add_argument("--x-min", type=float, default=None)
+    parser.add_argument("--x-max", type=float, default=None)
     parser.add_argument("--y-min", type=float, default=-40.0)
     parser.add_argument("--y-max", type=float, default=40.0)
-    parser.add_argument("--task-text", default=DEFAULT_TASK)
-    return parser.parse_args()
+    parser.add_argument("--task-text", default=None, help="route_tracking only")
+    parser.add_argument("--tasks", nargs="+", choices=("shortest", "pedestrian_clearance", "avoid_hazards"),
+                        default=["shortest", "pedestrian_clearance", "avoid_hazards"])
+    parser.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"),
+                        help="optional goal in local meters; invalid/unreachable scenes are skipped")
+    parser.add_argument("--goal-min-distance", type=float, default=18.)
+    parser.add_argument("--goal-max-distance", type=float, default=32.)
+    parser.add_argument("--goal-margin-m", type=float, default=3.)
+    parser.add_argument("--goal-seed", type=int, default=7)
+    parser.add_argument("--agent-radius-m", type=float, default=1.)
+    parser.add_argument("--hazard-buffer-m", type=float, default=3.)
+    parser.add_argument("--pedestrian-weight", type=float, default=4.)
+    parser.add_argument("--pedestrian-scale-m", type=float, default=4.)
+    parser.add_argument("--nominal-speed", type=float, default=1.)
+    parser.add_argument("--no-preview", dest="save_preview", action="store_false", default=True)
+    args = parser.parse_args(argv)
+    static = args.planning_mode == "static_multitask"
+    if static and (args.history_seconds not in (None, 0.) or args.history_samples not in (None, 0)):
+        parser.error("static_multitask has no histories; remove --history-seconds/--history-samples")
+    if static and args.task_text is not None:
+        parser.error("static_multitask uses defined task objectives; select --tasks instead of --task-text")
+    args.history_seconds = 0. if static else (2. if args.history_seconds is None else args.history_seconds)
+    args.history_samples = 0 if static else (5 if args.history_samples is None else args.history_samples)
+    args.x_min = (-40. if static else -16.) if args.x_min is None else args.x_min
+    args.x_max = (40. if static else 64.) if args.x_max is None else args.x_max
+    args.task_text = DEFAULT_TASK if args.task_text is None else args.task_text
+    args.tasks = list(dict.fromkeys(args.tasks))
+    if static:
+        positive = (args.goal_min_distance, args.goal_max_distance, args.goal_margin_m,
+                    args.agent_radius_m, args.pedestrian_scale_m, args.nominal_speed)
+        if not all(np.isfinite(v) and v > 0 for v in positive):
+            parser.error("goal distances, margin, agent radius, scale and speed must be finite and positive")
+        if args.goal_max_distance < args.goal_min_distance:
+            parser.error("goal-max-distance must be >= goal-min-distance")
+        if (not np.isfinite(args.hazard_buffer_m) or args.hazard_buffer_m < 0 or
+                not np.isfinite(args.pedestrian_weight) or args.pedestrian_weight < 0):
+            parser.error("hazard buffer and pedestrian weight must be finite and nonnegative")
+    return args
 
 
 def main():
@@ -493,9 +639,12 @@ def main():
         history_seconds=args.history_seconds,
         history_samples=args.history_samples,
     )
-    if args.future_horizon <= 0.0 or args.future_samples != 16:
+    if args.planning_mode == "static_multitask" and not (
+            config.x_min < 0 < config.x_max and config.y_min < 0 < config.y_max):
+        raise ValueError("static BEV bounds must contain the start S=(0,0)")
+    if args.planning_mode == "route_tracking" and (args.future_horizon <= 0.0 or args.future_samples != 16):
         raise ValueError("V8.5 processing requires a positive horizon and exactly 16 future samples")
-    if args.history_seconds <= 0.0 or args.history_samples < 2:
+    if args.planning_mode == "route_tracking" and (args.history_seconds <= 0.0 or args.history_samples < 2):
         raise ValueError("history rendering requires a positive horizon and >=2 samples")
     scenarios = build_scenarios(args)
     written = 0
@@ -508,7 +657,9 @@ def main():
                 written += 1
             else:
                 skipped += 1
-    print(f"wrote {written} BEV records; skipped {skipped} incomplete records")
+    print(f"{args.planning_mode}: wrote {written} scenes; skipped {skipped} invalid/unreachable scenes")
+    if args.planning_mode == "static_multitask":
+        print(f"{written * len(set(args.tasks))} task records; same RGB/goal across tasks in each scene")
 
 
 if __name__ == "__main__":

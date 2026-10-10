@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from raw_record_bev_v85 import INPUT_MODE
+from raw_record_bev_v85 import INPUT_MODE, STATIC_INPUT_MODE
 from bev_geometry_v85 import RASTER_LAYOUT, SCHEMA_REVISION
 from trajectory_gt_v85 import GT_CONTRACT
 
@@ -44,6 +44,11 @@ class PlanningDatasetBEVV85(Dataset):
             raise ValueError(f"{path} has invalid trajectory GT/timestamps")
 
     def _validate_metadata(self, data, path):
+        if "input_mode" in data and str(data["input_mode"].item()) == STATIC_INPUT_MODE:
+            raise ValueError(
+                f"{path} is a static_multitask record. This legacy dataset/trainer uses "
+                "route candidates and logged trajectory GT; see README_V85_STATIC_BEV.md."
+            )
         revision = int(data["schema_revision"].item()) if "schema_revision" in data else 0
         version = int(data["schema_version"].item()) if "schema_version" in data else 0
         layout = str(data["metric_raster_layout"].item()) if "metric_raster_layout" in data else ""
