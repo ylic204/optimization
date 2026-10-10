@@ -625,7 +625,8 @@ def _export_static_multitask(scenario, iteration, output_root, config, args):
 
 def export_iteration(scenario, iteration, output_root, config, args):
     if args.planning_mode == "static_multitask":
-        return _export_static_multitask(scenario, iteration, output_root, config, args)
+        from resume_bev_export_v85 import export_static_frame
+        return export_static_frame(scenario, iteration, output_root, config, args, _export_static_multitask)
     if args.planning_mode == "route_tracking":
         return _export_route_tracking(scenario, iteration, output_root, config, args)
     raise ValueError(f"unknown planning mode: {args.planning_mode}")
@@ -678,6 +679,7 @@ def parse_args(argv=None):
     parser.add_argument("--db-files", nargs="+", required=True)
     parser.add_argument("--map-version", default="nuplan-maps-v1.0")
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--resume", action="store_true", help="validate and reuse complete static frames; never overwrite")
     parser.add_argument("--planning-mode", choices=("static_multitask", "route_tracking"),
                         default="static_multitask")
     parser.add_argument("--limit-scenarios", type=int)
@@ -728,6 +730,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-preview", dest="save_preview", action="store_false", default=True)
     args = parser.parse_args(argv)
     static = args.planning_mode == "static_multitask"
+    if args.resume and not static:
+        parser.error("--resume currently supports static_multitask only")
     if static and (args.history_seconds not in (None, 0.) or args.history_samples not in (None, 0)):
         parser.error("static_multitask has no histories; remove --history-seconds/--history-samples")
     if static and args.task_text is not None:
@@ -798,21 +802,32 @@ def main():
     scenarios = build_scenarios(args)
     written = 0
     skipped = 0
+    resumed = 0
+    duplicates = 0
+    seen = set()
     for scenario in tqdm(scenarios, desc="nuPlan BEV scenarios"):
         for iteration in range(
             0, scenario.get_number_of_iterations(), args.frame_stride
         ):
-            if export_iteration(scenario, iteration, args.output_root, config, args):
+            key = (scenario.log_name, scenario.token, iteration)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            result = export_iteration(scenario, iteration, args.output_root, config, args)
+            if result is None:
+                resumed += 1
+            elif result:
                 written += 1
             else:
                 skipped += 1
-    print(f"{args.planning_mode}: wrote {written} scenes; skipped {skipped} invalid/unreachable scenes")
+    print(f"{args.planning_mode}: wrote {written}; reused {resumed}; duplicates {duplicates}; skipped invalid {skipped}")
     if args.planning_mode == "static_multitask":
-        print(f"{written * len(set(args.tasks))} task records; same RGB/goal across tasks in each scene")
+        print(f"{(written + resumed) * len(set(args.tasks))} available task records this run; same RGB/goal across tasks in each scene")
         from static_road_planner_v85 import write_json
         root = Path(args.output_root)
         root.mkdir(parents=True, exist_ok=True)
-        write_json(root / "export_summary.json", dict(written_scenes=written, skipped_scenes=skipped,
+        write_json(root / "export_summary.json", dict(written_scenes=written, reused_scenes=resumed, duplicate_frames=duplicates, skipped_scenes=skipped,
                    skip_reasons=getattr(args, "skip_reasons", {}), args=vars(args),
                    note="Logged GT (when available) and static numeric references are distinct; not closed-loop nuPlan evaluation."))
         from bev_scene_audit_v85 import write_dataset_index

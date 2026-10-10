@@ -136,7 +136,20 @@ python export_nuplan_bev_v85.py \
 若只想先检查图片，可加 `--skip-numeric-reference`；此时参考路径、参考通道距离及任务冲突
 均标记为未计算/未知，不能当作无解或无冲突。扩大后的道路图建图和碰撞检查会更耗时。
 
-使用**新的输出目录**；若帧目录已存在，导出器拒绝覆盖，避免混入旧数据或残缺结果。
+首次导出使用**新的输出目录**。再次运行同一参数时加 `--resume`：
+
+- 有 `export_complete.json` 的完整帧：校验参数及所有输出内容，匹配后直接复用，不重新建图。
+- 旧 r7 没有完成标记的帧：重算一次到临时目录，逐文件比较（NPZ 比较数组内容而非 ZIP 时间），
+  完全一致才复用并补标记。旧帧缺文件或不一致时明确报错，原结果不覆盖。
+- 新帧先在临时目录写完，再整体移入最终目录，避免普通异常留下半个结果。
+- 同一轮重复的 `(log, scenario token, iteration)` 自动去重，不重复导出。
+- `export_summary.json` 分别报告新增、复用、重复和无效帧。
+
+更改视野、任务、GT 采样、参考解开关等参数时，应使用新目录，不混入原数据。
+
+本导出器使用 CPU：nuPlan 数据读取、PIL 绘图、Shapely 几何检查和图搜索没有 CUDA 实现，
+无需 `device` 参数。`--skip-numeric-reference` 可跳过建图/参考求解用于快速预览，
+但不能用于要求完整参考成本与任务差异的实验。参考图变粗会改变参考问题，不能当作无影响的加速。
 静态导出不需要 actor 过去 2 秒轨迹或相机文件，不读取 route、交通灯。
 GT 模式只为确定目标和保存对照读取未来 ego trajectory；模型可见目标，不可见中间 GT 路径。
 `--no-preview` 关闭所有 PNG；不改变是否计算数值参考。`--tasks shortest pedestrian_clearance` 可指定任务。
@@ -295,10 +308,10 @@ python bev_scene_audit_v85.py --output-root /data/v85_static_bev/mini_evidence_r
 ## 9. 验证范围
 
 ```bash
-python -m unittest test_v85_scene_audit test_v85_logged_gt test_v85_static_bev test_v85_bev -v
+python -m unittest test_v85_export_resume test_v85_scene_audit test_v85_logged_gt test_v85_static_bev test_v85_bev -v
 ```
 
-30 项测试通过；新增跨边界对象、覆盖诊断、多标签分组、参考距离未知值、
+34 项测试通过，含续跑校验、旧帧兼容、失败写入隔离及重复帧去重；新增跨边界对象、覆盖诊断、多标签分组、参考距离未知值、
 等成本不同路径、稀疏场景完整导出与索引幂等性、模型输入隔离及非法几何拒绝；原有测试覆盖 GT 首次边界交点、侧向出界、朝向跨 ±π、停车和真实时间戳保留、
 短 GT 跳过、精确目标不吸附、超出旧目标范围的完整导出、有/无数值参考与防止 GT 输入泄露；
 亦覆盖旧道路目标模式无 future 调用、无 route/history 调用、无文字渲染、三任务共享输入、前向目标、无效目标不替换、

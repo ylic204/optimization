@@ -1,3 +1,15 @@
+# Revision7 resume fix
+
+34 tests passed across `test_v85_export_resume`, `test_v85_scene_audit`, `test_v85_logged_gt`,
+`test_v85_static_bev` and `test_v85_bev`. New tests verify strict parameter/content checks,
+one-time compatibility validation for pre-marker r7 frames, preservation of incomplete or
+incompatible existing data, atomic publication after successful export and same-run deduplication.
+
+Exporter execution remains CPU-only. These tests do not establish real nuPlan throughput or
+validate the contents of the user's existing server output directory.
+
+---
+
 # V8.5 object/evidence audit and quiet map rendering — revision 7
 
 Branch: `v85-bev-evidence-audit`.
