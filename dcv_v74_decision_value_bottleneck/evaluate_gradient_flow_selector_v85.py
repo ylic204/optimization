@@ -1,4 +1,4 @@
-"""Evaluate a V8.5 checkpoint with full, random, and learned token masks."""
+"""Evaluate a V8.5 BEV checkpoint with full/random/learned token masks."""
 
 import argparse
 import json
@@ -10,8 +10,10 @@ from torch.utils.data import DataLoader
 
 from gradient_flow_selector_v85 import build_v85_model
 from optimization_spec_v83 import OptimizationTask
-from planning_dataset_v84 import PlanningDatasetV84
+from planning_dataset_bev_v85 import PlanningDatasetBEVV85
+from raw_record_bev_v85 import INPUT_MODE
 from train_gradient_flow_selector_v85 import validate
+from checkpoint_contract_v85 import validate_checkpoint_contract
 
 
 def parse_args():
@@ -24,8 +26,10 @@ def parse_args():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--output", default="results/v85_evaluation.json")
+    parser.add_argument("--output", default="results/v85_bev_evaluation.json")
     parser.add_argument("--load-4bit", action="store_true")
+    parser.add_argument("--backend", choices=("llm_solver", "candidate_proxy"), default="llm_solver")
+    parser.add_argument("--outcomes", default="", help="per-scene models, solver status, trajectory and GT JSONL")
     return parser.parse_args()
 
 
@@ -34,6 +38,11 @@ def main():
     checkpoint = torch.load(cli.checkpoint, map_location="cpu")
     if "args" not in checkpoint:
         raise ValueError("checkpoint does not contain its V8.5 architecture args")
+    if checkpoint.get("input_mode") != INPUT_MODE:
+        raise ValueError(
+            f"checkpoint is not tagged with input_mode={INPUT_MODE!r}; "
+            "cross-view evaluation is not valid"
+        )
 
     saved = dict(checkpoint["args"])
     saved.update(
@@ -45,6 +54,8 @@ def main():
             "load_4bit": cli.load_4bit or saved.get("load_4bit", False),
             "nuplan_task": cli.nuplan_task,
             "pointnav_task": cli.pointnav_task,
+            "stage": "rl",
+            "rl_backend": cli.backend,
         }
     )
     saved.setdefault("nuplan_text", "")
@@ -54,23 +65,25 @@ def main():
     device = torch.device(cli.device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    model = build_v85_model(args, device)
-    model.selector.load_state_dict(checkpoint["selector"])
-    model.metric_head.load_state_dict(checkpoint["metric_head"])
-    model.mask_flow.load_state_dict(checkpoint["mask_flow"])
-
     tasks = [
         OptimizationTask.load(cli.nuplan_task),
         OptimizationTask.load(cli.pointnav_task),
     ]
     image_side = args.region_grid * 32
+    dataset = PlanningDatasetBEVV85(cli.data, image_side, require_trajectory_gt=cli.backend == "llm_solver")
+    validate_checkpoint_contract(checkpoint, args, dataset, "evaluate")
+    model = build_v85_model(args, device)
+    model.selector.load_state_dict(checkpoint["selector"])
+    model.metric_head.load_state_dict(checkpoint["metric_head"])
+    model.mask_flow.load_state_dict(checkpoint["mask_flow"])
     loader = DataLoader(
-        PlanningDatasetV84(cli.data, image_side),
+        dataset,
         cli.batch,
         shuffle=False,
         num_workers=cli.workers,
     )
-    metrics = validate(model, loader, args, device, tasks)
+    outcomes = cli.outcomes or str(Path(cli.output).with_suffix(".outcomes.jsonl"))
+    metrics = validate(model, loader, args, device, tasks, outcome_path=outcomes)
     output = Path(cli.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(metrics, indent=2), encoding="utf-8")

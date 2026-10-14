@@ -318,11 +318,14 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         vision_state,
         region_mask=None,
         selected_indices=None,
+        selected_region_gates=None,
     ):
         """Run the post-pruning ViT blocks and merger.
 
         Exactly one of ``region_mask`` (soft differentiable path) and
         ``selected_indices`` (hard compute-saving path) must be supplied.
+        Optional unit-forward ``selected_region_gates`` provide a selected-only
+        surrogate gradient while retaining the physically shortened stream.
         """
         if (region_mask is None) == (selected_indices is None):
             raise ValueError(
@@ -333,6 +336,8 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         batch_size = hidden_groups.shape[0]
 
         raw_gate = None
+        if selected_region_gates is not None and selected_indices is None:
+            raise ValueError("selected_region_gates require selected_indices")
         if selected_indices is not None:
             hidden_groups = self._gather_groups(
                 hidden_groups, selected_indices
@@ -342,6 +347,11 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
                 for item in position_groups
             )
             token_indices = selected_indices
+            if selected_region_gates is not None:
+                if selected_region_gates.shape != selected_indices.shape:
+                    raise ValueError("selected gates must have shape [B,K]")
+                raw_gate = selected_region_gates.to(hidden_groups.dtype)[..., None, None]
+                hidden_groups = hidden_groups * raw_gate
         else:
             raw_gate = region_mask.to(hidden_groups.dtype)[..., None, None]
             hidden_groups = hidden_groups * raw_gate
@@ -403,6 +413,74 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
             "deepstack_tokens": deepstack,
             "region_indices": token_indices,
         }
+
+    def _selected_chat_inputs(self, visual, prompt):
+        """Preserve sparse original grid positions in a real Qwen chat prefix."""
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": prompt},
+        ]}]
+        chat = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        ids = self.processor.tokenizer(chat, add_special_tokens=False, return_tensors="pt")["input_ids"].to(self.device)
+        locations = torch.where(ids[0] == int(self.model.config.image_token_id))[0]
+        if len(locations) != 1 or ids.shape[0] != 1:
+            raise ValueError("modeling requires one image placeholder in a single-sample chat")
+        start = int(locations[0])
+        k = visual["visual_tokens"].shape[1]
+        ids = torch.cat([ids[:, :start], ids[:, start:start + 1].expand(-1, k), ids[:, start + 1:]], -1)
+        embeddings = self.language_model.embed_tokens(ids)
+        embeddings[:, start:start + k] = visual["visual_tokens"].to(embeddings.dtype)
+        mask = torch.zeros_like(ids, dtype=torch.bool)
+        mask[:, start:start + k] = True
+        # Qwen3-VL supports 4 axes: causal text order, temporal, height, width.
+        length = ids.shape[1]
+        pos = torch.arange(length, device=ids.device)[None, None].expand(4, 1, -1).clone()
+        indices = visual["region_indices"][0]
+        pos[1, 0, start:start + k] = start
+        pos[2, 0, start:start + k] = start + indices // self.region_grid
+        pos[3, 0, start:start + k] = start + indices % self.region_grid
+        next_position = start + self.region_grid
+        suffix = torch.arange(length - start - k, device=ids.device) + next_position
+        pos[1:, 0, start + k:] = suffix[None]
+        return embeddings, torch.ones_like(ids), mask, pos
+
+    @torch.no_grad()
+    def generate_selected_json(self, vision_state, indices, prompt, max_new_tokens=1536):
+        """Greedy frozen decoding using K physically gathered visual groups.
+
+        No full-image generation fallback is used. Prefill receives DeepStack
+        only for the retained groups; subsequent steps reuse the text KV cache.
+        """
+        self.model.eval()
+        if indices.shape[0] != 1 or max_new_tokens <= 0:
+            raise ValueError("modeling expects one sample and a positive decode budget")
+        visual = self.continue_vision(vision_state, selected_indices=indices.sort(-1).values)
+        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt)
+        deepstack = [x.reshape(-1, x.shape[-1]).to(embeddings.dtype) for x in visual["deepstack_tokens"]]
+        output = self.language_model(
+            inputs_embeds=embeddings, attention_mask=attention, position_ids=positions,
+            visual_pos_masks=mask, deepstack_visual_embeds=deepstack or None,
+            use_cache=True, return_dict=True,
+        )
+        eos = self.model.generation_config.eos_token_id
+        eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
+        generated = []
+        next_spatial = int(positions[1:, 0, -1].max()) + 1
+        for step in range(max_new_tokens):
+            token = self.model.lm_head(output.last_hidden_state[:, -1:]).argmax(-1)
+            value = int(token[0, 0])
+            if value in eos:
+                break
+            generated.append(value)
+            if step == max_new_tokens - 1:
+                break
+            attention = torch.cat([attention, torch.ones_like(token)], -1)
+            next_positions = torch.full((4, 1, 1), next_spatial + step, dtype=torch.long, device=token.device)
+            next_positions[0] = embeddings.shape[1] + step
+            output = self.language_model(
+                input_ids=token, attention_mask=attention, position_ids=next_positions,
+                past_key_values=output.past_key_values, use_cache=True, return_dict=True,
+            )
+        return self.processor.tokenizer.decode(generated, skip_special_tokens=True)
 
     def fuse(self, input_ids, attention_mask, visual_output):
         """Fuse selected visual tokens and task text with Qwen3-VL's LLM."""

@@ -15,7 +15,6 @@ from mapped_vlm_optimizer_v83 import CandidateMetricHead
 from qwen3vl_selector_v79 import (
     DecisionRelatedQwenSelector,
     FrozenQwen3VLPrunableBackbone,
-    normalized_region_positions,
     topk_region_indices,
 )
 
@@ -30,9 +29,9 @@ def _batch_mass(mass, reference):
 def project_capped_simplex(values, valid, mass, iterations=40):
     """Project each row onto {0<=w<=1, sum(w)=mass} over valid entries.
 
-    The bisection threshold is treated as a piecewise-constant projection
-    parameter.  Gradients still pass through the active coordinates of
-    ``values``, matching the straight-through constrained dynamics used here.
+    Away from active-set boundaries, backward uses the true projection
+    Jacobian: center gradients on free coordinates, zero saturated entries.
+    ``mass`` is a fixed budget, not a learnable parameter.
     """
     valid_f = valid.to(values.dtype)
     mass = _batch_mass(mass, values)
@@ -55,7 +54,13 @@ def project_capped_simplex(values, valid, mass, iterations=40):
             lower = torch.where(current_mass > mass, threshold, lower)
             upper = torch.where(current_mass > mass, upper, threshold)
         threshold = 0.5 * (lower + upper)
-    return (values - threshold[:, None]).clamp(0.0, 1.0) * valid_f
+        projected = (detached - threshold[:, None]).clamp(0.0, 1.0) * valid_f
+        active = ((projected > 0.0) & (projected < 1.0) & valid).to(values.dtype)
+    delta = values - values.detach()
+    mean_delta = (delta * active).sum(-1, keepdim=True) / active.sum(
+        -1, keepdim=True
+    ).clamp_min(1.0)
+    return projected + active * (delta - mean_delta)
 
 
 def fixed_mass_mask(logits, valid, mass, temperature=0.35):
@@ -70,11 +75,36 @@ def hard_topk_mask(scores, valid, k):
     return torch.zeros_like(scores).scatter(1, indices, 1.0)
 
 
+def normalized_bev_region_positions(region_world_bounds, reference):
+    """Return region centers as normalized x-forward/y-left coordinates."""
+    bounds = torch.as_tensor(
+        region_world_bounds,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    if bounds.ndim != 3 or bounds.shape[-1] != 4:
+        raise ValueError("region_world_bounds must have shape [B,R,4]")
+    if bounds.shape[:2] != reference.shape[:2]:
+        raise ValueError("BEV bounds and visual-region sequence do not align")
+    centers = torch.stack(
+        [
+            0.5 * (bounds[..., 0] + bounds[..., 1]),
+            0.5 * (bounds[..., 2] + bounds[..., 3]),
+        ],
+        dim=-1,
+    )
+    minimum = bounds[..., [0, 2]].amin(dim=1)
+    maximum = bounds[..., [1, 3]].amax(dim=1)
+    scale = (maximum - minimum).clamp_min(1e-6)
+    return 2.0 * (centers - minimum[:, None]) / scale[:, None] - 1.0
+
+
 def endpoint_improvement_loss(initial_values, final_values, margin=0.0):
     """Penalize a final task value that fails to improve on its initial value.
 
-    The initial value is detached so optimization cannot satisfy the hinge by
-    deliberately making the baseline worse.
+    Detaching removes the direct gradient incentive to worsen the baseline;
+    shared-parameter updates can still change it on subsequent iterations.
+    This is an endpoint penalty, not a per-step convergence guarantee.
     """
     if float(margin) < 0.0:
         raise ValueError("improvement margin must be non-negative")
@@ -177,6 +207,17 @@ class MaskGradientFlowND(nn.Module):
             states.append(state)
         return state, states, velocities
 
+    def decision_scores(self, states, velocities, initial_logits=None):
+        """Rank/sample the last pre-projection proposal, not clipped plateaus.
+
+        Projection preserves ordering except at saturated ties. Using the raw
+        proposal consistently at train/eval keeps a policy-gradient path even
+        if the projected final mask is entirely binary. ND states remain feasible.
+        """
+        if velocities:
+            return states[-2] + self.step_size(len(velocities) - 1) * velocities[-1]
+        return states[0] if initial_logits is None else initial_logits
+
 
 class GradientFlowSelectorV85(nn.Module):
     def __init__(self, backbone, selector, metric_head, mask_flow):
@@ -186,13 +227,19 @@ class GradientFlowSelectorV85(nn.Module):
         self.metric_head = metric_head
         self.mask_flow = mask_flow
 
-    def encode_and_select(self, images, texts, budget):
+    def encode_and_select(self, images, texts, budget, region_world_bounds):
         encoded = self.backbone.encode_inputs(images, texts)
+        selection, positions, valid = self.select_encoded(
+            encoded, budget, region_world_bounds
+        )
+        return encoded, selection, positions, valid
+
+    def select_encoded(self, encoded, budget, region_world_bounds):
         visual = encoded["region_visual_tokens"]
         batch, regions, _ = visual.shape
         valid = torch.ones(batch, regions, dtype=torch.bool, device=visual.device)
-        positions = normalized_region_positions(
-            batch, regions, visual.device, visual.dtype
+        positions = normalized_bev_region_positions(
+            region_world_bounds, visual
         )
         selection = self.selector(
             visual_tokens=visual,
@@ -202,7 +249,7 @@ class GradientFlowSelectorV85(nn.Module):
             visual_valid=valid,
             budget=budget,
         )
-        return encoded, selection, positions, valid
+        return selection, positions, valid
 
     def fuse_mask(self, encoded, mask):
         visual = self.backbone.continue_vision(
@@ -212,14 +259,26 @@ class GradientFlowSelectorV85(nn.Module):
             encoded["input_ids"], encoded["attention_mask"], visual
         )
 
-    def fuse_topk(self, encoded, scores, valid, k):
-        indices = topk_region_indices(scores, valid, int(k))
-        visual = self.backbone.continue_vision(
-            encoded["vision_state"], selected_indices=indices
-        )
-        fused = self.backbone.fuse(
+    def fuse_indices(self, encoded, indices, selected_region_gates=None):
+        # Drawing order is part of the RL action, never Qwen's spatial order.
+        indices, ordering = indices.sort(dim=-1)
+        if selected_region_gates is not None:
+            selected_region_gates = selected_region_gates.gather(1, ordering)
+        kwargs = {"selected_indices": indices}
+        if selected_region_gates is not None:
+            kwargs["selected_region_gates"] = selected_region_gates
+        visual = self.backbone.continue_vision(encoded["vision_state"], **kwargs)
+        return self.backbone.fuse(
             encoded["input_ids"], encoded["attention_mask"], visual
         )
+
+    def fuse_topk(self, encoded, scores, valid, k, straight_through=False):
+        indices = topk_region_indices(scores, valid, int(k))
+        gates = None
+        if straight_through:
+            selected = torch.gather(scores, 1, indices)
+            gates = 1.0 + (selected - selected.detach())
+        fused = self.fuse_indices(encoded, indices, gates)
         return fused, indices
 
     def predict_metrics(self, fused, batch):

@@ -11,8 +11,12 @@ fi
 if [[ -n "${RESUME:-}" ]]; then
   EXTRA_ARGS+=(--resume "$RESUME")
 fi
+if [[ "${ALLOW_CROSS_VIEW_RESUME:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--allow-cross-view-resume)
+fi
 
 python "$ROOT/train_gradient_flow_selector_v85.py" \
+  --stage "${STAGE:-metric}" \
   --data "${TRAIN_DATA:?set TRAIN_DATA}" \
   --val "${VAL_DATA:?set VAL_DATA}" \
   --nuplan-task "${NUPLAN_TASK:-$ROOT/tasks/nuplan_safe_progress.json}" \
@@ -33,5 +37,17 @@ python "$ROOT/train_gradient_flow_selector_v85.py" \
   --lambda-value "${LAMBDA_VALUE:-0.25}" \
   --lambda-improve "${LAMBDA_IMPROVE:-0.10}" \
   --improve-margin "${IMPROVE_MARGIN:-0.0}" \
+  --rl-group-size "${RL_GROUP_SIZE:-4}" \
+  --rl-temperature "${RL_TEMPERATURE:-0.15}" \
+  --rl-kl-weight "${RL_KL_WEIGHT:-0.02}" \
+  --rl-entropy-weight "${RL_ENTROPY_WEIGHT:-0.001}" \
+  --rl-violation-weight "${RL_VIOLATION_WEIGHT:-1.0}" \
+  --rl-backend "${RL_BACKEND:-llm_solver}" \
+  --modeling-max-new-tokens "${MODELING_MAX_NEW_TOKENS:-2048}" \
+  --solver-max-speed "${SOLVER_MAX_SPEED:-15.0}" \
+  --solver-max-acceleration "${SOLVER_MAX_ACCELERATION:-4.0}" \
+  --rl-ade-weight "${RL_ADE_WEIGHT:-1.0}" \
+  --rl-fde-weight "${RL_FDE_WEIGHT:-0.25}" \
+  --rl-failure-cost "${RL_FAILURE_COST:-100.0}" \
   "${EXTRA_ARGS[@]}" \
   "$@"
