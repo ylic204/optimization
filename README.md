@@ -1,5 +1,23 @@
 # V8.5 — BEV Selector with Frozen LLM Modeling and Solver Feedback
 
+## Tilebased 最小地形成本路径适配
+
+新增分支 `v85-tilebased-llm-solver`，基于 `v85-bev-selector-llm-solver`。
+接入原始 Pokémon/Warcraft tile-map 数据协议；推荐先用 Pokémon 的现成
+**地图＋起点＋终点＋最小成本路径 GT**，不添加步数约束或探索/记忆任务。
+
+- `download_tilebased_v85.py`：固定版本下载、SHA256 校验及离线复用。
+- `preprocess_tilebased_v85.py`：保留官方地图划分，恢复并校验全部原始 GT，自动生成任务文本。
+- `planning_dataset_tilebased_v85.py`：将模型公开输入与真实成本/GT 分开读取。
+- `tilebased_solver_environment_v85.py`：冻结 Qwen 生成节点成本实例，Dijkstra 求解，真实成本反馈。
+- `run_tilebased_v85.py`：复用 V8.5 selector/固定步 FM-ND/RL，提供 metric、distill、rl、evaluate 四个入口。
+
+**完整下载、预处理、模型调用和训练命令：
+[README_V85_TILEBASED.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED.md)。**
+新任务不用车辆 QP、ADE/FDE 或旧 BEV checkpoint。
+下面保留原 BEV 实验说明，供旧版本复现。
+
+
 本分支 `v85-bev-selector-llm-solver` 在 `v85-bev-rl-posttraining` 基础上补齐主链路：
 **选择 BEV 区域 → 冻结 LLM 生成优化实例 → 连续轨迹求解器 → 与时间对齐 GT 比较 → 更新区域选择策略**。
 GitHub `main` 仍是旧第一视角版本，请切换到本分支运行。

@@ -7,7 +7,7 @@ perception or ND updates. This is an offline contextual-bandit policy.
 """
 
 import torch
-from torch.distributions import Categorical, kl_divergence
+from torch.distributions import Categorical
 
 
 def _validate_policy(scores, valid, k, temperature):
@@ -41,12 +41,17 @@ def ordered_action_statistics(scores, valid, actions, temperature=0.15, referenc
             raise ValueError("actions must be valid and sampled without replacement")
         distribution = Categorical(logits=(scores / temperature).masked_fill(~remaining, -torch.inf))
         logp = logp + distribution.log_prob(action)
-        entropy = entropy + distribution.entropy()
+        # Mask normalized log-probabilities BEFORE subtraction/products.
+        # Generic categorical KL may form (-inf)-(-inf) at removed actions;
+        # its forward can be finite while backward propagates NaNs.
+        safe_logp = distribution.logits.masked_fill(~remaining, 0.0)
+        entropy = entropy - (distribution.probs * safe_logp).sum(-1)
         if reference_scores is not None:
             reference = Categorical(
                 logits=(reference_scores.detach() / temperature).masked_fill(~remaining, -torch.inf)
             )
-            kl = kl + kl_divergence(distribution, reference)
+            safe_reference_logp = reference.logits.masked_fill(~remaining, 0.0)
+            kl = kl + (distribution.probs * (safe_logp - safe_reference_logp)).sum(-1)
         remaining = remaining.scatter(1, action[:, None], False)
     return logp, entropy, kl
 
