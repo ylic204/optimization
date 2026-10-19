@@ -5,6 +5,36 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
+## 先检查整图 VQA：定义环境，再询问可见内容
+
+`vqa_tilebased_v85.py` 使用独立的 **system message** 定义俯视二维像素地图环境，
+说明水域、浅色道路/沙滩、低矮植被、树木、建筑的可能外观，并要求结合形状、纹理和上下文判断。
+这些是各地图共用的环境先验，不包含某张图的答案、GT 或成本映射。
+完整提示词在 `prompts/tilebased_vqa_system_v85.txt`，可以直接修改或用 `--system-prompt-file` 指定替代文件。
+
+用户消息包含原始 RGB 和六个自然语言问题：总体布局、水域、浅色区域、绿色纹理差异、建筑、模糊区域。
+模型用中文回答；不要求逐格定位、成本矩阵或 JSON。本脚本通过官方 processor 和 `model.generate` 调用冻结 Qwen，
+不经过选择器或求解器。模型调用参考 [Qwen3-VL 官方 Transformers 文档](https://huggingface.co/docs/transformers/model_doc/qwen3_vl)。
+保留 processor 返回的 `mm_token_type_ids`；检查处理后的图像仍为原始 320×320 对应的网格。
+
+```bash
+python vqa_tilebased_v85.py \
+  --data /data/v85_tilebased/pkmn \
+  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
+  --device cuda:0 --load-4bit \
+  --split val --map-indices 0 3 6 9 \
+  --output results/tilebased_vqa_r1
+```
+
+与之前实验保持相同精度；原来不用量化时去掉 `--load-4bit`。
+只准备图像和提示词、不加载模型时，使用 `--prepare-only`，并可省略 `--vlm-model`。
+输出目录必须不存在或为空。输入图像只从预处理 NPZ 的 `image` 字段读取；不读取 GT 成本或路径。
+
+输出包含 `system_prompt.txt`、`questions.txt`、四张 `map_*_input.png`、逐图 `map_*_answer.txt`、
+`answers.jsonl` 和配置。JSONL 保存实际 chat 文本、图片网格、视觉 token 数及停止原因。
+先对照保存的图像人工核查回答是否正确描述水域、道路、树木和建筑；**不把生成结束当成 VQA 回答正确**。
+VQA 成功只说明粗粒度场景理解可用，不能代替后续格子定位与成本建模评价。
+
 ## 当前 Full 基线较弱时，先运行接口与识别诊断
 
 新增 `diagnose_tilebased_v85.py`，直接复用已经预处理的数据，无需重下载、重做 GT 或先训练。

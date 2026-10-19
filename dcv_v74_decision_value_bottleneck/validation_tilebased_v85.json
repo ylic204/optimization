@@ -63,5 +63,16 @@
       "Offline CLI loads no VLM, preserves original answers and matrix results",
       "Uploaded diagnostic answers rescored against the original preprocessed split without regeneration"
     ]
+  },
+  "whole_image_vqa_validation": {
+    "date": "2026-10-19",
+    "tests_passed": 2,
+    "test_file": "test_v85_tilebased_vqa.py",
+    "checks": [
+      "Prepare-only exports original RGB and system/questions without GT or a model",
+      "Generation plumbing test verifies system role, original image, modality IDs and EOS accounting",
+      "Prepare-only successfully read real val maps 0, 3, 6, 9"
+    ],
+    "limitation": "No actual Qwen weights or GPU generation available here; no VQA accuracy claim."
   }
 }
