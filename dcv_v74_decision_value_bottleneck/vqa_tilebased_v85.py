@@ -7,18 +7,49 @@ import time
 
 import numpy as np
 from PIL import Image
-from tilebased_core_v85 import CONTRACT, DATASETS
+from tilebased_core_v85 import CONTRACT, DATASETS, PKMN_LEGEND, coordinate, task_text
 
 SYSTEM_FILE = Path(__file__).resolve().parent / 'prompts/tilebased_vqa_system_v85.txt'
-QUESTIONS = '''Use the top-down pixel-map environment defined in the system message. For this turn, perform visual question answering only. Answer questions 1-6 briefly in English and give visible evidence for each answer. State when a feature is absent or uncertain.
-1. What major surface types and objects are visible, and where are they located?
-2. Is there water? If so, describe its location, shape, texture, and boundaries.
-3. Are there pale-yellow or tan regions? Do they look like connected paths, sand, shores, or something else? Explain using shape and surrounding features.
-4. Do the green regions differ in texture or shape? Distinguish flat ground vegetation, trees, and other vegetation where possible.
-5. Are there buildings or other artificial structures? Describe their approximate locations and visible features; exact counting is not required.
-6. Which regions or categories are ambiguous, and what cannot be determined confidently from the image?
-Describe the current image only. Do not produce a route, grid coordinates, terrain costs, an optimization model, or JSON in this VQA response.'''
+QUESTIONS = '''Perform navigation-focused VQA only. Answer the following questions briefly in English using visible evidence and the public task rules.
+1. Locate S and G approximately within the image using their supplied coordinates. Describe the nearby visible regions; do not assume endpoint markers are drawn.
+2. What connected regions could support a relatively low-cost route between them? Describe their layout and connections, including diagonal connections where relevant. Do not claim an exact optimal route.
+3. Which visible boundaries or higher-cost regions could make a direct route costly or favor a detour? Discuss alternatives only when supported by the image.
+4. Which few image regions would be most useful to inspect more closely before building the cost model for this S/G query, and why could they change the route decision?
+5. What remaining uncertainty could change the route cost or choice? Ignore naming ambiguities that have no navigation consequence. If a category distinction changes the supplied cost, explain the consequence without guessing the category.
+All cells in this benchmark are traversable: distinguish a costly crossing from an impossible crossing. Reachability follows from the supplied graph rules and is not evidence of visual understanding. Do not invent obstacles or claim that a route was solver-verified. Do not output a full path, a cost matrix, an optimization model, or JSON.'''
 
+
+def load_public_tasks(root, split, indices, task_index):
+    """Select a query per map in manifest order; retain only public task fields."""
+    if task_index < 0:
+        raise ValueError('task index must be nonnegative')
+    selected = {f'{index:06d}.npz': [] for index in dict.fromkeys(indices)}
+    with (Path(root)/split/'tasks.jsonl').open(encoding='utf-8') as stream:
+        for line in stream:
+            record = json.loads(line)
+            if record.get('map_file') in selected:
+                selected[record['map_file']].append(record)
+    tasks = {}
+    grid = DATASETS['pkmn']['grid']
+    for index in dict.fromkeys(indices):
+        rows = selected[f'{index:06d}.npz']
+        if task_index >= len(rows):
+            raise ValueError(f'map {index}: task index {task_index} unavailable ({len(rows)} public queries)')
+        record = rows[task_index]
+        tasks[index] = dict(sample_id=record['sample_id'], task_index=task_index,
+            source_rc=list(coordinate(record['source_rc'], (grid,grid))),
+            target_rc=list(coordinate(record['target_rc'], (grid,grid))))
+    return tasks
+
+
+def navigation_question(task):
+    grid = DATASETS['pkmn']['grid']
+    return (f"PUBLIC NAVIGATION TASK\n{task_text('pkmn',task['source_rc'],task['target_rc'])}\n"
+            f"The image covers the full {grid}x{grid} grid; each cell is 16x16 pixels. "
+            "S/G are specified by coordinates, not added visual markers.\n"
+            f"Public terrain-cost legend: {PKMN_LEGEND}\n"
+            "The legend defines rules, not the actual category or cost of any image cell.\n\n"
+            + QUESTIONS)
 
 
 def load_maps(root, split, indices):
@@ -75,9 +106,9 @@ def load_qwen(model_path, device, load_4bit):
     return model, processor
 
 
-def answer_image(model, processor, image, system_prompt, max_new_tokens):
+def answer_image(model, processor, image, system_prompt, max_new_tokens, user_prompt=QUESTIONS):
     import torch
-    messages = build_messages(system_prompt,image)
+    messages = build_messages(system_prompt,image,user_prompt)
     chat = processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
     side = image.width
     # PIL input is uint8 RGB. Let the official processor normalize and construct
@@ -113,6 +144,7 @@ def main():
     p.add_argument('--data',required=True)
     p.add_argument('--split',choices=['train','val','test'],default='val')
     p.add_argument('--map-indices',type=int,nargs='+',default=[0,3,6,9])
+    p.add_argument('--task-index',type=int,default=0,help='zero-based query per map in tasks.jsonl order')
     p.add_argument('--vlm-model')
     p.add_argument('--device',default='cuda:0')
     p.add_argument('--load-4bit',action='store_true')
@@ -129,16 +161,20 @@ def main():
     system_prompt = Path(a.system_prompt_file).read_text(encoding='utf-8').strip()
     if not system_prompt:raise ValueError('system prompt must not be empty')
     config, maps = load_maps(a.data,a.split,a.map_indices)
+    tasks = load_public_tasks(a.data,a.split,a.map_indices,a.task_index)
+    prompts = {index:navigation_question(tasks[index]) for index,_ in maps}
     out.mkdir(parents=True,exist_ok=True)
     (out/'system_prompt.txt').write_text(system_prompt+'\n',encoding='utf-8')
     (out/'questions.txt').write_text(QUESTIONS+'\n',encoding='utf-8')
-    settings = dict(vars(a),vqa_contract='tilebased_whole_image_vqa_v1',
+    settings = dict(vars(a),vqa_contract='tilebased_navigation_vqa_v2',public_tasks=tasks,
                     dataset=config['dataset'],upstream_revision=config.get('upstream_revision'),
                     system_sha256=hashlib.sha256(system_prompt.encode()).hexdigest())
-    for index,image in maps:image.save(out/f'map_{index:06d}_input.png')
+    for index,image in maps:
+        image.save(out/f'map_{index:06d}_input.png')
+        (out/f'map_{index:06d}_question.txt').write_text(prompts[index]+'\n',encoding='utf-8')
     if a.prepare_only:
         (out/'config.json').write_text(json.dumps(settings,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
-        print(f'Prepared {len(maps)} original RGB images and both prompts in {out}. No VLM was run.')
+        print(f'Prepared {len(maps)} original RGB images and navigation prompts in {out}. No VLM was run.')
         return
     import torch
     import transformers
@@ -148,9 +184,9 @@ def main():
     with (out/'answers.jsonl').open('w',encoding='utf-8') as stream:
         for index,image in maps:
             started = time.perf_counter()
-            result = answer_image(model,processor,image,system_prompt,a.max_new_tokens)
+            result = answer_image(model,processor,image,system_prompt,a.max_new_tokens,prompts[index])
             result.update(map_index=index,split=a.split,input_image=f'map_{index:06d}_input.png',
-                          system_prompt=system_prompt,user_prompt=QUESTIONS,
+                          system_prompt=system_prompt,user_prompt=prompts[index],public_task=tasks[index],
                           seconds=time.perf_counter()-started)
             stream.write(json.dumps(result,ensure_ascii=False)+'\n');stream.flush()
             (out/f'map_{index:06d}_answer.txt').write_text(result['answer']+'\n',encoding='utf-8')

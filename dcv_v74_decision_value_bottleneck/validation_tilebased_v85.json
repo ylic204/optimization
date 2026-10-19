@@ -74,5 +74,17 @@
       "Prepare-only successfully read real val maps 0, 3, 6, 9"
     ],
     "limitation": "No actual Qwen weights or GPU generation available here; no VQA accuracy claim."
+  },
+  "navigation_vqa_validation": {
+    "date": "2026-10-19",
+    "tests_passed": 3,
+    "test_file": "test_v85_tilebased_vqa.py",
+    "checks": [
+      "Prepare-only uses original RGB and public S/G without GT arrays or model loading",
+      "Query selection rejects missing queries and invalid endpoints; excludes privileged fields",
+      "Native generation plumbing passes the task-specific prompt and preserves modality IDs",
+      "Real val maps 0, 3, 6, 9 prepared successfully with public query 0"
+    ],
+    "limitation": "No Qwen3-VL-8B inference or VQA accuracy evaluation performed; formal modeling prompt unchanged."
   }
 }

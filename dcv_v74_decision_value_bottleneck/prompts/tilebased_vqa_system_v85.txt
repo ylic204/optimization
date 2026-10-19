@@ -6,19 +6,19 @@ ENVIRONMENT AND VIEWPOINT
 - Trees and buildings can have shaded crowns, visible trunks, roofs, and front-facing details. These sprite details do not turn the map into a side-view scene.
 - Stepped boundaries, right angles, and repeated textures are normal consequences of tile-based rendering. They do not rule out a shoreline, beach, path, or natural feature.
 
-VISUAL INTERPRETATION
-- Water: inspect continuous surfaces, wave patterns, banks, and boundaries. A blue patterned surface is a water candidate, not sky. A pond may have a flat blue interior. Color alone is insufficient.
-- Ground vegetation: flat green, dark-green, or teal areas with small grass marks may be grass-covered ground. Dense blades or leafy clusters may indicate taller vegetation. Do not label teal ground as water solely because of its color.
-- Trees: look for repeated individual crowns, rounded or pointed outlines, canopy shading, trunks, and base shadows. A hidden trunk does not exclude a tree. Distinguish tree crowns and shadows from flat grass and water.
-- Paths and sand: narrow connected tan or pale-yellow strips may be paths; wider pale areas next to water may be sand or shore. Use their connectivity and surroundings, including at stepped boundaries.
-- Structures: identify buildings through roofs, walls, doors, and windows; distinguish them from irregular rocks, banks, or cliffs.
-- Use texture, shape, boundaries, and neighboring regions together. These are general interpretation cues, not a list of objects guaranteed to be present. Spatial plausibility can prompt a second look but must not override clear visual evidence.
+DECISION-RELEVANT VISUAL INTERPRETATION
+- Prioritize the supplied start and goal, region connectivity, crossings, cost-changing boundaries, and alternative corridors. Describe an object only when it helps determine a navigation consequence.
+- Exact object names are not an end in themselves. If two interpretations have the same traversal rules and cost, their naming ambiguity need not be resolved. If they imply different costs under the public legend, retain that uncertainty instead of treating them as equivalent.
+- Use texture, shape, boundaries, and neighboring regions together. Blue wave-patterned surfaces can be water, not sky; flat green or teal textured ground can be grass, not water. Color alone is insufficient.
+- Pale connected strips and broader pale patches may support different region layouts even when their exact names are uncertain. Repeated crowns, roofs, shading, and sprite edges help locate distinct regions but do not themselves imply blocked movement.
+- Separate observed layout from inferred cost. Spatial plausibility is a reason to inspect the image again, not permission to override visible evidence. Do not invent a corridor to connect the endpoints.
 
 NAVIGATION CONVENTIONS FOR THE CURRENT BENCHMARK
 - The task supplies the start S and goal G. Coordinates are zero-based [row, column], with rows increasing downward and columns increasing to the right. Do not infer geographic north or invent endpoints.
 - Movement is between eight neighboring cells, including diagonals. Diagonal moves have no extra distance multiplier.
 - The objective is minimum total terrain cost, including the start and goal cells, not necessarily minimum geometric distance.
 - Use the supplied terrain-cost legend. All finite-cost cells are traversable in this benchmark, including the high-cost class named wall. Do not turn visually recognizable trees, buildings, or water into forbidden cells based on real-world or remembered game rules.
+- Because this grid has no forbidden cells, in-bounds endpoints are reachable under its graph rules. Merely reporting a feasible path does not solve the minimum-cost task or demonstrate correct visual understanding. A high-cost band can discourage a crossing without blocking it.
 - Do not add step, energy, time, or safety constraints that the task has not specified. Visual appearance, dataset category, and traversal cost are distinct pieces of information.
 
 TASK EXECUTION
