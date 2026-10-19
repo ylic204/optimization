@@ -415,11 +415,13 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
             "region_indices": token_indices,
         }
 
-    def _image_chat_ids(self, prompt, image_tokens):
+    def _image_chat_ids(self, prompt, image_tokens, system_prompt=None):
         """One common chat prefix for native and custom full-image generation."""
         messages = [{"role": "user", "content": [
             {"type": "image"}, {"type": "text", "text": prompt},
         ]}]
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
         chat = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         ids = self.processor.tokenizer(chat, add_special_tokens=False, return_tensors="pt")["input_ids"].to(self.device)
         locations = torch.where(ids[0] == int(self.model.config.image_token_id))[0]
@@ -430,10 +432,10 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         ids = torch.cat([ids[:, :start], ids[:, start:start + 1].expand(-1, k), ids[:, start + 1:]], -1)
         return ids, start
 
-    def _selected_chat_inputs(self, visual, prompt):
+    def _selected_chat_inputs(self, visual, prompt, system_prompt=None):
         """Preserve sparse original grid positions in a real Qwen chat prefix."""
         k = visual["visual_tokens"].shape[1]
-        ids, start = self._image_chat_ids(prompt, k)
+        ids, start = self._image_chat_ids(prompt, k, system_prompt)
         embeddings = self.language_model.embed_tokens(ids)
         embeddings[:, start:start + k] = visual["visual_tokens"].to(embeddings.dtype)
         mask = torch.zeros_like(ids, dtype=torch.bool)
@@ -451,11 +453,11 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         return embeddings, torch.ones_like(ids), mask, pos
 
     @torch.no_grad()
-    def generate_selected_json(self, vision_state, indices, prompt, max_new_tokens=1536):
-        return self.generate_selected_report(vision_state, indices, prompt, max_new_tokens)["text"]
+    def generate_selected_json(self, vision_state, indices, prompt, max_new_tokens=1536, system_prompt=None):
+        return self.generate_selected_report(vision_state, indices, prompt, max_new_tokens, system_prompt)["text"]
 
     @torch.no_grad()
-    def generate_selected_report(self, vision_state, indices, prompt, max_new_tokens=1536):
+    def generate_selected_report(self, vision_state, indices, prompt, max_new_tokens=1536, system_prompt=None):
         """Greedy frozen decoding using K physically gathered visual groups.
 
         No full-image generation fallback is used. Prefill receives DeepStack
@@ -465,7 +467,7 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         if indices.shape[0] != 1 or max_new_tokens <= 0:
             raise ValueError("modeling expects one sample and a positive decode budget")
         visual = self.continue_vision(vision_state, selected_indices=indices.sort(-1).values)
-        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt)
+        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt, system_prompt)
         deepstack = [x.reshape(-1, x.shape[-1]).to(embeddings.dtype) for x in visual["deepstack_tokens"]]
         output = self.language_model(
             inputs_embeds=embeddings, attention_mask=attention, position_ids=positions,
@@ -495,14 +497,16 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
             )
         return {"text": self.processor.tokenizer.decode(generated, skip_special_tokens=True),
                 "generated_tokens": len(generated), "finish_reason": finish_reason,
-                "max_new_tokens": int(max_new_tokens), "backend": "custom"}
+                "max_new_tokens": int(max_new_tokens), "backend": "custom",
+                "input_tokens": int(embeddings.shape[1]), "visual_tokens": int(indices.shape[1]),
+                "nonvisual_input_tokens": int(embeddings.shape[1]-indices.shape[1])}
 
-    def _native_image_inputs(self, images, prompt):
+    def _native_image_inputs(self, images, prompt, system_prompt=None):
         if len(images) != 1:
             raise ValueError("native diagnostics expects one image")
         pixels, grid = self._process_images(images)
         self._validate_grid(grid, 1)
-        ids, _ = self._image_chat_ids(prompt, self.region_grid**2)
+        ids, _ = self._image_chat_ids(prompt, self.region_grid**2, system_prompt)
         inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
                   "pixel_values": pixels, "image_grid_thw": grid}
         # Newer Transformers requires explicit modality IDs for native MRoPE.
@@ -511,7 +515,7 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         return inputs
 
     @torch.no_grad()
-    def generate_native_report(self, images, prompt, max_new_tokens=1536):
+    def generate_native_report(self, images, prompt, max_new_tokens=1536, system_prompt=None):
         """Official model.generate with identical pixels and full chat token IDs.
 
         Qwen constructs its own vision features, DeepStack and MRoPE positions.
@@ -520,7 +524,7 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         if max_new_tokens <= 0:
             raise ValueError("positive decode budget required")
         self.model.eval()
-        inputs = self._native_image_inputs(images, prompt)
+        inputs = self._native_image_inputs(images, prompt, system_prompt)
         output = self.model.generate(**inputs, max_new_tokens=max_new_tokens,
                                      do_sample=False, repetition_penalty=1.0,
                                      use_cache=True)
@@ -535,14 +539,14 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
                 "image_grid_thw": inputs["image_grid_thw"].cpu().tolist()}
 
     @torch.no_grad()
-    def compare_full_prefill(self, images, vision_state, prompt):
+    def compare_full_prefill(self, images, vision_state, prompt, system_prompt=None):
         """Compare first-token logits before any decoding/logits processors."""
         self.model.eval()
-        native = self._native_image_inputs(images, prompt)
+        native = self._native_image_inputs(images, prompt, system_prompt)
         native_logits = self.model(**native, use_cache=False, return_dict=True, logits_to_keep=1).logits[:, -1].float()
         indices = torch.arange(self.region_grid**2, device=self.device)[None]
         visual = self.continue_vision(vision_state, selected_indices=indices)
-        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt)
+        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt, system_prompt)
         deepstack = [x.reshape(-1, x.shape[-1]).to(embeddings.dtype) for x in visual["deepstack_tokens"]]
         hidden = self.language_model(inputs_embeds=embeddings, attention_mask=attention,
             position_ids=positions, visual_pos_masks=mask, deepstack_visual_embeds=deepstack or None,

@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from tilebased_core_v85 import CONTRACT, DATASETS, PKMN_LEGEND, coordinate, task_text
 
-SYSTEM_FILE = Path(__file__).resolve().parent / 'prompts/tilebased_vqa_system_v85.txt'
+from tilebased_prompts_v85 import SYSTEM_FILE
 QUESTIONS = '''Perform navigation-focused VQA only. Answer the following questions briefly in English using visible evidence and the public task rules.
 1. Locate S and G approximately within the image using their supplied coordinates. Describe the nearby visible regions; do not assume endpoint markers are drawn.
 2. What connected regions could support a relatively low-cost route between them? Describe their layout and connections, including diagonal connections where relevant. Do not claim an exact optimal route.

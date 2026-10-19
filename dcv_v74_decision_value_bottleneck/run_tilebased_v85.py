@@ -20,6 +20,8 @@ from qwen3vl_selector_v79 import topk_region_indices
 from rl_posttraining_v85 import sample_region_action, policy_gradient_loss
 from planning_dataset_tilebased_v85 import TilebasedDatasetV85
 from tilebased_core_v85 import CONTRACT, shortest_path, path_cost
+from tilebased_prompts_v85 import prompt_metadata
+from tilebased_prompt_comparison_v85 import paired_prompt_report
 from tilebased_solver_environment_v85 import (FrozenTilebasedSolverEnvironment,
     ENVIRONMENT_CONTRACT, summarize_outcomes)
 
@@ -158,7 +160,10 @@ def rl_loss(model, reference, env, encoded, selection, positions, valid, public,
 @torch.no_grad()
 def evaluate(model, loader, env, args, device, modes, path):
     model.eval()
-    records = {mode: [] for mode in modes}
+    paired = isinstance(env,dict)
+    environments = env if paired else {env.prompt_variant:env}
+    records = {variant:{mode:[] for mode in modes} for variant in environments}
+    sample_offset = 0
     generator = torch.Generator(device=device).manual_seed(args.seed+71)
     with Path(path).open('w') as stream:
         for raw in tqdm(loader, desc='Tilebased frozen modeling + solver'):
@@ -170,14 +175,28 @@ def evaluate(model, loader, env, args, device, modes, path):
                        'random': topk_region_indices(torch.rand(valid.shape, device=device, generator=generator),valid,k),
                        'initial': topk_region_indices(selection['logits'],valid,k),
                        'learned': topk_region_indices(scores,valid,k)}
+            # Same encoded image, endpoints and chosen regions in both arms.
+            # Alternate arm order across batches to reduce systematic timing bias.
+            variants = list(environments)
+            if sample_offset % 2:
+                variants.reverse()
             for mode in modes:
-                results = env.evaluate(encoded, subsets[mode], public, labels)
-                records[mode].extend(results)
-                for row, result in enumerate(results):
-                    length = int(labels['gt_path_length'][row])
-                    stream.write(json.dumps(dict(result, mode=mode,
-                        gt_path_rc=labels['gt_path_rc'][row,:length].cpu().tolist()), allow_nan=False)+'\n')
-    return {mode: summarize_outcomes(results) for mode, results in records.items()}
+                for variant in variants:
+                    results = environments[variant].evaluate(encoded, subsets[mode], public, labels)
+                    records[variant][mode].extend(results)
+                    for row, result in enumerate(results):
+                        length = int(labels['gt_path_length'][row])
+                        stream.write(json.dumps(dict(result, mode=mode,
+                            gt_path_rc=labels['gt_path_rc'][row,:length].cpu().tolist()), allow_nan=False)+'\n')
+                    stream.flush()
+            sample_offset += 1
+    summaries = {variant:{mode:summarize_outcomes(rows) for mode,rows in group.items()}
+                 for variant,group in records.items()}
+    if paired:
+        summaries['paired'] = {mode:paired_prompt_report(records['legacy'][mode],records['navigation'][mode])
+                               for mode in modes}
+        return summaries
+    return next(iter(summaries.values()))
 
 
 @torch.no_grad()
@@ -246,6 +265,8 @@ def parse_args():
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
+    p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
+    p.add_argument('--compare-prompts', action='store_true', help='evaluate legacy/navigation on identical selected regions in one run')
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--grad-clip', type=float, default=5.)
     p.add_argument('--seed', type=int, default=1234)
@@ -256,6 +277,10 @@ def parse_args():
         p.error('temperatures, step sizes, learning rate and grad clip must be positive')
     if min(a.limit,a.val_limit,a.improve_margin) < 0:
         p.error('limits and improvement margin must be nonnegative')
+    if a.compare_prompts and a.mode != 'evaluate':
+        p.error('--compare-prompts is evaluation only')
+    if a.compare_prompts and len(set(a.modes)) != len(a.modes):
+        p.error('comparison modes must be unique')
     if a.mode in ('distill','rl') and not a.checkpoint:
         p.error('distill requires metric checkpoint; rl requires distill checkpoint')
     if a.mode == 'evaluate' and not a.checkpoint and set(a.modes)-{'full','random'}:
@@ -272,9 +297,16 @@ def main():
         raise FileExistsError(f'{output} is not empty; choose a fresh run directory')
     dataset = TilebasedDatasetV85(args.data, args.split if args.mode == 'evaluate' else 'train', args.limit)
     args.region_grid = dataset.config['region_grid']
+    variants = ['legacy','navigation'] if args.compare_prompts else [args.modeling_prompt]
+    prompt_config = {variant:prompt_metadata(variant,dataset.config['dataset']) for variant in variants}
+    args.modeling_prompt_metadata = prompt_config
+    args.dataset_signature = dataset.signature
+    args.torch_version = str(torch.__version__)
+    args.checkpoint_modeling_prompt = None
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True) if args.checkpoint else None
     if checkpoint:
         validate_checkpoint(checkpoint, dataset, args)
+        args.checkpoint_modeling_prompt = checkpoint['args'].get('modeling_prompt','legacy')
     model = build_v85_model(args, device)
     if model.backbone.target_image_side != dataset.config['image_side']:
         raise ValueError('Qwen patch/merge geometry would resize native images; incompatible backbone')
@@ -286,8 +318,11 @@ def main():
     model.backbone.eval()
     output.mkdir(parents=True, exist_ok=True)
     (output/'args.json').write_text(json.dumps(vars(args),indent=2)+'\n')
+    (output/'prompt_config.json').write_text(json.dumps(prompt_config,indent=2)+'\n')
     loader = DataLoader(dataset,batch_size=args.batch,shuffle=args.mode!='evaluate',num_workers=args.workers)
-    env = FrozenTilebasedSolverEnvironment(model.backbone,args.region_grid,args.modeling_max_new_tokens,args.failure_cost)
+    environments = {variant:FrozenTilebasedSolverEnvironment(model.backbone,args.region_grid,
+        args.modeling_max_new_tokens,args.failure_cost,prompt_variant=variant) for variant in variants}
+    env = environments if args.compare_prompts else environments[args.modeling_prompt]
     if args.mode == 'evaluate':
         report = evaluate(model,loader,env,args,device,args.modes,output/'outcomes.jsonl')
         (output/'summary.json').write_text(json.dumps(report,indent=2)+'\n')

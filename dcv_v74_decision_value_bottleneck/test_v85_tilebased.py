@@ -104,7 +104,7 @@ class TinyBackbone(nn.Module):
         if region_mask is not None:return (x*region_mask[...,None]).mean(1)
         return x.gather(1,selected_indices[...,None].expand(-1,-1,8)).mean(1)
     def fuse(self,ids,mask,visual):return visual
-    def generate_selected_json(self,state,indices,prompt,max_new_tokens):
+    def generate_selected_json(self,state,indices,prompt,max_new_tokens,system_prompt=None):
         self.prompts.append(prompt)
         return self.answer
 

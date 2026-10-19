@@ -86,5 +86,40 @@
       "Real val maps 0, 3, 6, 9 prepared successfully with public query 0"
     ],
     "limitation": "No Qwen3-VL-8B inference or VQA accuracy evaluation performed; formal modeling prompt unchanged."
+  },
+  "formal_navigation_prompt_validation": {
+    "date": "2026-10-19",
+    "tests_passed": 48,
+    "files": [
+      "test_v85_tilebased_prompts.py",
+      "test_v85_tilebased.py",
+      "test_v85_tilebased_vqa.py",
+      "test_v85_tilebased_diagnostics.py",
+      "test_v85_solver_environment.py"
+    ],
+    "transformers_version": "4.57.6",
+    "torch_version": "2.14.1+cpu",
+    "checks": [
+      "Legacy user prompt remains unchanged and has no system message",
+      "Navigation system and modeling prompt are passed through the actual frozen solver environment, with no GT in either prompt",
+      "Paired evaluation holds image encoding, endpoints and selected visual indices fixed; failure-aware paired metrics verified",
+      "Metric/distill/RL/evaluate CLI chain tested with frozen generation test double and real Dijkstra",
+      "Small randomly initialized actual Qwen tested with and without system prefix, prune layers 0 and 1; native/custom logits and greedy outputs agree"
+    ],
+    "actual_8b_experiment": {
+      "status": "not_run",
+      "reason": "Server model path /data/lyi/models/Qwen3-VL-8B-Instruct absent; no GPU available in this execution environment",
+      "planned_tasks": 40,
+      "prompt_variants": [
+        "legacy",
+        "navigation"
+      ],
+      "selection_modes": [
+        "full",
+        "random"
+      ],
+      "generation_calls": 160,
+      "performance_improvement": null
+    }
   }
 }

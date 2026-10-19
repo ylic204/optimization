@@ -1,16 +1,22 @@
 """Frozen VLM -> validated node-cost model -> Dijkstra -> true-cost reward."""
+import hashlib
 import time
 import numpy as np
 import torch
-from tilebased_core_v85 import build_model_prompt, validate_model, shortest_path, evaluate_path, matrix_diagnostics
+from tilebased_core_v85 import validate_model, shortest_path, evaluate_path, matrix_diagnostics
+
+from tilebased_prompts_v85 import modeling_user_prompt, modeling_system_prompt
 
 ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_exact_mincost_v1'
 
 
 class FrozenTilebasedSolverEnvironment:
-    def __init__(self, backbone, region_grid, max_new_tokens=4096, failure_cost=10.):
+    def __init__(self, backbone, region_grid, max_new_tokens=4096, failure_cost=10., prompt_variant='legacy'):
         if failure_cost <= 0 or not np.isfinite(failure_cost) or max_new_tokens <= 0:
             raise ValueError('positive failure cost and decode budget required')
+        if prompt_variant not in ('legacy','navigation'):
+            raise ValueError('unknown modeling prompt variant')
+        self.prompt_variant = prompt_variant
         self.backbone, self.region_grid = backbone, region_grid
         self.max_new_tokens, self.failure_cost = max_new_tokens, failure_cost
 
@@ -24,7 +30,8 @@ class FrozenTilebasedSolverEnvironment:
             target = public_inputs['target_rc'][row].cpu().numpy()
             dataset = public_inputs['dataset'][row]
             chosen = indices[row].cpu().tolist()
-            prompt = build_model_prompt(public_inputs['task_text'][row], dataset, source, target,
+            system = modeling_system_prompt(self.prompt_variant,dataset)
+            prompt = modeling_user_prompt(self.prompt_variant,public_inputs['task_text'][row], dataset, source, target,
                                         chosen, self.region_grid, public_inputs['legend'][row])
             state = {k: (tuple(x[row:row+1] for x in v) if k == 'position_groups' else v[row:row+1])
                      for k, v in encoded['vision_state'].items()}
@@ -34,12 +41,16 @@ class FrozenTilebasedSolverEnvironment:
                     'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None}
             try:
                 item['modeling_prompt'] = prompt
+                item['modeling_prompt_variant'] = self.prompt_variant
+                item['system_prompt'] = system
+                item['prompt_sha256'] = hashlib.sha256((system+'\n'+prompt).encode()).hexdigest()
+                generation_kwargs = {'system_prompt':system} if system else {}
                 if hasattr(self.backbone, 'generate_selected_report'):
-                    generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens)
+                    generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                     answer = generation['text']
                     item['generation'] = {k:v for k,v in generation.items() if k != 'text'}
                 else:
-                    answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens)
+                    answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                 item['model_answer'] = answer
                 item['matrix_diagnostics'] = matrix_diagnostics(answer)
                 modeled_costs = validate_model(answer, dataset, source, target)
@@ -89,4 +100,8 @@ def summarize_outcomes(results):
     if generation:
         result['length_stop_rate'] = float(np.mean([x['finish_reason']=='length' for x in generation]))
         result['mean_generated_tokens'] = float(np.mean([x['generated_tokens'] for x in generation]))
+    for field in ('input_tokens','nonvisual_input_tokens'):
+        measured = [x[field] for x in generation if field in x]
+        if measured:
+            result['mean_'+field] = float(np.mean(measured))
     return result

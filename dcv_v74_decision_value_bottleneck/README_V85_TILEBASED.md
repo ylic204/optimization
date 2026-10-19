@@ -48,8 +48,59 @@ VQA 不输出完整路径、成本矩阵或模型 JSON，不能替代后续格�
 脚本使用官方 processor 和 `model.generate` 调用冻结 Qwen，不经过选择器或求解器；
 保留 `mm_token_type_ids` 并检查原始 320×320 图像网格。
 接口参考 [Qwen3-VL 官方文档](https://huggingface.co/docs/transformers/model_doc/qwen3_vl)。
-此修改作用于 VQA 诊断及可复用环境提示词，尚未自动改变 `run_tilebased_v85.py` 的正式建模提示词。
-需要先在服务器实测，再决定是否将其接入正式实验。
+同一英文环境提示词已接入 `run_tilebased_v85.py` 的正式建模与 RL 求解器反馈，默认使用 `navigation`。
+正式调用只输出成本模型 JSON，不先生成 VQA 回答，也不把 VQA 回答当成 GT。
+
+## 新旧提示词的配对规划实验
+
+新增 `--modeling-prompt navigation|legacy`（默认 `navigation`）和 `--compare-prompts`。
+`navigation` 使用独立 system message 加导航建模指令；`legacy` 保留原来的 user prompt 且没有 system message。
+共享逻辑位于 `tilebased_prompts_v85.py`，原生与裁剪 Qwen 接口均支持 system message。
+选择器仍接收原有任务文本；新环境提示词用于选定区域后的冻结建模器，RL 的奖励因此来自新建模提示词下的真实求解结果。
+metric/distill 的代理损失不变。本次没有微调 Qwen，也没有更改成本、图结构或 GT。
+
+在脚本目录运行以下命令，直接复用已经预处理的数据：
+
+```bash
+python run_tilebased_v85.py \
+  --mode evaluate --compare-prompts \
+  --data /data/v85_tilebased/pkmn \
+  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
+  --device cuda:0 --load-4bit \
+  --split val --limit 40 --batch 1 \
+  --modes full random --budget 0.15 --seed 1234 \
+  --modeling-max-new-tokens 4096 \
+  --output results/tilebased_prompt_ab_r1
+```
+
+保持原实验的模型精度；原来未量化则去掉 `--load-4bit`。目录必须为空或不存在。
+这轮是 40 个任务 × 2 个视觉预算方案 × 2 种提示词，共 160 次建模调用。
+Full 保留 100 个视觉 token，Random 保留 15 个。同一任务在两种提示词下共享图像编码、S/G 和完全相同的选择区域，
+只加载一次 Qwen，并交替提示词执行顺序。两组均采用贪心解码和相同输出 token 上限，不依赖旧日志的运行配置。
+新提示词增加的文本开销单独记录，不将视觉 token 比例当成总计算量加速比。
+
+输出：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.json` | `legacy`、`navigation` 各自的 Full/Random 结果，以及 `paired` 配对变化 |
+| `outcomes.jsonl` | 每个任务、预算方案和提示词版本的回答、选择区域、路径、GT 评价和错误 |
+| `prompt_config.json` | 实际 system prompt、版本和 SHA256 |
+| `args.json` | 模型路径、预算、种子、数据签名、checkpoint 原提示词版本等运行配置 |
+
+优先查看 `paired.full.mean_task_loss_improvement`，计算为旧损失减新损失，正数表示改善，**失败样本也保留在计算中**。
+同时检查 `success_rate_change`、`mean_regret_improvement_both_success`、两组的 `optimal_rate_all` 和 `cost_cell_accuracy_successful`。
+共同成功样本上的 regret 单独配对，避免因成功样本集合变化产生误读；常数矩阵率和 uniform-cost 路径重合率辅助解释模型是否读取了图像。
+`mean_input_tokens`、`mean_nonvisual_input_tokens`、生成 token 数和 `environment_seconds` 用于观察开销；后者不含共享的早期编码和选择器计算，不是端到端延迟。
+
+40 个任务仅用于初步诊断，同图多个 S/G 查询相关，不应据此宣称统计显著提升。
+确认 Full 的成本建模改善后，再扩大验证集、固定提示词并在 test 上报告结果；随后用该提示词重新进行 RL。
+已有 checkpoint 可以做配对评估，选择器在两组中固定；旧 RL checkpoint 的奖励是在旧提示词下学习的，迁移评估不等于已经完成新提示词下的 RL 训练。
+单独恢复旧基线使用 `--modeling-prompt legacy`；单独运行新方法使用默认值或 `--modeling-prompt navigation`。
+当前环境提示词面向 Pokémon；Warcraft 请显式使用 `legacy`。
+
+验证状态：集成与配对流程已用 CPU 测试，包含小型随机初始化真实 Qwen 的 system-prefix 位置编码和原生/裁剪输出一致性。
+这些测试不代表 Qwen3-VL-8B 的任务能力；当前工作环境没有服务器模型权重和 GPU，真实 8B 新旧提示词实验尚待运行，暂无提升数值。
 
 ## 当前 Full 基线较弱时，先运行接口与识别诊断
 
@@ -77,7 +128,7 @@ python diagnose_tilebased_v85.py \
 - `native`：官方 `model.generate`，由 Qwen 原生计算视觉特征、DeepStack 和 MRoPE。
 - `custom`：当前选择器使用的自定义生成接口，诊断时保留全部视觉区域。
 - `cells`：只询问 S/G 和预先固定位置的少量格子，减少完整 20×20 矩阵的序列化负担；允许回答 unknown。
-- `matrix`：沿用正式评估的完整成本矩阵提示词与求解规则。
+- `matrix`：沿用 `legacy` 完整成本矩阵提示词与求解规则；该接口诊断默认不添加新环境提示词。新旧提示词任务效果比较使用上面的 `--compare-prompts`。
 
 可先用 `--probes cells` 做短检查，再换一个输出目录运行完整命令。
 可选 `--blank-control` 增加同尺寸灰图对照，用于检查答案是否依赖视觉；灰图结果不混入正式规划评估。

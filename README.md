@@ -12,7 +12,7 @@
 - `tilebased_solver_environment_v85.py`：冻结 Qwen 生成节点成本实例，Dijkstra 求解，真实成本反馈。
 - `vqa_tilebased_v85.py`：用英文环境提示词和公开 S/G 做导航 VQA，检查连接关系、路线代价与决策相关视觉区域，保存逐任务提示词和回答。
 - `diagnose_tilebased_v85.py`：原生/自定义 Qwen 同输入对照、局部格子识别、完整矩阵诊断与可选灰图对照。
-- `run_tilebased_v85.py`：复用 V8.5 selector/固定步 FM-ND/RL，提供 metric、distill、rl、evaluate 四个入口。
+- `run_tilebased_v85.py`：复用 V8.5 selector/固定步 FM-ND/RL，正式建模默认接入英文导航环境提示词；`--compare-prompts` 在相同视觉选择下配对评估新旧提示词。
 
 **完整下载、预处理、模型调用和训练命令：
 [README_V85_TILEBASED.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED.md)。**

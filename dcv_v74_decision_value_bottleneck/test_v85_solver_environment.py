@@ -168,7 +168,8 @@ def test_export_records_actual_times_and_missing_future_contract():
 
 
 @pytest.mark.parametrize("prune_layer", [0, 1])
-def test_real_qwen_text_model_sparse_prefill_and_cached_decode(prune_layer):
+@pytest.mark.parametrize("system_prompt", [None, "Top-down navigation environment"])
+def test_real_qwen_text_model_sparse_prefill_and_cached_decode(prune_layer, system_prompt):
     torch.manual_seed(7)
     transformers = pytest.importorskip("transformers")
     config = transformers.Qwen3VLConfig(
@@ -192,12 +193,18 @@ def test_real_qwen_text_model_sparse_prefill_and_cached_decode(prune_layer):
 
     class Tokenizer:
         def __call__(self, *args, **kwargs):
-            return {"input_ids": torch.tensor([[1, 4, 5, 6, 7, 8]])}
+            return {"input_ids": torch.tensor([([9,10,11] if system_prompt else []) + [1,4,5,6,7,8]])}
 
         def decode(self, ids, **kwargs):
             return json.dumps(ids)
 
-    backbone.processor = SimpleNamespace(tokenizer=Tokenizer(), apply_chat_template=lambda *args, **kwargs: "chat")
+    def chat_template(messages, **kwargs):
+        if system_prompt:
+            assert messages[0] == {"role":"system", "content":system_prompt}
+        else:
+            assert len(messages)==1 and messages[0]["role"]=="user"
+        return "chat"
+    backbone.processor = SimpleNamespace(tokenizer=Tokenizer(), apply_chat_template=chat_template)
     pixels, grid = torch.randn(36, 3 * 2 * 16 * 16), torch.tensor([[1, 6, 6]])
     backbone.processor.image_processor = lambda **kwargs: {"pixel_values": pixels, "image_grid_thw": grid}
     hidden, pairs, cu_seqlens, max_seqlen = backbone._prepare_vision_stream(pixels, grid)
@@ -207,20 +214,21 @@ def test_real_qwen_text_model_sparse_prefill_and_cached_decode(prune_layer):
              "position_groups": tuple(x.reshape(1, 9, 4, -1) for x in pairs)}
     visual = backbone.continue_vision(state, selected_indices=torch.tensor([[0, 8]]))
     assert visual["visual_tokens"].shape == (1, 2, 32) and len(visual["deepstack_tokens"]) == 1
-    embeddings, attention, mask, positions = backbone._selected_chat_inputs(visual, "prompt")
-    assert embeddings.shape == (1, 7, 32) and mask.sum() == 2
-    assert positions[2, 0, 2:4].tolist() == [2, 4]
-    assert positions[3, 0, 2:4].tolist() == [2, 4]
-    answer = backbone.generate_selected_json(state, torch.tensor([[8, 0]]), "prompt", max_new_tokens=3)
+    embeddings, attention, mask, positions = backbone._selected_chat_inputs(visual, "prompt", system_prompt)
+    offset = 3 if system_prompt else 0
+    assert embeddings.shape == (1, 7+offset, 32) and mask.sum() == 2
+    assert positions[2, 0, 2+offset:4+offset].tolist() == [2+offset, 4+offset]
+    assert positions[3, 0, 2+offset:4+offset].tolist() == [2+offset, 4+offset]
+    answer = backbone.generate_selected_json(state, torch.tensor([[8, 0]]), "prompt", max_new_tokens=3, system_prompt=system_prompt)
     assert len(json.loads(answer)) == 3
     assert all(p.grad is None for p in backbone.model.parameters())
 
     image = torch.zeros(1, 3, 96, 96)
-    parity = backbone.compare_full_prefill(image, state, "prompt")
+    parity = backbone.compare_full_prefill(image, state, "prompt", system_prompt)
     assert parity["first_token_equal"]
     assert parity["max_abs_logit_difference"] < 1e-5
-    native = backbone.generate_native_report(image, "prompt", 3)
-    custom = backbone.generate_selected_report(state, torch.arange(9)[None], "prompt", 3)
+    native = backbone.generate_native_report(image, "prompt", 3, system_prompt)
+    custom = backbone.generate_selected_report(state, torch.arange(9)[None], "prompt", 3, system_prompt)
     assert native["text"] == custom["text"]
     assert native["generated_tokens"] == custom["generated_tokens"] == 3
     assert native["finish_reason"] == custom["finish_reason"] == "length"
