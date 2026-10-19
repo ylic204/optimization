@@ -1,4 +1,5 @@
 import math
+import inspect
 
 import torch
 import torch.nn as nn
@@ -414,8 +415,8 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
             "region_indices": token_indices,
         }
 
-    def _selected_chat_inputs(self, visual, prompt):
-        """Preserve sparse original grid positions in a real Qwen chat prefix."""
+    def _image_chat_ids(self, prompt, image_tokens):
+        """One common chat prefix for native and custom full-image generation."""
         messages = [{"role": "user", "content": [
             {"type": "image"}, {"type": "text", "text": prompt},
         ]}]
@@ -425,8 +426,14 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         if len(locations) != 1 or ids.shape[0] != 1:
             raise ValueError("modeling requires one image placeholder in a single-sample chat")
         start = int(locations[0])
-        k = visual["visual_tokens"].shape[1]
+        k = int(image_tokens)
         ids = torch.cat([ids[:, :start], ids[:, start:start + 1].expand(-1, k), ids[:, start + 1:]], -1)
+        return ids, start
+
+    def _selected_chat_inputs(self, visual, prompt):
+        """Preserve sparse original grid positions in a real Qwen chat prefix."""
+        k = visual["visual_tokens"].shape[1]
+        ids, start = self._image_chat_ids(prompt, k)
         embeddings = self.language_model.embed_tokens(ids)
         embeddings[:, start:start + k] = visual["visual_tokens"].to(embeddings.dtype)
         mask = torch.zeros_like(ids, dtype=torch.bool)
@@ -445,6 +452,10 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
 
     @torch.no_grad()
     def generate_selected_json(self, vision_state, indices, prompt, max_new_tokens=1536):
+        return self.generate_selected_report(vision_state, indices, prompt, max_new_tokens)["text"]
+
+    @torch.no_grad()
+    def generate_selected_report(self, vision_state, indices, prompt, max_new_tokens=1536):
         """Greedy frozen decoding using K physically gathered visual groups.
 
         No full-image generation fallback is used. Prefill receives DeepStack
@@ -464,11 +475,13 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         eos = self.model.generation_config.eos_token_id
         eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
         generated = []
+        finish_reason = "length"
         next_spatial = int(positions[1:, 0, -1].max()) + 1
         for step in range(max_new_tokens):
             token = self.model.lm_head(output.last_hidden_state[:, -1:]).argmax(-1)
             value = int(token[0, 0])
             if value in eos:
+                finish_reason = "eos"
                 break
             generated.append(value)
             if step == max_new_tokens - 1:
@@ -480,7 +493,68 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
                 input_ids=token, attention_mask=attention, position_ids=next_positions,
                 past_key_values=output.past_key_values, use_cache=True, return_dict=True,
             )
-        return self.processor.tokenizer.decode(generated, skip_special_tokens=True)
+        return {"text": self.processor.tokenizer.decode(generated, skip_special_tokens=True),
+                "generated_tokens": len(generated), "finish_reason": finish_reason,
+                "max_new_tokens": int(max_new_tokens), "backend": "custom"}
+
+    def _native_image_inputs(self, images, prompt):
+        if len(images) != 1:
+            raise ValueError("native diagnostics expects one image")
+        pixels, grid = self._process_images(images)
+        self._validate_grid(grid, 1)
+        ids, _ = self._image_chat_ids(prompt, self.region_grid**2)
+        inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids),
+                  "pixel_values": pixels, "image_grid_thw": grid}
+        # Newer Transformers requires explicit modality IDs for native MRoPE.
+        if "mm_token_type_ids" in inspect.signature(self.core.forward).parameters:
+            inputs["mm_token_type_ids"] = (ids == int(self.model.config.image_token_id)).long()
+        return inputs
+
+    @torch.no_grad()
+    def generate_native_report(self, images, prompt, max_new_tokens=1536):
+        """Official model.generate with identical pixels and full chat token IDs.
+
+        Qwen constructs its own vision features, DeepStack and MRoPE positions.
+        This is a diagnostic full-image backend, NEVER a sparse fallback.
+        """
+        if max_new_tokens <= 0:
+            raise ValueError("positive decode budget required")
+        self.model.eval()
+        inputs = self._native_image_inputs(images, prompt)
+        output = self.model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                     do_sample=False, repetition_penalty=1.0,
+                                     use_cache=True)
+        tokens = output[0, inputs["input_ids"].shape[1]:].tolist()
+        eos = self.model.generation_config.eos_token_id
+        eos = set(eos if isinstance(eos, (tuple, list)) else [eos])
+        ended = bool(tokens and tokens[-1] in eos)
+        content = tokens[:-1] if ended else tokens
+        return {"text": self.processor.tokenizer.decode(content, skip_special_tokens=True),
+                "generated_tokens": len(content), "finish_reason": "eos" if ended else "length",
+                "max_new_tokens": int(max_new_tokens), "backend": "native",
+                "image_grid_thw": inputs["image_grid_thw"].cpu().tolist()}
+
+    @torch.no_grad()
+    def compare_full_prefill(self, images, vision_state, prompt):
+        """Compare first-token logits before any decoding/logits processors."""
+        self.model.eval()
+        native = self._native_image_inputs(images, prompt)
+        native_logits = self.model(**native, use_cache=False, return_dict=True, logits_to_keep=1).logits[:, -1].float()
+        indices = torch.arange(self.region_grid**2, device=self.device)[None]
+        visual = self.continue_vision(vision_state, selected_indices=indices)
+        embeddings, attention, mask, positions = self._selected_chat_inputs(visual, prompt)
+        deepstack = [x.reshape(-1, x.shape[-1]).to(embeddings.dtype) for x in visual["deepstack_tokens"]]
+        hidden = self.language_model(inputs_embeds=embeddings, attention_mask=attention,
+            position_ids=positions, visual_pos_masks=mask, deepstack_visual_embeds=deepstack or None,
+            use_cache=False, return_dict=True).last_hidden_state[:, -1]
+        custom_logits = self.model.lm_head(hidden).float()
+        difference = (native_logits-custom_logits).abs()
+        return {"first_token_equal": bool((native_logits.argmax(-1)==custom_logits.argmax(-1)).all()),
+                "native_first_token": int(native_logits.argmax(-1)[0]),
+                "custom_first_token": int(custom_logits.argmax(-1)[0]),
+                "max_abs_logit_difference": float(difference.max()),
+                "mean_abs_logit_difference": float(difference.mean()),
+                "image_grid_thw": native["image_grid_thw"].cpu().tolist()}
 
     def fuse(self, input_ids, attention_mask, visual_output):
         """Fuse selected visual tokens and task text with Qwen3-VL's LLM."""

@@ -22,23 +22,30 @@
   "base_branch": "v85-bev-selector-llm-solver",
   "base_commit": "fbe42f170de562ac59c85b57a2807816b391986f",
   "upstream_revision": "384900fd82d8404a6eb0deb326412755620f3747",
-  "validation_date": "2026-10-18",
+  "validation_date": "2026-10-19",
   "download_test": "pkmn train/val/test downloaded via new downloader and SHA256 verified; offline reuse passed",
   "loader_test": "all three real splits loaded with batch_size=4 at native 320x320",
   "pytest": {
-    "passed": 55,
-    "skipped": 1,
-    "skip_reason": "optional Transformers-dependent sparse Qwen test; transformers not installed",
+    "passed": 63,
+    "skipped": 0,
     "files": [
       "test_v85_tilebased.py",
+      "test_v85_tilebased_diagnostics.py",
       "test_v85_gradient_flow.py",
       "test_v85_posttraining.py",
       "test_v85_solver_environment.py"
-    ]
+    ],
+    "transformers_versions": [
+      "4.57.6",
+      "5.17.0"
+    ],
+    "torch_version": "2.14.1+cpu"
   },
   "model_test": "tiny frozen-backbone double exercised metric/distill/rl/evaluate CLI chain; real Dijkstra and reward",
   "limitations": [
     "No Qwen3-VL-8B weights or GPU run in this environment; no quality/speedup claim.",
     "Warcraft raw archives downloaded; full preprocessing requires a verified user-supplied public legend."
-  ]
+  ],
+  "diagnostic_validation": "Random tiny real Qwen: native/custom full-image first-token logits agree within 1e-5 and three greedy decoded tokens match; prune_layer 0 and 1, sparse cached decoding. CLI fixture checks paired identical images/prompts, local cells, matrix scoring and blank controls.",
+  "data_validation_date": "2026-10-18"
 }

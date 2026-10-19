@@ -5,6 +5,68 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
+## 当前 Full 基线较弱时，先运行接口与识别诊断
+
+新增 `diagnose_tilebased_v85.py`，直接复用已经预处理的数据，无需重下载、重做 GT 或先训练。
+当 Full 成功率仅 65%、成功样本相对 regret 约 3.86 时，格式成功不能证明视觉建模有效；
+先检查冻结模型能否正确读取地形成本，再解释选择器的收益。
+
+在本目录运行，`--vlm-model` 替换成服务器上 **Qwen3-VL-8B-Instruct** 的实际路径：
+
+```bash
+python diagnose_tilebased_v85.py \
+  --data /data/v85_tilebased/pkmn \
+  --vlm-model /path/to/Qwen3-VL-8B-Instruct \
+  --device cuda:0 \
+  --split val --map-indices 0 3 6 9 \
+  --backends native custom --probes cells matrix \
+  --max-new-tokens 4096 --cell-max-new-tokens 768 \
+  --output results/tilebased_diagnostics_r1
+```
+
+如原实验使用量化，添加 `--load-4bit` 并保持两条接口相同精度。脚本只从本地加载模型。
+输出目录须不存在或为空。默认选择四张地图，每张只取第一个公开 S/G 查询；
+不会按 GT 成本或模型结果挑选地图。两条接口使用相同 RGB、预处理像素、chat token ID、提示词和解码预算：
+
+- `native`：官方 `model.generate`，由 Qwen 原生计算视觉特征、DeepStack 和 MRoPE。
+- `custom`：当前选择器使用的自定义生成接口，诊断时保留全部视觉区域。
+- `cells`：只询问 S/G 和预先固定位置的少量格子，减少完整 20×20 矩阵的序列化负担；允许回答 unknown。
+- `matrix`：沿用正式评估的完整成本矩阵提示词与求解规则。
+
+可先用 `--probes cells` 做短检查，再换一个输出目录运行完整命令。
+可选 `--blank-control` 增加同尺寸灰图对照，用于检查答案是否依赖视觉；灰图结果不混入正式规划评估。
+原始图不加 GT 路线、网格标签或裁剪重绘；公开地形图例与 S/G 继续保留。
+
+输出文件：
+
+| 文件 | 内容与用途 |
+|---|---|
+| `config.json` | 运行参数、数据签名、PyTorch/Transformers 版本 |
+| `prefill.jsonl` | 两条接口首个生成 token 的 logits 最大/平均绝对差与 argmax 是否相同 |
+| `outcomes.jsonl` | 每次原始输出、提示词及哈希、停止原因、生成 token 数、错误、逐格/路径指标 |
+| `summary.json` | 按 probe、图像条件、backend 分组的结果与成对答案一致数 |
+
+解读时按以下顺序：
+
+1. 两条接口首 token logits 有明显差异时，先检查服务器版本、精度及视觉接入；小浮点差异或仅首 token 一致都不能单独证明整条链路正确。
+2. 两条接口一致但局部格子成本识别都很差，优先检查地形图例、视觉可辨性及冻结模型能力。
+3. 局部识别较好但完整矩阵常数化、行列错误或截断明显，说明完整矩阵建模/序列化仍是瓶颈。
+4. Full 的成本识别和路径质量达到可用水平后，再比较训练后的 selector 与同预算 random。
+
+`cells` 的 `cell_accuracy_successful` 是格式合法输出中、查询格子的成本准确率；unknown 计错。
+`known_fraction_successful` 是非空回答比例，不等于正确率。这里不将地形名称当作人工语义 GT。
+矩阵 `cost_cell_accuracy_successful` 在全部地形格上计算；`cost_mae_successful` 是平均成本绝对误差。
+`same_path_as_uniform_cost` 表示与统一成本 Dijkstra 返回的路径完全相同，仅作诊断，不是最优性的判据。
+
+正式 `run_tilebased_v85.py` 的日志也增加这些矩阵诊断及 `generation` 字段；
+`finish_reason=length` 表示耗尽输出预算，`eos` 表示遇到结束 token；`generated_tokens` 不包含 EOS。
+继续严格拒绝错误形状和非法成本，不自动补齐矩阵、不从 GT 修复输出、不改变 reward。
+旧 checkpoint 和已生成数据的契约保持兼容。诊断脚本不会训练或更新任何模型参数。
+
+验证边界：用随机初始化的小型真实 Qwen 实现检查完整输入的 prefill/连续解码一致性，
+同时检查稀疏输入、GT 隔离和原有训练流程。小模型测试不代表 8B 的实际识别准确率；
+仍须在服务器运行上述对照，不能将本次更新报告为准确率已提升。
+
 ## 1. 与旧接口的对应
 
 | 原 V8.5 route/GT 接口 | Tilebased 接口 |
@@ -222,7 +284,7 @@ DGD/FM 监督的对象是 mask 更新方向，不是 GT 路径的 flow matching�
 ## 8. 验证
 
 ```bash
-python -m pytest -q test_v85_tilebased.py
+python -m pytest -q test_v85_tilebased.py test_v85_tilebased_diagnostics.py test_v85_solver_environment.py test_v85_gradient_flow.py test_v85_posttraining.py
 ```
 
 包含：八邻接/起点成本、同成本不同路径、GT 连通性、非法模型拒绝、标签隔离、
@@ -231,7 +293,9 @@ CPU 测试使用小型 backbone 替身测试接口和梯度，真实图求解使
 Qwen3-VL-8B 的识别准确率、GPU 显存、训练收益及端到端加速需在你的模型环境实测，
 不能由这些接口测试推断。
 
-本次已执行：Pokémon 三个原始文件下载与 SHA256 校验、全量 4,000 张地图/16,000 个任务转换与 GT 校验、
-三个 split 的 batch=4 读取；相关回归测试 55 passed、1 skipped（缺少可选 Transformers 依赖）。
+初次适配已执行：Pokémon 三个原始文件下载与 SHA256 校验、全量 4,000 张地图/16,000 个任务转换与 GT 校验、
+三个 split 的 batch=4 读取。
+本次诊断更新在 Transformers 4.57.6 和 5.17.0 上分别通过 63 项回归测试，无跳过；
+小型真实 Qwen 包括剪枝前运行 0/1 个视觉 block 的完整输入一致性与稀疏解码检查。
 详细记录见 `validation_tilebased_v85.json`。此外修复了共享 RL 的 masked categorical KL 在反向传播中
 可能出现 `(-inf)-(-inf)` 的 NaN；新旧 RL 测试均通过。

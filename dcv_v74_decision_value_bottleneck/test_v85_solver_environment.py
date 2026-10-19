@@ -167,14 +167,16 @@ def test_export_records_actual_times_and_missing_future_contract():
     assert _reference_path_ego([], np.zeros(3), BevConfig()).shape == (0, 3)
 
 
-def test_real_qwen_text_model_sparse_prefill_and_cached_decode():
+@pytest.mark.parametrize("prune_layer", [0, 1])
+def test_real_qwen_text_model_sparse_prefill_and_cached_decode(prune_layer):
+    torch.manual_seed(7)
     transformers = pytest.importorskip("transformers")
     config = transformers.Qwen3VLConfig(
         text_config=dict(vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                          num_attention_heads=2, num_key_value_heads=2, head_dim=16,
                          rope_scaling={"rope_type": "default", "mrope_section": [2, 3, 3], "mrope_interleaved": True}),
-        vision_config=dict(depth=1, hidden_size=16, intermediate_size=32, num_heads=2,
-                           out_hidden_size=32, deepstack_visual_indexes=[0]),
+        vision_config=dict(depth=2, hidden_size=16, intermediate_size=32, num_heads=2,
+                           out_hidden_size=32, deepstack_visual_indexes=[1]),
         image_token_id=5, vision_start_token_id=4, vision_end_token_id=6,
     )
     backbone = FrozenQwen3VLPrunableBackbone.__new__(FrozenQwen3VLPrunableBackbone)
@@ -183,7 +185,10 @@ def test_real_qwen_text_model_sparse_prefill_and_cached_decode():
     backbone.model.generation_config.eos_token_id = []
     backbone.region_grid = 3
     backbone.visual_hidden_dim, backbone.text_hidden_dim = 16, 32
-    backbone.merge_unit, backbone.prune_layer = 4, 0
+    backbone.merge_unit, backbone.prune_layer = 4, prune_layer
+    backbone.spatial_merge_size = 2
+    backbone.target_pixels = 96**2
+    backbone.model.generation_config.pad_token_id = 0
 
     class Tokenizer:
         def __call__(self, *args, **kwargs):
@@ -193,7 +198,11 @@ def test_real_qwen_text_model_sparse_prefill_and_cached_decode():
             return json.dumps(ids)
 
     backbone.processor = SimpleNamespace(tokenizer=Tokenizer(), apply_chat_template=lambda *args, **kwargs: "chat")
-    hidden, pairs, _, _ = backbone._prepare_vision_stream(torch.randn(36, 3 * 2 * 16 * 16), torch.tensor([[1, 6, 6]]))
+    pixels, grid = torch.randn(36, 3 * 2 * 16 * 16), torch.tensor([[1, 6, 6]])
+    backbone.processor.image_processor = lambda **kwargs: {"pixel_values": pixels, "image_grid_thw": grid}
+    hidden, pairs, cu_seqlens, max_seqlen = backbone._prepare_vision_stream(pixels, grid)
+    for block in backbone.visual.blocks[:prune_layer]:
+        hidden = backbone._run_block(block, hidden, cu_seqlens, pairs, max_seqlen)
     state = {"hidden_groups": hidden.reshape(1, 9, 4, 16),
              "position_groups": tuple(x.reshape(1, 9, 4, -1) for x in pairs)}
     visual = backbone.continue_vision(state, selected_indices=torch.tensor([[0, 8]]))
@@ -205,3 +214,13 @@ def test_real_qwen_text_model_sparse_prefill_and_cached_decode():
     answer = backbone.generate_selected_json(state, torch.tensor([[8, 0]]), "prompt", max_new_tokens=3)
     assert len(json.loads(answer)) == 3
     assert all(p.grad is None for p in backbone.model.parameters())
+
+    image = torch.zeros(1, 3, 96, 96)
+    parity = backbone.compare_full_prefill(image, state, "prompt")
+    assert parity["first_token_equal"]
+    assert parity["max_abs_logit_difference"] < 1e-5
+    native = backbone.generate_native_report(image, "prompt", 3)
+    custom = backbone.generate_selected_report(state, torch.arange(9)[None], "prompt", 3)
+    assert native["text"] == custom["text"]
+    assert native["generated_tokens"] == custom["generated_tokens"] == 3
+    assert native["finish_reason"] == custom["finish_reason"] == "length"

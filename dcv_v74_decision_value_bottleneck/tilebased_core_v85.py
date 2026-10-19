@@ -133,7 +133,7 @@ def build_model_prompt(task, dataset, source, target, retained_indices, region_g
             f"from {DATASETS[dataset]['cost_values']}. No extra keys or executable code.")
 
 
-def validate_model(answer, dataset, source, target):
+def parse_model_json(answer):
     text = str(answer).strip()
     if text.startswith('```json') and text.endswith('```'):
         text = text[7:-3].strip()
@@ -144,7 +144,36 @@ def validate_model(answer, dataset, source, target):
                 raise ValueError('duplicate JSON key')
             result[k] = v
         return result
-    obj = json.loads(text, object_pairs_hook=unique_keys)
+    return json.loads(text, object_pairs_hook=unique_keys)
+
+
+def matrix_diagnostics(answer):
+    """Describe malformed outputs without repairing them or changing rewards."""
+    result = {'json_valid': False}
+    try:
+        obj = parse_model_json(answer)
+        result['json_valid'] = True
+        values = obj.get('node_costs') if isinstance(obj, dict) else None
+        if not isinstance(values, list):
+            result['matrix_type'] = type(values).__name__
+            return result
+        result['matrix_rows'] = len(values)
+        result['matrix_row_lengths'] = [len(row) if isinstance(row, list) else None for row in values]
+        try:
+            a = np.asarray(values, dtype=float)
+        except (ValueError, TypeError):
+            return result
+        if a.ndim == 2 and a.size and np.isfinite(a).all():
+            unique, counts = np.unique(a, return_counts=True)
+            result.update(matrix_shape=list(a.shape), constant_matrix=len(unique)==1,
+                          predicted_cost_histogram={str(float(k)):int(v) for k,v in zip(unique,counts)})
+    except (ValueError, TypeError) as exc:
+        result['json_error'] = str(exc)
+    return result
+
+
+def validate_model(answer, dataset, source, target):
+    obj = parse_model_json(answer)
     if not isinstance(obj, dict) or set(obj) != {'schema', 'source_rc', 'target_rc', 'node_costs'}:
         raise ValueError('incorrect optimization schema fields')
     n = DATASETS[dataset]['grid']
@@ -152,13 +181,16 @@ def validate_model(answer, dataset, source, target):
         raise ValueError('incorrect optimization schema version')
     if coordinate(obj['source_rc'], (n, n)) != tuple(source) or coordinate(obj['target_rc'], (n, n)) != tuple(target):
         raise ValueError('model changed the task endpoints')
-    costs = np.asarray(obj['node_costs'])
     if not isinstance(obj['node_costs'], list) or any(
             not isinstance(row, list) or any(type(x) not in (int, float) for x in row)
             for row in obj['node_costs']):
         raise ValueError('node_costs must contain JSON numbers, not strings or booleans')
-    if costs.shape != (n, n) or costs.dtype.kind not in 'fiu' or not np.isfinite(costs).all():
-        raise ValueError('node_costs has incorrect shape/type/nonfinite values')
+    lengths = [len(row) for row in obj['node_costs']]
+    if len(lengths) != n or any(length != n for length in lengths):
+        raise ValueError(f'node_costs shape mismatch: expected {n}x{n}; rows={len(lengths)}, row_lengths={lengths}')
+    costs = np.asarray(obj['node_costs'])
+    if costs.dtype.kind not in 'fiu' or not np.isfinite(costs).all():
+        raise ValueError('node_costs contains nonfinite or nonnumeric values')
     allowed = np.asarray(DATASETS[dataset]['cost_values'])
     if not np.isclose(costs[..., None], allowed, atol=1e-5, rtol=1e-5).any(-1).all():
         raise ValueError('node_costs contains values outside the public cost vocabulary')

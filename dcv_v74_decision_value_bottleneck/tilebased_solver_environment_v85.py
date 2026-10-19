@@ -2,7 +2,7 @@
 import time
 import numpy as np
 import torch
-from tilebased_core_v85 import build_model_prompt, validate_model, shortest_path, evaluate_path
+from tilebased_core_v85 import build_model_prompt, validate_model, shortest_path, evaluate_path, matrix_diagnostics
 
 ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_exact_mincost_v1'
 
@@ -33,8 +33,15 @@ class FrozenTilebasedSolverEnvironment:
                     'retained_tokens': len(chosen), 'total_tokens': self.region_grid**2,
                     'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None}
             try:
-                answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens)
+                item['modeling_prompt'] = prompt
+                if hasattr(self.backbone, 'generate_selected_report'):
+                    generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens)
+                    answer = generation['text']
+                    item['generation'] = {k:v for k,v in generation.items() if k != 'text'}
+                else:
+                    answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens)
                 item['model_answer'] = answer
+                item['matrix_diagnostics'] = matrix_diagnostics(answer)
                 modeled_costs = validate_model(answer, dataset, source, target)
                 item['status'] = 'solver_failure'
                 route = shortest_path(modeled_costs, source, target)
@@ -45,6 +52,11 @@ class FrozenTilebasedSolverEnvironment:
                                          target, float(supervision['optimal_cost'][row]))
                 item.update(measured, status='success')
                 item['loss'] = min(measured['relative_regret'], self.failure_cost*.999)
+                truth = supervision['true_costs'][row].cpu().numpy()
+                item['cost_cell_accuracy'] = float(np.isclose(modeled_costs, truth, rtol=1e-5, atol=1e-5).mean())
+                item['cost_mae'] = float(np.abs(modeled_costs-truth).mean())
+                uniform = shortest_path(np.ones_like(modeled_costs), source, target)
+                item['same_path_as_uniform_cost'] = bool(np.array_equal(route, uniform))
             except (ValueError, KeyError, TypeError, OverflowError) as exc:
                 item['error'] = str(exc)
             item['environment_seconds'] = time.perf_counter() - start
@@ -67,4 +79,14 @@ def summarize_outcomes(results):
     for field in ('retained_tokens', 'total_tokens', 'environment_seconds'):
         result[field] = float(np.mean([x[field] for x in results]))
     result['token_ratio'] = result['retained_tokens']/result['total_tokens']
+    diagnostic_success = [x for x in success if 'cost_cell_accuracy' in x]
+    if diagnostic_success:
+        result['constant_matrix_rate_successful'] = float(np.mean([
+            x['matrix_diagnostics']['constant_matrix'] for x in diagnostic_success]))
+        for field in ('cost_cell_accuracy', 'cost_mae', 'same_path_as_uniform_cost'):
+            result[field+'_successful'] = float(np.mean([x[field] for x in diagnostic_success]))
+    generation = [x['generation'] for x in results if 'generation' in x]
+    if generation:
+        result['length_stop_rate'] = float(np.mean([x['finish_reason']=='length' for x in generation]))
+        result['mean_generated_tokens'] = float(np.mean([x['generated_tokens'] for x in generation]))
     return result
