@@ -19,6 +19,8 @@ from tilebased_core_v85 import (DATASETS, build_model_prompt, evaluate_path, mat
                                 parse_model_json, shortest_path, validate_model)
 
 
+DIAGNOSTIC_CONTRACT = 'tilebased_diagnostics_v2'
+
 def query_cells(source, target, grid):
     # Fixed geometry and task endpoints only. Never use GT/costs to choose cells.
     return list(dict.fromkeys([tuple(map(int, source)), tuple(map(int, target)),
@@ -32,18 +34,27 @@ def build_cells_prompt(dataset, cells, legend):
             f'cell [r,c] occupies horizontal [c/{grid},(c+1)/{grid}] and vertical [r/{grid},(r+1)/{grid}] '
             'fractions of the whole image. Read ONLY the requested cells from the image. '
             f'Terrain-cost legend: {legend}\nRequested cells: {list(map(list,cells))}. '
-            'Return one JSON object with a cells list in requested order, each item '
-            '{"row":r,"column":c,"terrain":"name","cost":number}. '
+            'Return exactly {"cells":[{"row":r,"column":c,"terrain":"name","cost":number}, ...]} '
+            'with one entry per requested cell in requested order. The outer value must be an object, not an array. '
             'Use terrain="unknown", cost=null if you cannot identify a cell; do not invent a uniform map. '
             'Do not output a path or a full matrix.')
 
 
 def score_cells(answer, cells, true_costs, dataset):
     obj = parse_model_json(answer)
-    if not isinstance(obj,dict) or set(obj) != {'cells'} or not isinstance(obj['cells'],list) or len(obj['cells']) != len(cells):
+    # A bare array preserves every prediction: score its content, but expose the
+    # outer-schema violation separately. Never repair entries, costs or order.
+    bare_list = isinstance(obj,list)
+    if bare_list:
+        entries = obj
+    elif isinstance(obj,dict) and set(obj) == {'cells'}:
+        entries = obj['cells']
+    else:
+        raise ValueError('expected a cells object or a bare cell array')
+    if not isinstance(entries,list) or len(entries) != len(cells):
         raise ValueError('expected one cells entry per query')
     correct, known, rows = 0, 0, []
-    for item, (r,c) in zip(obj['cells'],cells):
+    for item, (r,c) in zip(entries,cells):
         if (not isinstance(item,dict) or set(item) != {'row','column','terrain','cost'} or
                 type(item['row']) is not int or type(item['column']) is not int or
                 (item['row'],item['column']) != (r,c) or not isinstance(item['terrain'],str)):
@@ -55,7 +66,10 @@ def score_cells(answer, cells, true_costs, dataset):
         hit = value is not None and bool(np.isclose(value,true_costs[r,c],rtol=1e-5,atol=1e-5))
         correct += int(hit); known += int(value is not None)
         rows.append(dict(item,true_cost=float(true_costs[r,c]),correct=hit))
-    return {'cell_accuracy':correct/len(cells),'known_fraction':known/len(cells),'cells_scored':rows}
+    return {'cell_accuracy':correct/len(cells),'known_fraction':known/len(cells),'cells_scored':rows,
+            'strict_format_valid':not bare_list,
+            'format_normalization':'bare_list_to_cells' if bare_list else 'none',
+            'correct_cells':correct,'queried_cells':len(cells)}
 
 
 def summarize(records):
@@ -68,6 +82,11 @@ def summarize(records):
         for metric in ('cost_cell_accuracy','cost_mae','relative_regret','same_path_as_uniform_cost','cell_accuracy','known_fraction'):
             values=[r[metric] for r in success if metric in r]
             if values:item[metric+'_successful']=float(np.mean(values))
+        if key[0]=='cells':
+            item['strict_format_success_rate'] = sum(bool(r.get('strict_format_valid')) for r in success)/len(rows)
+            item['normalized_outer_format_samples'] = sum(r.get('format_normalization')=='bare_list_to_cells' for r in success)
+            item['correct_cells'] = sum(r.get('correct_cells',0) for r in success)
+            item['scored_cells'] = sum(r.get('queried_cells',0) for r in success)
         if key[0]=='matrix':
             item['optimal_rate_all']=sum(bool(r.get('optimal')) for r in rows)/len(rows)
             item['constant_matrix_rate_successful']=(float(np.mean([r['matrix_diagnostics']['constant_matrix'] for r in success])) if success else None)
@@ -79,10 +98,57 @@ def summarize(records):
     return report
 
 
+
+def rescore_saved_cells(source_file, ds, out):
+    """Offline scoring of existing answers; no model loading or regeneration."""
+    source = Path(source_file)
+    records = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+    if not records:
+        raise ValueError('empty diagnostic log')
+    lookup = {r['sample_id']:i for i,r in enumerate(ds.records)}
+    for item in records:
+        if item['sample_id'] not in lookup:
+            raise ValueError('sample absent from selected dataset split: '+item['sample_id'])
+        if item['probe'] == 'matrix':
+            continue  # Matrix outputs and original planning scores are untouched.
+        if item['probe'] != 'cells':
+            raise ValueError('unsupported saved diagnostic probe')
+        sample = ds[lookup[item['sample_id']]]
+        public, labels = sample['public_inputs'], sample['supervision']
+        dataset = public['dataset']
+        cells = query_cells(public['source_rc'].tolist(),public['target_rc'].tolist(),DATASETS[dataset]['grid'])
+        marker = 'Requested cells: '
+        if marker not in item['prompt']:
+            raise ValueError('saved prompt lacks explicit cell queries')
+        requested, _ = json.JSONDecoder().raw_decode(item['prompt'].split(marker,1)[1])
+        if requested != list(map(list,cells)):
+            raise ValueError('saved cell queries do not match this dataset/task')
+        item['previous_scoring'] = {k:item[k] for k in ('status','error','cell_accuracy','strict_format_valid') if k in item}
+        for key in ('error','cell_accuracy','known_fraction','cells_scored','strict_format_valid',
+                    'format_normalization','correct_cells','queried_cells'):
+            item.pop(key,None)
+        item['status'] = 'model_failure'
+        item['diagnostic_contract'] = DIAGNOSTIC_CONTRACT
+        try:
+            item.update(score_cells(item['model_answer'],cells,labels['true_costs'].numpy(),dataset))
+            item['status'] = 'success'
+        except (ValueError,TypeError,KeyError,OverflowError) as exc:
+            item['error'] = str(exc)
+    out.mkdir(parents=True,exist_ok=True)
+    (out/'config.json').write_text(json.dumps(dict(diagnostic_contract=DIAGNOSTIC_CONTRACT,
+        rescore_only=True,source_log=str(source),source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        dataset_signature=ds.signature),indent=2)+'\n')
+    (out/'outcomes.jsonl').write_text(''.join(json.dumps(r,allow_nan=False)+'\n' for r in records))
+    report = summarize(records)
+    (out/'summary.json').write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report,indent=2))
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data',required=True)
-    p.add_argument('--vlm-model',required=True)
+    p.add_argument('--vlm-model')
+    p.add_argument('--rescore-from',help='existing diagnostic outcomes.jsonl; no model or GPU required')
     p.add_argument('--device',default='cuda:0')
     p.add_argument('--load-4bit',action='store_true')
     p.add_argument('--split',choices=['train','val','test'],default='val')
@@ -98,7 +164,11 @@ def main():
     if min(a.max_new_tokens,a.cell_max_new_tokens)<=0 or any(i<0 for i in a.map_indices):p.error('invalid token/map limits')
     out=Path(a.output)
     if out.exists() and any(out.iterdir()):raise FileExistsError('use a fresh diagnostic output directory')
+    if not a.rescore_from and not a.vlm_model:p.error('--vlm-model is required unless --rescore-from is used')
     ds=TilebasedDatasetV85(a.data,a.split)
+    if a.rescore_from:
+        rescore_saved_cells(a.rescore_from,ds,out)
+        return
     # Use first public S/G query per selected map, not four repeats of each image.
     found={}
     for i,r in enumerate(ds.records):found.setdefault(int(Path(r['map_file']).stem),i)
@@ -111,7 +181,7 @@ def main():
     if model.target_image_side!=ds.config['image_side']:raise ValueError('native image size mismatch')
     import transformers
     out.mkdir(parents=True, exist_ok=True)
-    (out/'config.json').write_text(json.dumps(dict(vars(a),transformers_version=transformers.__version__,
+    (out/'config.json').write_text(json.dumps(dict(vars(a),diagnostic_contract=DIAGNOSTIC_CONTRACT,transformers_version=transformers.__version__,
         torch_version=str(torch.__version__),dataset_signature=ds.signature),indent=2)+'\n')
     records=[]
     conditions=['original','blank'] if a.blank_control else ['original']
@@ -142,7 +212,7 @@ def main():
                         started=time.perf_counter()
                         generated=(model.generate_native_report(image,prompt,budget) if backend=='native' else
                                    model.generate_selected_report(encoded['vision_state'],full_indices,prompt,budget))
-                        item={'sample_id':public['sample_id'][0],'probe':probe,'image_condition':condition,
+                        item={'diagnostic_contract':DIAGNOSTIC_CONTRACT,'sample_id':public['sample_id'][0],'probe':probe,'image_condition':condition,
                               'backend':backend,'model_answer':generated['text'],
                               'generation':{k:v for k,v in generated.items() if k!='text'},
                               'prompt':prompt,'prompt_sha256':hashlib.sha256(prompt.encode()).hexdigest(),

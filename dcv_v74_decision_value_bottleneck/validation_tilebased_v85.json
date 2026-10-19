@@ -47,5 +47,21 @@
     "Warcraft raw archives downloaded; full preprocessing requires a verified user-supplied public legend."
   ],
   "diagnostic_validation": "Random tiny real Qwen: native/custom full-image first-token logits agree within 1e-5 and three greedy decoded tokens match; prune_layer 0 and 1, sparse cached decoding. CLI fixture checks paired identical images/prompts, local cells, matrix scoring and blank controls.",
-  "data_validation_date": "2026-10-18"
+  "data_validation_date": "2026-10-18",
+  "cell_scoring_v2_validation": {
+    "date": "2026-10-19",
+    "passed": 23,
+    "skipped": 1,
+    "files": [
+      "test_v85_tilebased_diagnostics.py",
+      "test_v85_tilebased.py"
+    ],
+    "skip_reason": "Existing live-generation CLI fixture requires optional Transformers; this offline-scoring patch does not change model inference.",
+    "checks": [
+      "Bare-array content accuracy separated from strict outer-format validity",
+      "Invalid cell values still rejected",
+      "Offline CLI loads no VLM, preserves original answers and matrix results",
+      "Uploaded diagnostic answers rescored against the original preprocessed split without regeneration"
+    ]
+  }
 }

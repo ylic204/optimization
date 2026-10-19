@@ -84,3 +84,46 @@ def test_diagnostic_cli_pairs_identical_inputs_and_records_both_probes(tmp_path,
         assert native[1].equal(custom[1]) and native[2:]==custom[2:]
     summary=json.loads((output/'summary.json').read_text())
     assert summary['paired']=={'pairs':4,'identical_answers':4}
+
+
+def test_bare_array_content_scored_but_format_failure_remains_visible():
+    cells=[(0,0),(1,1)]
+    entries=[dict(row=r,column=c,terrain='grass',cost=1.5) for r,c in cells]
+    truth=np.ones((20,20));truth[1,1]=1.5
+    array=score_cells(json.dumps(entries),cells,truth,'pkmn')
+    wrapped=score_cells(json.dumps({'cells':entries}),cells,truth,'pkmn')
+    assert array['cell_accuracy']==wrapped['cell_accuracy']==.5
+    assert not array['strict_format_valid'] and wrapped['strict_format_valid']
+    assert array['format_normalization']=='bare_list_to_cells'
+    assert array['correct_cells']==1 and array['queried_cells']==2
+    entries[0]['cost']=7  # Outer normalization cannot legalize an invalid prediction.
+    with pytest.raises(ValueError,match='invalid cell cost'):
+        score_cells(json.dumps(entries),cells,truth,'pkmn')
+
+
+def test_offline_rescore_preserves_answers_matrix_scores_and_original_log(tmp_path,monkeypatch):
+    import diagnose_tilebased_v85 as diagnostic
+    data=tmp_path/'data';data.mkdir();fixture_export(data)
+    cells=query_cells([0,0],[19,19],20)
+    entries=[dict(row=r,column=c,terrain='grass',cost=1.5) for r,c in cells]
+    cell=dict(sample_id='fixture',probe='cells',image_condition='original',backend='native',
+              model_answer=json.dumps(entries),prompt=build_cells_prompt('pkmn',cells,PKMN_LEGEND),
+              status='model_failure',error='expected one cells entry per query')
+    matrix=dict(sample_id='fixture',probe='matrix',image_condition='original',backend='native',
+                model_answer='invalid',status='model_failure',error='original matrix error')
+    source=tmp_path/'input.jsonl'
+    original=''.join(json.dumps(r)+'\n' for r in [cell,matrix]);source.write_text(original)
+    def no_model(*args,**kwargs):raise AssertionError('must not load a VLM for offline scoring')
+    monkeypatch.setattr(diagnostic,'FrozenQwen3VLPrunableBackbone',no_model)
+    out=tmp_path/'rescored'
+    monkeypatch.setattr(sys,'argv',['diagnose','--data',str(data),'--split','train',
+        '--rescore-from',str(source),'--output',str(out)])
+    diagnostic.main()
+    scored=[json.loads(x) for x in (out/'outcomes.jsonl').read_text().splitlines()]
+    assert source.read_text()==original and scored[1]==matrix
+    assert scored[0]['model_answer']==cell['model_answer']
+    assert scored[0]['previous_scoring']['status']=='model_failure'
+    assert scored[0]['status']=='success' and scored[0]['cell_accuracy']==0
+    summary=json.loads((out/'summary.json').read_text())['cells/original/native']
+    assert summary['success_rate']==1 and summary['strict_format_success_rate']==0
+    assert summary['normalized_outer_format_samples']==1

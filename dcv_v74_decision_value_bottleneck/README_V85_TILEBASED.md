@@ -53,7 +53,25 @@ python diagnose_tilebased_v85.py \
 3. 局部识别较好但完整矩阵常数化、行列错误或截断明显，说明完整矩阵建模/序列化仍是瓶颈。
 4. Full 的成本识别和路径质量达到可用水平后，再比较训练后的 selector 与同预算 random。
 
-`cells` 的 `cell_accuracy_successful` 是格式合法输出中、查询格子的成本准确率；unknown 计错。
+诊断 v2 区分外层格式合规与内容可评分：返回裸数组 `[...]` 时，仍严格验证每个格子的
+字段、顺序、坐标、数量及成本，然后计算识别准确率；`strict_format_valid=false` 和
+`format_normalization=bare_list_to_cells` 明确记录缺少 `{"cells":...}` 包装。
+`success_rate` 在 cells 中表示内容可评分率；`strict_format_success_rate` 才是严格格式合规率。
+这只影响局部诊断，正式矩阵建模的校验和奖励完全不变。
+
+已有诊断日志可离线重评分，无需 VLM 权重、Transformers 或 CUDA（读取器仍需 PyTorch）：
+
+```bash
+python diagnose_tilebased_v85.py \
+  --data /data/v85_tilebased/pkmn --split val \
+  --rescore-from results/tilebased_diagnostics_r1/outcomes.jsonl \
+  --output results/tilebased_diagnostics_rescored_r2
+```
+
+原始日志不覆盖；新日志保留原回答、`previous_scoring` 及旧矩阵结果。
+查询坐标会与数据集中相应任务核对。v2 的新生成提示词也显式展示完整 JSON 包装。
+
+`cells` 的 `cell_accuracy_successful` 是内容可评分输出中、查询格子的成本准确率；unknown 计错。
 `known_fraction_successful` 是非空回答比例，不等于正确率。这里不将地形名称当作人工语义 GT。
 矩阵 `cost_cell_accuracy_successful` 在全部地形格上计算；`cost_mae_successful` 是平均成本绝对误差。
 `same_path_as_uniform_cost` 表示与统一成本 Dijkstra 返回的路径完全相同，仅作诊断，不是最优性的判据。
