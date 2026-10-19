@@ -10,7 +10,7 @@ from PIL import Image
 from tilebased_core_v85 import CONTRACT, DATASETS
 
 SYSTEM_FILE = Path(__file__).resolve().parent / 'prompts/tilebased_vqa_system_v85.txt'
-QUESTIONS = '''请根据当前图片，用中文按 1—6 简短回答。每个判断都说明可见依据；没有看到就说未见明显证据，不确定就明确说明。
+QUESTIONS = '''请遵循 system 中的俯视二维像素地图设定：图像上方不是天空，阶梯状边缘是瓦片绘制特征。请根据当前图片，用中文按 1—6 简短回答。每个判断都说明可见依据；没有看到就说未见明显证据，不确定就明确说明。
 1. 概括图片包含哪些主要地表或对象，以及它们的大致分布。
 2. 是否有水域？如果有，位于哪里，呈现什么形状或纹理？
 3. 是否有浅黄色或浅棕色区域？如果有，它们更像道路、沙滩还是其他区域？说明依据和连接形状。
