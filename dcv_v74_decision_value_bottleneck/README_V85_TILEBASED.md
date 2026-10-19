@@ -9,15 +9,19 @@
 
 `vqa_tilebased_v85.py` 使用独立的 **system message** 定义俯视二维像素地图环境，
 说明水域、浅色道路/沙滩、低矮植被、树木、建筑的可能外观，并要求结合形状、纹理和上下文判断。
-这些是各地图共用的环境先验，不包含某张图的答案、GT 或成本映射。
+这些是各地图共用的环境先验，不包含某张图的答案、GT 或逐格成本。
 完整提示词在 `prompts/tilebased_vqa_system_v85.txt`，可以直接修改或用 `--system-prompt-file` 指定替代文件。
-环境提示词已强化为中文：明确没有天空或地平线、对象贴图的立体细节不改变俯视含义、
+system prompt 使用英文，角色为 navigation and optimization modeling assistant；
+包含当前基准的坐标、八邻接、累计地形成本目标及有限成本格可通行规则。
+环境说明明确：明确没有天空或地平线、对象贴图的立体细节不改变俯视含义、
 阶梯状边缘来自瓦片绘制，并区分青绿色草地、水面纹理、树冠与阴影。
 规则对所有地图通用，不指定哪张图哪里有水；空间一致性是辅助线索，不能替代当前图片的可见证据。
-这是提示词修订，尚不能声称已改善 Qwen 的识别准确率。
+system 中不再将助手永久限制为 VQA，也不全局禁止结构化建模；具体阶段和输出格式由 user 消息指定。
+文件名沿用 `tilebased_vqa_system_v85.txt`，内容可供后续导航调用复用；当前由 VQA 脚本加载，
+尚未自动改变正式 `run_tilebased_v85.py` 的建模提示词。提示词修订的识别效果仍需实测。
 
 用户消息包含原始 RGB 和六个自然语言问题：总体布局、水域、浅色区域、绿色纹理差异、建筑、模糊区域。
-模型用中文回答；不要求逐格定位、成本矩阵或 JSON。本脚本通过官方 processor 和 `model.generate` 调用冻结 Qwen，
+user 消息和回答也使用英文；VQA 阶段不要求逐格定位、成本矩阵或 JSON。本脚本通过官方 processor 和 `model.generate` 调用冻结 Qwen，
 不经过选择器或求解器。模型调用参考 [Qwen3-VL 官方 Transformers 文档](https://huggingface.co/docs/transformers/model_doc/qwen3_vl)。
 保留 processor 返回的 `mm_token_type_ids`；检查处理后的图像仍为原始 320×320 对应的网格。
 

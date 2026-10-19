@@ -10,14 +10,15 @@ from PIL import Image
 from tilebased_core_v85 import CONTRACT, DATASETS
 
 SYSTEM_FILE = Path(__file__).resolve().parent / 'prompts/tilebased_vqa_system_v85.txt'
-QUESTIONS = '''请遵循 system 中的俯视二维像素地图设定：图像上方不是天空，阶梯状边缘是瓦片绘制特征。请根据当前图片，用中文按 1—6 简短回答。每个判断都说明可见依据；没有看到就说未见明显证据，不确定就明确说明。
-1. 概括图片包含哪些主要地表或对象，以及它们的大致分布。
-2. 是否有水域？如果有，位于哪里，呈现什么形状或纹理？
-3. 是否有浅黄色或浅棕色区域？如果有，它们更像道路、沙滩还是其他区域？说明依据和连接形状。
-4. 绿色区域是否具有不同的纹理或形状？请区分你能看出的低矮地表植被、树木或其他植被；无法区分时说明。
-5. 是否有建筑或明显的人工结构？如果有，描述大致位置和外观，不要求精确计数。
-6. 哪些区域最容易混淆？说明你无法仅凭这张图确定的内容。
-这一步只描述图像，不进行路径规划，也不输出地形成本。'''
+QUESTIONS = '''Use the top-down pixel-map environment defined in the system message. For this turn, perform visual question answering only. Answer questions 1-6 briefly in English and give visible evidence for each answer. State when a feature is absent or uncertain.
+1. What major surface types and objects are visible, and where are they located?
+2. Is there water? If so, describe its location, shape, texture, and boundaries.
+3. Are there pale-yellow or tan regions? Do they look like connected paths, sand, shores, or something else? Explain using shape and surrounding features.
+4. Do the green regions differ in texture or shape? Distinguish flat ground vegetation, trees, and other vegetation where possible.
+5. Are there buildings or other artificial structures? Describe their approximate locations and visible features; exact counting is not required.
+6. Which regions or categories are ambiguous, and what cannot be determined confidently from the image?
+Describe the current image only. Do not produce a route, grid coordinates, terrain costs, an optimization model, or JSON in this VQA response.'''
+
 
 
 def load_maps(root, split, indices):
