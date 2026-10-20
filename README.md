@@ -12,6 +12,7 @@
 - `tilebased_solver_environment_v85.py`：冻结 Qwen 默认生成 S→G 通路图，稀疏 Dijkstra 求解，真实路径成本反馈；无需生成完整地形矩阵。
 - `tilebased_segments_v85.py`：默认直接输出坐标连接与成本，程序建立节点索引；流式检查重复/非法连接，保留原始 S/G、GT 和地形成本。
 - `tilebased_corridor_v85.py`：校验路标与连接、固定几何展开、通路求解及遗漏路线/成本估计误差分解。
+- `visualize_tilebased_v85.py`：离线绘制原图、实际求解路径、GT 和候选图；无需重新调用 Qwen。
 - `vqa_tilebased_v85.py`：用英文环境提示词和公开 S/G 做导航 VQA，检查连接关系、路线代价与决策相关视觉区域，保存逐任务提示词和回答。
 - `diagnose_tilebased_v85.py`：原生/自定义 Qwen 同输入对照、局部格子识别、完整矩阵诊断与可选灰图对照。
 - `run_tilebased_v85.py --mode experiment`：一次加载冻结 Qwen，完成代理预热 → 选择器梯度蒸馏 → 求解器反馈 RL；比较同预算未训练/已训练选择器及 Full 参考，记录学习曲线、调用量与耗时。Random 是可选基线。

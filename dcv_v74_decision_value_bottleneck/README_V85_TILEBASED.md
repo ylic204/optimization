@@ -27,6 +27,29 @@ python run_tilebased_v85.py --mode evaluate --split val --modes full --limit 16 
 下方一键实验直接使用新接口训练可学习选择器，并保留 Full 参考；无需重新下载或预处理。
 目前仅完成 CPU 接口和训练流程回归，未在预训练 8B 上测得性能提升。
 
+## 先看实际路径：离线可视化
+
+已有 `outcomes.jsonl` 就可以画图，无需重新运行 Qwen，也不需要 CUDA、Torch 或 Transformers；
+依赖仅为 NumPy、Pillow。请使用与这次运行对应的预处理目录及 split。
+
+```bash
+python visualize_tilebased_v85.py --data /data/v85_tilebased/pkmn --outcomes results/tilebased_segments_full_r2/outcomes.jsonl --split val --mode full --output results/tilebased_segments_full_r2/path_visualizations
+```
+
+打开输出目录中的 `index.html`，或直接看 `0000_paths.png` 等图片。
+每个样本包含四个面板：原图与公开 S/G、粉色实际求解路径、青色原始 GT、橙色候选连接及粉色所选路径。
+箭头标明行进方向，标题记录真实路径成本、GT 成本及 regret。行列坐标按格子中心映射，放大使用最近邻，
+不平滑或修改像素地图。相同成本的另一条最优路线也可以正确，不要求和 GT 形状完全一致。
+
+脚本读取日志中实际的 `path_rc`，不会从模型回答另求一条路线或修复失败。
+失败样本同样输出，并明确显示没有记录的路径。每张图附 `*_details.json`，保存实际坐标、候选图和模型原回答。
+绘图前检查图像校验和、S/G、GT、路径连续性和记录成本，防止把不同数据版本混在一起。
+水域及 wall 按本数据集有限成本规则理解，不能凭常识将其直接视为禁止区域。
+
+`--limit 0`（默认）绘制所有匹配记录；可设 `--limit 16`。可使用 `before.jsonl/distilled.jsonl/after.jsonl`，
+并相应指定 `--mode full/untrained/distilled/learned`；`--mode all` 绘制文件中所有模式。
+输出目录须新建或为空；复制整个可视化目录到本地，即可离线打开网页。
+
 ## 当前主实验：学习选择器，以更少视觉 token 完成规划
 
 使用 `--mode experiment`，一次加载冻结 Qwen，依次执行：
