@@ -1,19 +1,23 @@
 """Frozen VLM -> corridor (or legacy matrix) model -> solver -> true-cost reward."""
 import hashlib
+import inspect
 import time
 import numpy as np
 import torch
 from tilebased_core_v85 import validate_model, shortest_path, evaluate_path, matrix_diagnostics
 
 from tilebased_corridor_v85 import validate_corridor, compile_corridor, solve_corridor, corridor_evaluation
+from tilebased_segments_v85 import validate_segments, SegmentOutputGuard
 from tilebased_prompts_v85 import modeling_user_prompt, modeling_system_prompt
 
 ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_exact_mincost_v1'
 CORRIDOR_ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_sg_corridor_v1'
+SEGMENT_ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_sg_segments_v2'
 
 def environment_contract(representation):
     if representation == 'matrix':return ENVIRONMENT_CONTRACT
     if representation == 'corridor':return CORRIDOR_ENVIRONMENT_CONTRACT
+    if representation == 'segments':return SEGMENT_ENVIRONMENT_CONTRACT
     raise ValueError('unknown model representation')
 
 
@@ -59,14 +63,27 @@ class FrozenTilebasedSolverEnvironment:
                 generation_kwargs = {'system_prompt':system} if system else {}
                 self.calls['modeling_calls'] += 1
                 if hasattr(self.backbone, 'generate_selected_report'):
+                    if self.model_representation == 'segments' and 'output_guard' in inspect.signature(self.backbone.generate_selected_report).parameters:
+                        generation_kwargs['output_guard'] = SegmentOutputGuard(dataset)
                     generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                     answer = generation['text']
                     item['generation'] = {k:v for k,v in generation.items() if k != 'text'}
                 else:
                     answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                 item['model_answer'] = answer
-                if self.model_representation == 'corridor':
-                    modeled = validate_corridor(answer,dataset,source,target)
+                item['streaming_guard_enabled'] = 'output_guard' in generation_kwargs
+                finish = item.get('generation', {}).get('finish_reason')
+                if finish in ('segment_limit','invalid_segment','repeated_segment','invalid_segment_separator'):
+                    item['failure_category'] = finish
+                    raise ValueError(f'coordinate output guard stopped generation: {finish}')
+                if finish == 'length':
+                    item['failure_category'] = 'length_limit'
+                if self.model_representation in ('corridor','segments'):
+                    validator = validate_segments if self.model_representation == 'segments' else validate_corridor
+                    modeled = validator(answer,dataset,source,target)
+                    item['proposed_segment_count'] = len(modeled['edges'])
+                    item['empty_connections'] = not modeled['edges']
+                    item['constant_segment_costs'] = bool(modeled['edges']) and len({e[2] for e in modeled['edges']}) == 1
                     graph = compile_corridor(modeled)
                     item['status'] = 'solver_failure'
                     self.calls['formal_solver_calls'] += 1
@@ -81,6 +98,7 @@ class FrozenTilebasedSolverEnvironment:
                     self.calls['formal_solver_calls'] += 1
                     route = shortest_path(modeled_costs, source, target)
                 if route is None:
+                    item['failure_category'] = 'empty_connections' if item.get('empty_connections') else 'disconnected_graph'
                     raise ValueError('generated model has no S-to-G path; no fallback routing is applied')
                 # Privileged labels are accessed only AFTER generation and solving.
                 measured = evaluate_path(route, supervision['true_costs'][row].cpu().numpy(), source,
@@ -88,7 +106,7 @@ class FrozenTilebasedSolverEnvironment:
                 item.update(measured, status='success')
                 item['loss'] = min(measured['relative_regret'], self.failure_cost*.999)
                 truth = supervision['true_costs'][row].cpu().numpy()
-                if self.model_representation == 'corridor':
+                if self.model_representation in ('corridor','segments'):
                     self.calls['diagnostic_solver_calls'] += 1
                     item.update(corridor_evaluation(graph,route,estimated,truth,float(supervision['optimal_cost'][row])))
                 else:
@@ -99,6 +117,7 @@ class FrozenTilebasedSolverEnvironment:
                 item['same_path_as_uniform_cost'] = bool(np.array_equal(route, uniform))
             except (ValueError, KeyError, TypeError, OverflowError) as exc:
                 item['error'] = str(exc)
+                item.setdefault('failure_category', 'invalid_model' if item['status']=='model_failure' else 'solver_error')
             item['environment_seconds'] = time.perf_counter() - start
             results.append(item)
         return results
@@ -125,17 +144,24 @@ def summarize_outcomes(results):
             x['matrix_diagnostics']['constant_matrix'] for x in diagnostic_success]))
         for field in ('cost_cell_accuracy', 'cost_mae', 'same_path_as_uniform_cost'):
             result[field+'_successful'] = float(np.mean([x[field] for x in diagnostic_success]))
-    graph_success = [x for x in success if x.get('model_representation')=='corridor']
+    graph_success = [x for x in success if x.get('model_representation') in ('corridor','segments')]
     if graph_success:
         for field in ('estimated_path_cost','path_cost_relative_error','corridor_oracle_cost',
                       'corridor_restriction_regret','corridor_cost_model_regret',
                       'waypoint_count','segment_count','modeled_cell_count','modeled_arc_count',
                       'same_path_as_uniform_cost'):
             result[field+'_successful'] = float(np.mean([x[field] for x in graph_success]))
+        result['single_segment_rate_successful'] = float(np.mean([x['segment_count']==1 for x in graph_success]))
+        result['constant_segment_cost_rate_successful'] = float(np.mean([x['constant_segment_costs'] for x in graph_success]))
+    result['failure_categories'] = {key:sum(x.get('failure_category','unknown')==key and x['status']!='success' for x in results)
+        for key in sorted({x.get('failure_category','unknown') for x in results if x['status']!='success'})}
+    result['empty_connections_rate_all'] = sum(bool(x.get('empty_connections')) and x['status']!='success' for x in results)/len(results)
     generation = [x['generation'] for x in results if 'generation' in x]
     if generation:
         result['length_stop_rate'] = float(np.mean([x['finish_reason']=='length' for x in generation]))
         result['mean_generated_tokens'] = float(np.mean([x['generated_tokens'] for x in generation]))
+        result['generation_finish_reasons'] = {reason:sum(x['finish_reason']==reason for x in generation)
+            for reason in sorted({x['finish_reason'] for x in generation})}
     for field in ('input_tokens','nonvisual_input_tokens'):
         measured = [x[field] for x in generation if field in x]
         if measured:

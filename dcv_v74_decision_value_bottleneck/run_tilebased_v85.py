@@ -26,7 +26,8 @@ from tilebased_prompt_comparison_v85 import paired_prompt_report
 from tilebased_learning_v85 import (LearningProgress, write_json, append_json,
     read_outcomes, paired_learning_report)
 from tilebased_solver_environment_v85 import (FrozenTilebasedSolverEnvironment,
-    ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, environment_contract, summarize_outcomes)
+    ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, SEGMENT_ENVIRONMENT_CONTRACT,
+    environment_contract, summarize_outcomes)
 
 
 class TileCostHead(nn.Module):
@@ -145,7 +146,7 @@ def rl_loss(model, reference, env, encoded, selection, positions, valid, public,
         ref_scores = rollout(reference, rs, rp, rv, args)[4]
         baseline = env.evaluate(encoded, topk_region_indices(selection['logits'], valid, k), public, labels)
         initial = scores.new_tensor([x['loss'] for x in baseline])
-    rewards, logps, entropies, kls, losses = [], [], [], [], []
+    rewards, logps, entropies, kls, losses, successes = [], [], [], [], [], []
     for _ in range(args.rl_group_size):
         action, logp, entropy, kl = sample_region_action(scores, valid, k, args.rl_temperature, ref_scores)
         result = env.evaluate(encoded, action, public, labels)
@@ -153,12 +154,16 @@ def rl_loss(model, reference, env, encoded, selection, positions, valid, public,
         improvement = F.relu(task-initial+args.improve_margin)
         rewards.append(-task-args.lambda_improve*improvement)
         losses.append(task)
+        successes.append(scores.new_tensor([x['status']=='success' for x in result]))
         logps.append(logp); entropies.append(entropy/k); kls.append(kl/k)
     loss, policy, advantage = policy_gradient_loss(torch.stack(logps), torch.stack(rewards),
         torch.stack(entropies), torch.stack(kls), args.rl_kl_weight, args.rl_entropy_weight)
     return loss, {'task_loss': torch.stack(losses).mean(), 'policy_loss': policy,
                   'advantage_abs': advantage.abs().mean(),
-                  'reward_std': torch.stack(rewards).std(dim=0, unbiased=False).mean()}
+                  'reward_std': torch.stack(rewards).std(dim=0, unbiased=False).mean(),
+                  'informative_reward_group_rate': (torch.stack(rewards).amax(0)-torch.stack(rewards).amin(0)>1e-7).float().mean(),
+                  'all_samples_failed_group_rate': (torch.stack(successes).sum(0)==0).float().mean(),
+                  'sampled_success_rate': torch.stack(successes).mean()}
 
 
 @torch.no_grad()
@@ -225,7 +230,7 @@ def validate_proxy(model, loader, args, device):
 def validate_checkpoint(ckpt, dataset, args):
     if ckpt.get('contract') != CONTRACT or ckpt.get('dataset_signature') != dataset.signature:
         raise ValueError('checkpoint/data contract mismatch; legacy BEV checkpoints are not Tilebased checkpoints')
-    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT):
+    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT):
         raise ValueError('checkpoint solver environment mismatch')
     for name in ('hidden','latent_dim','mask_steps','prune_layer','max_text_length','mask_step_size'):
         if ckpt['args'][name] != getattr(args, name):
@@ -277,7 +282,7 @@ def parse_args():
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
-    p.add_argument('--model-representation', choices=['corridor','matrix'], default='corridor')
+    p.add_argument('--model-representation', choices=['segments','corridor','matrix'], default='segments')
     p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
     p.add_argument('--compare-prompts', action='store_true', help='evaluate legacy/navigation on identical selected regions in one run')
     p.add_argument('--lr', type=float, default=2e-4)

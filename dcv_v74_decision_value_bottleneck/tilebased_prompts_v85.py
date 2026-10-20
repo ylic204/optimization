@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 from tilebased_core_v85 import DATASETS, build_model_prompt
 from tilebased_corridor_v85 import CORRIDOR_SCHEMA, MAX_NODES, MAX_EDGES
+from tilebased_segments_v85 import SEGMENT_SCHEMA
 
 SYSTEM_FILE = Path(__file__).resolve().parent/'prompts/tilebased_vqa_system_v85.txt'
 
@@ -22,6 +23,10 @@ def modeling_system_prompt(variant, dataset):
 
 def modeling_user_prompt(variant, task, dataset, source, target, indices, region_grid, legend,
                          model_representation='matrix'):
+    if model_representation == 'segments':
+        if variant not in ('legacy','navigation'):
+            raise ValueError('unknown prompt variant')
+        return segments_user_prompt(task,dataset,source,target,indices,region_grid,legend)
     if model_representation == 'corridor':
         if variant not in ('legacy','navigation'):
             raise ValueError('unknown prompt variant')
@@ -86,3 +91,31 @@ def corridor_user_prompt(task, dataset, source, target, indices, region_grid, le
         "No off-graph connections or hidden ground-truth routing will be added. Supply a connected S-to-G graph. "
         "If S equals G, use one node and an empty edge list. Output JSON only: no node_costs matrix, no path_rc, "
         "no executable code and no extra keys.")
+
+
+def segments_user_prompt(task, dataset, source, target, indices, region_grid, legend):
+    n = DATASETS[dataset]['grid']; side = DATASETS[dataset]['image_side']
+    low,high = min(DATASETS[dataset]['cost_values']),max(DATASETS[dataset]['cost_values'])
+    chosen = sorted(map(int,indices))
+    regions = ('All visual regions are retained.' if chosen == list(range(region_grid**2)) else
+               f'Retained regions on the original {region_grid}x{region_grid} row-major visual grid: {chosen}. '
+               'These are visual regions, not terrain cells. Missing appearance is unknown; use estimates without claiming observation.')
+    return (f'{task}\nThe RGB image is {side}x{side}; each terrain cell is {side//n}x{side//n} pixels. '
+        f'S/G are supplied coordinates and may not be drawn. {regions}\n'
+        f'Terrain costs: {legend}\n'
+        'Build a small spatial connection graph for the minimum-cost solver. '
+        'Include useful turns and alternatives supported by the image, especially detours around expensive terrain. '
+        'Use long straight connections within similar terrain; split at turns or cost changes, not at every cell. '
+        'Use original [row,column] coordinates directly, never node IDs. The solver will choose the route. '
+        'Do not reconstruct a full cost matrix.\n'
+        f'Return one JSON object: schema="{SEGMENT_SCHEMA}", source_rc={list(map(int,source))}, '
+        f'target_rc={list(map(int,target))}, source_cost=<estimated start-cell cost>, segments=[...]. '
+        'Each segment is {"from_rc":[row,column],"to_rc":[row,column],"mean_cost":number}. '
+        'It connects its two cell centers by straight eight-neighbor steps, in the stated direction. '
+        'mean_cost is the average cost per entered cell on that connection, excluding its departure cell. '
+        f'Cost estimates must be finite numbers in [{low},{high}]. The solver counts the start cost once. '
+        'Connect turns by using exactly the same endpoint coordinates. Keep the cost differences visible in the image; '
+        'do not assign one default cost to every connection. '
+        'Use an empty segments list only when S=G or you cannot propose any connection; an unconnected S/G graph fails. '
+        f'At most {MAX_EDGES} segments; do not repeat a directed connection. '
+        'End the JSON immediately after your finite connection list. No explanation, node list, or numbered edges.')

@@ -5,6 +5,28 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
+## 本轮修复：直接输出坐标连接，减少无关的格式负担
+
+默认切换为 `--model-representation segments`（`tilebased_sg_segments_v2`）。
+Qwen 输出连接两端的原图坐标及成本，程序建立内部节点索引；不再要求模型遵守“G 必须是节点 1”。
+它仍建模 S→G 的候选连接，由求解器选择路径，不生成完整地形矩阵。
+Full、未训练及已训练选择器使用同一表示、环境提示词和生成停止规则。
+
+生成器在完整 JSON 出现时停止；已完整输出的连接若坐标非法、重复或超过 64 条，也提前停止并记失败。
+这是流式检查，**不是保证合法输出的约束解码，也不补全缺失连接或调用 GT 修复路径**。
+不改变原始数据、S/G、GT、成本和损失；已有预处理结果可直接使用。
+旧编号表示可用 `--model-representation corridor` 复现，旧完整矩阵用 `matrix`。
+旧检查点可作为迁移初始化，日志记录来源表示；不能视为已在新表示下训练。
+
+可先在此前相同的 16 个 val 查询运行 Full，观察格式失败和成本误差是否降低：
+
+```bash
+python run_tilebased_v85.py --mode evaluate --split val --modes full --limit 16 --data /data/v85_tilebased/pkmn --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct --device cuda:0 --load-4bit --model-representation segments --modeling-max-new-tokens 4096 --seed 1234 --output results/tilebased_segments_full_r2
+```
+
+下方一键实验直接使用新接口训练可学习选择器，并保留 Full 参考；无需重新下载或预处理。
+目前仅完成 CPU 接口和训练流程回归，未在预训练 8B 上测得性能提升。
+
 ## 当前主实验：学习选择器，以更少视觉 token 完成规划
 
 使用 `--mode experiment`，一次加载冻结 Qwen，依次执行：
@@ -33,11 +55,11 @@ python run_tilebased_v85.py \
   --metric-epochs 3 --distill-epochs 3 --rl-epochs 2 \
   --rl-group-size 2 --budget 0.15 --seed 1234 \
   --modeling-max-new-tokens 4096 \
-  --output results/tilebased_selector_learning_r1
+  --output results/tilebased_selector_learning_r2
 ```
 
 保持已有模型精度；未量化则去掉 `--load-4bit`。输出目录必须新建或为空。
-默认 `--model-representation corridor --modeling-prompt navigation`，不生成完整地形矩阵。
+默认 `--model-representation segments --modeling-prompt navigation`，不生成完整地形矩阵。
 `--limit` 为 train 任务数，`--rl-limit` 为其中用于昂贵 RL 的前 N 个任务，`--val-limit` 为独立 val 查询数。
 取预先确定的清单前缀，不按 GT、路径差异或运行结果筛选；训练时打乱顺序。0 表示不限制。
 `--metric-epochs/--distill-epochs/--rl-epochs` 控制一键实验，`--epochs` 仅控制单阶段训练。
@@ -64,6 +86,9 @@ python run_tilebased_v85.py \
 固定 `--budget 0.15` 对应保留 15/100 个视觉 token；预算满足是机制保证，**任务质量保持需要实测**。
 不要只凭 token 减少、格式成功率或训练 loss 下降宣称有效。
 
+新增 RL 指标 `informative_reward_group_rate` 统计采样组内奖励有差异的比例，
+`all_samples_failed_group_rate` 统计采样全部失败的组比例，`sampled_success_rate` 统计采样建模求解成功率。
+它们与 `reward_std/advantage_abs` 一起判断真实任务反馈是否提供学习信号。
 `reward_std`、`advantage_abs` 若在 RL 中长期为 0，表示采样集合没有产生可区分的奖励；
 即使 KL/熵正则仍更新参数，也不能称为学到了任务有效的选择。
 `progress` 将代理头与选择器的优化步分开，训练和验证的建模调用/正式求解调用/诊断求解调用也分开。
@@ -80,11 +105,11 @@ RL 的 step 0 蒸馏权重也参与 val 检查点选择；若 RL 没有严格降
 ```bash
 python run_tilebased_v85.py \
   --mode evaluate --split test --modes full learned \
-  --checkpoint results/tilebased_selector_learning_r1/rl/best.pt \
+  --checkpoint results/tilebased_selector_learning_r2/rl/best.pt \
   --data /data/v85_tilebased/pkmn \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
   --device cuda:0 --load-4bit --budget 0.15 \
-  --output results/tilebased_selector_test_r1
+  --output results/tilebased_selector_test_r2
 ```
 
 如要在 test 比较未训练权重，用 `untrained.pt` 另开输出目录并评估 `--modes learned`；
@@ -93,19 +118,25 @@ python run_tilebased_v85.py \
 
 ## 默认规划表示：围绕 S→G 建立通路图
 
-**VLM 输出什么？** `tilebased_sg_corridor_v1` 包含六个字段：
+**VLM 输出什么？** `tilebased_sg_segments_v2` 包含五个字段：
 
 | 字段 | 含义 |
 |---|---|
-| `schema` | `tilebased_sg_corridor_v1` |
-| `source_rc`, `target_rc` | 公开 S/G，零起始行列坐标 |
+| `schema` | `tilebased_sg_segments_v2` |
+| `source_rc`, `target_rc` | 数据集的公开 S/G，零起始 `[row,column]` |
 | `source_cost` | 对起点成本的估计，只计一次 |
-| `nodes_rc` | 少量路标点，0 为 S，1 为 G，其余可放在转折、连接点或成本变化处 |
-| `edges` | `[起点编号, 终点编号, 平均到达成本]` 的有向连接列表 |
+| `segments` | 有向连接，每条含 `from_rc`、`to_rc`、`mean_cost` |
 
-图中可以包含多条备选通路及共享连接，求解器决定最终路径；不要求 VLM 输出完整路线或 400 个成本格子。
-最多 32 个路标和 64 条连接是输出 schema 的大小限制，不是导航任务的新资源约束。
-可只输出一个有证据支持的通路，不强制凑出多条；遗漏有价值备选路线会体现在最终 regret 中。
+格式示例（坐标及成本仅为示意，不是某张数据集图片的 GT）：
+
+```json
+{"schema":"tilebased_sg_segments_v2","source_rc":[2,3],"target_rc":[8,9],"source_cost":1.5,"segments":[{"from_rc":[2,3],"to_rc":[2,9],"mean_cost":1.5},{"from_rc":[2,9],"to_rc":[8,9],"mean_cost":2.0}]}
+```
+
+相邻连接在相同坐标衔接，程序自行编号。图中可以包含备选通路及共享连接，求解器决定最终路径。
+最多 64 条连接是输出大小限制，不是导航任务的资源约束。无需输出每个地形格。
+可只输出一条有证据支持的通路，不强制凑出多条；遗漏有价值的备选路线会体现在 regret 中。
+旧 `corridor` 表示仍使用 `nodes_rc/edges`、32 个节点上限及节点 0=S、1=G，只有显式选择旧表示才适用。
 
 **如何得到实际路径？** 两个路标间的连接是直线段，沿较长轴用最近整数插值展开成八邻接步；
 正反方向使用同一规范端点次序，半整数向上取整。转弯和成本变化用额外路标表达。
@@ -122,6 +153,9 @@ python run_tilebased_v85.py \
 **评价与训练反馈：** 生成路线后才读取完整 GT 成本，计算真实路径成本、最优率、相对 regret 和原有失败惩罚。
 主要结果仍是最终任务质量与视觉预算；不再要求完整矩阵准确率。日志另记录：
 
+- `failure_categories/generation_finish_reasons`：失败原因及 EOS、完整 JSON、重复连接、长度上限等停止原因的计数。
+- `single_segment_rate_successful/constant_segment_cost_rate_successful`：成功图是否退化为单连接或所有连接成本相同；它们是诊断量，不自动判错。
+- `empty_connections_rate_all`：空连接且失败的样本数除以全部样本数。
 - `compiled_graph`：实际送入求解器的空间节点、单位连接和预测成本。
 - `corridor_restriction_regret`：在生成通路图内使用真实成本所得最优值，相对完整 GT 最优值的差距。
 - `corridor_cost_model_regret`：实际所选路径相对上述通路图内最优值的差距。
@@ -357,6 +391,13 @@ python diagnose_tilebased_v85.py \
   sand/stairs=1, grass=1.5, snow=1.8, dirt=2, leaves=2.5,
   plants=3.5, lake=6, mud=8, ocean=10, wall=25。
 
+**S/G 没有重新指定。** 预处理按原始 `sources/targets` 配对，并恢复对应的 `paths`。
+原图没有必然可见的 S/G 标记，端点由任务文本给出；可视化叠加标记不改变原始坐标。
+水域成本是有限的，原始采样也允许水域端点，因此 G 在水中不代表预处理错误。
+不能把真实成本中的水域临时改成不可通行，否则原始任务及 GT 将不再对应。
+上游部分注释把 wall 称为不可通行，但发布的部分路径经过 wall；此适配以已验证的数组与求解协议为准，
+不把本基准成功率解释成现实中的避障安全率。
+
 求解规则核对来源：
 <https://github.com/archettialberto/neural_weighted_a_star/blob/main/a_star/ray_a_star.py>
 和同仓库 `a_star/neighbor_utils.py`。
@@ -435,7 +476,7 @@ print(labels['optimal_cost'])
 
 ## 5. 冻结模型与求解器
 
-默认生成 `tilebased_sg_corridor_v1`，字段和几何规则见本文开头。VLM 根据当前任务和保留视觉信息，
+默认生成 `tilebased_sg_segments_v2`，字段和几何规则见本文开头。VLM 根据当前任务和保留视觉信息，
 提出空间连接及成本估计；稀疏 Dijkstra 在生成的通路子图上求解，随后才读取完整标签评价。
 `--model-representation matrix` 保留旧 `tilebased_node_cost_path_v1`，仅用于复现旧实验。
 解析器均拒绝额外字段、重复键、非有限值及非法坐标，不执行模型生成的代码。
@@ -527,11 +568,13 @@ DGD/FM 监督的对象是 mask 更新方向，不是 GT 路径的 flow matching�
 
 ## 8. 验证
 
-本次一键学习实验更新通过 41 项 CPU 测试（`test_v85_tilebased_learning.py`、
-`test_v85_tilebased.py`、`test_v85_tilebased_corridor.py`、`test_v85_tilebased_prompts.py`、
-`test_v85_tilebased_vqa.py`）。包含真实三阶段优化器更新、Qwen 冻结、代理头冻结、同预算配对、
-失败样本保留、正式/诊断调用计数、最佳权重恢复及 RL 无改善时保留蒸馏权重。
-这是小型冻结生成替身与实际 Dijkstra 的流程验证，**尚未在 Qwen3-VL-8B 上运行这轮训练，无提升数值**。
+本轮通过 57 项 CPU 测试，涉及 `test_v85_tilebased_segments.py`、
+`test_v85_tilebased_learning.py`、`test_v85_tilebased.py`、`test_v85_tilebased_corridor.py`、
+`test_v85_tilebased_prompts.py` 和 `test_v85_tilebased_vqa.py`。
+覆盖直接坐标建模、重复/非法连接停止、完整 JSON 停止、GT 隔离、实际稀疏求解及 RL 梯度，
+并回归一键三阶段训练、冻结参数、固定预算、最佳检查点恢复和旧表示。
+解码测试用替身语言模型执行实际自定义解码循环；没有加载预训练 Qwen3-VL-8B。
+**这些是接口与训练流程测试，不是识别准确率、训练提升或实际加速结果。**
 以下为更广的历史回归套件，部分测试需要 Transformers：
 
 ```bash

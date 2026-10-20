@@ -457,7 +457,7 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
         return self.generate_selected_report(vision_state, indices, prompt, max_new_tokens, system_prompt)["text"]
 
     @torch.no_grad()
-    def generate_selected_report(self, vision_state, indices, prompt, max_new_tokens=1536, system_prompt=None):
+    def generate_selected_report(self, vision_state, indices, prompt, max_new_tokens=1536, system_prompt=None, output_guard=None):
         """Greedy frozen decoding using K physically gathered visual groups.
 
         No full-image generation fallback is used. Prefill receives DeepStack
@@ -486,6 +486,11 @@ class FrozenQwen3VLPrunableBackbone(nn.Module):
                 finish_reason = "eos"
                 break
             generated.append(value)
+            if output_guard is not None:
+                reason = output_guard(self.processor.tokenizer.decode(generated, skip_special_tokens=True))
+                if reason:
+                    finish_reason = reason
+                    break
             if step == max_new_tokens - 1:
                 break
             attention = torch.cat([attention, torch.ones_like(token)], -1)

@@ -164,5 +164,30 @@
       "No test split opened during training/validation; standalone CLI stages and prompt comparisons remain compatible"
     ],
     "actual_8b_training": "Not run: no server Qwen3-VL-8B weights or GPU here. Tests use a frozen generation double with actual solver; no performance or convergence claim."
+  },
+  "coordinate_segments_validation": {
+    "date": "2026-10-20",
+    "tests_passed": 57,
+    "files": [
+      "test_v85_tilebased_segments.py",
+      "test_v85_tilebased_learning.py",
+      "test_v85_tilebased.py",
+      "test_v85_tilebased_corridor.py",
+      "test_v85_tilebased_prompts.py",
+      "test_v85_tilebased_vqa.py"
+    ],
+    "new_default": "--model-representation segments --modeling-prompt navigation",
+    "checks": [
+      "Coordinate connections without model-generated node IDs; no missing-edge completion or GT-assisted routing",
+      "Reject malformed coordinates including mixed booleans, duplicates and nonfinite costs",
+      "Streaming guard exercised through actual custom decode loop with a fake language model",
+      "Actual graph solver and RL gradient; informative reward and all-failure group statistics",
+      "One-command learning pipeline and legacy representations remain compatible"
+    ],
+    "limitations": [
+      "No pretrained Qwen3-VL-8B/GPU run or performance improvement claim",
+      "Streaming guard detects certain invalid outputs; it is not grammar-constrained decoding",
+      "Original dataset endpoints, GT and costs unchanged"
+    ]
   }
 }

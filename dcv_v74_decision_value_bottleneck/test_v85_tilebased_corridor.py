@@ -123,7 +123,7 @@ def test_corridor_rl_backpropagates_only_into_selector_and_flow():
     assert all(p.grad is None for p in model.metric_head.parameters())
 
 
-def test_default_cli_is_corridor_and_full_random_share_prompt_rules(tmp_path,monkeypatch):
+def test_legacy_corridor_cli_and_full_random_share_prompt_rules(tmp_path,monkeypatch):
     import run_tilebased_v85 as runner
     data=tmp_path/'data';data.mkdir();fixture_export(data)
     def build(args,device):
@@ -135,7 +135,7 @@ def test_default_cli_is_corridor_and_full_random_share_prompt_rules(tmp_path,mon
     monkeypatch.setattr(runner,'build_v85_model',build)
     out=tmp_path/'result'
     monkeypatch.setattr(sys,'argv',['run','--mode','evaluate','--data',str(data),'--split','train',
-        '--vlm-model','test-double','--device','cpu','--output',str(out),'--modes','full','random'])
+        '--vlm-model','test-double','--model-representation','corridor','--device','cpu','--output',str(out),'--modes','full','random'])
     runner.main()
     rows=[json.loads(s) for s in (out/'outcomes.jsonl').read_text().splitlines()]
     assert len(rows)==2 and rows[0]['system_prompt']==rows[1]['system_prompt']

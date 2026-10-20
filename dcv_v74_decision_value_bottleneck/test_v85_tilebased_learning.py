@@ -7,7 +7,7 @@ import pytest
 import torch
 from test_v85_tilebased import setup_tiny, fixture_export
 from run_tilebased_v85 import encode
-from tilebased_corridor_v85 import CORRIDOR_SCHEMA
+from tilebased_segments_v85 import SEGMENT_SCHEMA
 from tilebased_learning_v85 import paired_learning_report, LearningProgress
 from tilebased_solver_environment_v85 import FrozenTilebasedSolverEnvironment
 
@@ -64,8 +64,9 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
         model.backbone.features = torch.randn(1, 100, 8)
         model.backbone.target_image_side = 320
         model.backbone.text_hidden_dim = 8
-        model.backbone.answer = json.dumps(dict(schema=CORRIDOR_SCHEMA, source_rc=[0,0],
-            target_rc=[19,19], source_cost=1, nodes_rc=[[0,0],[19,19]], edges=[[0,1,1]]))
+        model.backbone.answer = json.dumps(dict(schema=SEGMENT_SCHEMA, source_rc=[0,0],
+            target_rc=[19,19], source_cost=1,
+            segments=[dict(from_rc=[0,0],to_rc=[19,19],mean_cost=1)]))
         frozen.update(copy.deepcopy(model.backbone.state_dict()))
         builds.append(model)
         return model
@@ -114,3 +115,7 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
     assert curve[-1]['progress']['optimizer_steps'] == 3
     updates = [json.loads(line) for line in (out/'rl/updates.jsonl').read_text().splitlines()]
     assert updates[0]['metrics']['reward_std'] == updates[0]['metrics']['advantage_abs'] == 0
+    assert updates[0]['metrics']['informative_reward_group_rate'] == 0
+    assert updates[0]['metrics']['all_samples_failed_group_rate'] == 0
+    assert updates[0]['metrics']['sampled_success_rate'] == 1
+    assert json.loads((out/'args.json').read_text())['model_representation'] == 'segments'
