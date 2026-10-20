@@ -13,7 +13,8 @@
 - `tilebased_corridor_v85.py`：校验路标与连接、固定几何展开、通路求解及遗漏路线/成本估计误差分解。
 - `vqa_tilebased_v85.py`：用英文环境提示词和公开 S/G 做导航 VQA，检查连接关系、路线代价与决策相关视觉区域，保存逐任务提示词和回答。
 - `diagnose_tilebased_v85.py`：原生/自定义 Qwen 同输入对照、局部格子识别、完整矩阵诊断与可选灰图对照。
-- `run_tilebased_v85.py`：复用 V8.5 selector/固定步 FM-ND/RL，正式建模默认接入英文导航环境提示词；`--compare-prompts` 在相同视觉选择下配对评估新旧提示词。
+- `run_tilebased_v85.py --mode experiment`：一次加载冻结 Qwen，完成代理预热 → 选择器梯度蒸馏 → 求解器反馈 RL；比较同预算未训练/已训练选择器及 Full 参考，记录学习曲线、调用量与耗时。Random 是可选基线。
+- `tilebased_learning_v85.py`：失败感知的任务配对比较、训练/验证调用计数与学习开销记录。
 
 **完整下载、预处理、模型调用和训练命令：
 [README_V85_TILEBASED.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED.md)。**

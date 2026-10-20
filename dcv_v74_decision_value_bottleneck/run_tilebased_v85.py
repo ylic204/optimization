@@ -2,6 +2,7 @@
 
 metric/distill use an explicitly labeled differentiable path-cost surrogate.
 rl/evaluate ALWAYS generate JSON with frozen Qwen and call the exact solver.
+experiment trains all three stages and compares untrained/trained selectors.
 """
 import argparse
 import copy
@@ -22,6 +23,8 @@ from planning_dataset_tilebased_v85 import TilebasedDatasetV85
 from tilebased_core_v85 import CONTRACT, shortest_path, path_cost
 from tilebased_prompts_v85 import prompt_metadata
 from tilebased_prompt_comparison_v85 import paired_prompt_report
+from tilebased_learning_v85 import (LearningProgress, write_json, append_json,
+    read_outcomes, paired_learning_report)
 from tilebased_solver_environment_v85 import (FrozenTilebasedSolverEnvironment,
     ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, environment_contract, summarize_outcomes)
 
@@ -154,7 +157,8 @@ def rl_loss(model, reference, env, encoded, selection, positions, valid, public,
     loss, policy, advantage = policy_gradient_loss(torch.stack(logps), torch.stack(rewards),
         torch.stack(entropies), torch.stack(kls), args.rl_kl_weight, args.rl_entropy_weight)
     return loss, {'task_loss': torch.stack(losses).mean(), 'policy_loss': policy,
-                  'advantage_abs': advantage.abs().mean()}
+                  'advantage_abs': advantage.abs().mean(),
+                  'reward_std': torch.stack(rewards).std(dim=0, unbiased=False).mean()}
 
 
 @torch.no_grad()
@@ -175,6 +179,8 @@ def evaluate(model, loader, env, args, device, modes, path):
                        'random': topk_region_indices(torch.rand(valid.shape, device=device, generator=generator),valid,k),
                        'initial': topk_region_indices(selection['logits'],valid,k),
                        'learned': topk_region_indices(scores,valid,k)}
+            # Stage labels used only when the experiment holds those weights.
+            subsets['untrained'] = subsets['distilled'] = subsets['learned']
             # Same encoded image, endpoints and chosen regions in both arms.
             # Alternate arm order across batches to reduce systematic timing bias.
             variants = list(environments)
@@ -231,7 +237,7 @@ def validate_checkpoint(ckpt, dataset, args):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--mode', choices=['metric','distill','rl','evaluate'], required=True)
+    p.add_argument('--mode', choices=['experiment','metric','distill','rl','evaluate'], required=True)
     p.add_argument('--data', required=True, help='preprocessed root containing dataset.json')
     p.add_argument('--vlm-model', required=True)
     p.add_argument('--device', default='cuda:0')
@@ -243,6 +249,12 @@ def parse_args():
     p.add_argument('--limit', type=int, default=0, help='training/evaluation tasks; 0=all')
     p.add_argument('--val-limit', type=int, default=0)
     p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--metric-epochs', type=int, default=3, help='experiment only')
+    p.add_argument('--distill-epochs', type=int, default=3, help='experiment only')
+    p.add_argument('--rl-epochs', type=int, default=2, help='experiment only')
+    p.add_argument('--rl-limit', type=int, default=0, help='experiment: first N tasks of the training subset for expensive RL; 0=all')
+    p.add_argument('--reference-modes', nargs='*', choices=['full','random'], default=['full'],
+                   help='experiment references; untrained/learned comparison is always run')
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--workers', type=int, default=0)
     p.add_argument('--budget', type=float, default=.15)
@@ -276,8 +288,14 @@ def parse_args():
         p.error('budget must be (0,1]; positive batch/epochs/mask-steps and group-size>=2 required')
     if min(a.teacher_step_size,a.decision_temperature,a.mask_step_size,a.mask_temperature,a.rl_temperature,a.lr,a.grad_clip) <= 0:
         p.error('temperatures, step sizes, learning rate and grad clip must be positive')
-    if min(a.limit,a.val_limit,a.improve_margin) < 0:
+    if min(a.limit,a.val_limit,a.rl_limit,a.improve_margin) < 0:
         p.error('limits and improvement margin must be nonnegative')
+    if min(a.metric_epochs,a.distill_epochs,a.rl_epochs) <= 0:
+        p.error('experiment stage epochs must be positive')
+    if len(set(a.reference_modes)) != len(a.reference_modes):
+        p.error('reference modes must be unique')
+    if a.mode == 'experiment' and a.checkpoint:
+        p.error('experiment starts from scratch to measure untrained vs trained; use individual stages for checkpoint initialization')
     if a.compare_prompts and a.mode != 'evaluate':
         p.error('--compare-prompts is evaluation only')
     if a.compare_prompts and len(set(a.modes)) != len(a.modes):
@@ -332,6 +350,36 @@ def main():
         print(json.dumps(report,indent=2)); return
     validation_data = TilebasedDatasetV85(args.data,'val',args.val_limit)
     validation_loader = DataLoader(validation_data,batch_size=args.batch,num_workers=args.workers)
+    if args.mode == 'experiment':
+        run_experiment(model, loader, validation_loader, env, args, device, output)
+    else:
+        train_stage(model, loader, validation_loader, env, args, device, output, LearningProgress())
+
+
+def save_checkpoint(model, dataset, args, path, epoch, report, progress):
+    saved = {name:getattr(model,name).state_dict() for name in ('selector','mask_flow','metric_head')}
+    saved.update(contract=CONTRACT, environment=environment_contract(args.model_representation),
+                 dataset_signature=dataset.signature, stage=args.mode, args=vars(args).copy(),
+                 epoch=epoch, validation=report, progress=progress.snapshot())
+    torch.save(saved, path)
+
+
+def load_stage_weights(model, path):
+    saved = torch.load(path, map_location='cpu', weights_only=True)
+    for name in ('selector','mask_flow','metric_head'):
+        getattr(model, name).load_state_dict(saved[name])
+    return saved
+
+
+def train_stage(model, loader, validation_loader, env, args, device, output, progress,
+                initial_validation=None, curve_path=None):
+    """Train only stage parameters; retain best AND last, return best metadata.
+
+    In the pipeline RL starts with the distilled validation as its step-zero
+    candidate. If RL does not improve it, best.pt explicitly keeps stage=distill.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    write_json(output/'args.json', vars(args))
     model.metric_head.requires_grad_(args.mode=='metric')
     model.selector.requires_grad_(args.mode!='metric')
     model.mask_flow.requires_grad_(args.mode!='metric')
@@ -342,46 +390,117 @@ def main():
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(parameters,lr=args.lr)
     best = float('inf')
+    if initial_validation is not None:
+        best = initial_validation['task_loss']
+        initial_args = copy.copy(args)
+        initial_args.mode = 'distill'
+        save_checkpoint(model, loader.dataset, initial_args, output/'best.pt', 0,
+                        {'learned':initial_validation}, progress)
     for epoch in range(args.epochs):
         model.eval()
         (model.metric_head if args.mode=='metric' else model.selector).train()
         if args.mode!='metric': model.mask_flow.train()
         logs = []
         for raw in tqdm(loader,desc=f'Tilebased {args.mode} {epoch+1}'):
-            batch = to_device(raw,device)
-            public, labels = batch['public_inputs'],batch['supervision']
-            encoded,selection,positions,valid = encode(model,public,args.budget)
-            if args.mode == 'metric':
-                k = max(1,round(args.budget*valid.shape[1]))
-                indices = topk_region_indices(torch.rand(valid.shape,device=device),valid,k)
-                with torch.no_grad():
-                    full = model.fuse_mask(encoded,torch.ones_like(selection['logits']))
-                    sparse = model.fuse_indices(encoded,indices)
-                target = torch.log(labels['true_costs'])
-                loss = .5*(F.smooth_l1_loss(torch.log(model.metric_head(full)),target)+
-                           F.smooth_l1_loss(torch.log(model.metric_head(sparse)),target))
-                metrics = {'cost_regression':loss}
-            elif args.mode == 'distill':
-                loss,metrics = distill_loss(model,encoded,selection,positions,valid,labels,proxy_paths(public,labels),args)
-            else:
-                loss,metrics = rl_loss(model,reference,env,encoded,selection,positions,valid,public,labels,args)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters,args.grad_clip)
-            optimizer.step()
-            logs.append({k:float(v.detach()) for k,v in dict(metrics,loss=loss).items()})
-        report = (evaluate(model,validation_loader,env,args,device,['learned'],output/f'val_{epoch+1}.jsonl')
-                  if args.mode=='rl' else validate_proxy(model,validation_loader,args,device))
+            with progress.measure(env, 'training'):
+                batch = to_device(raw,device)
+                public, labels = batch['public_inputs'],batch['supervision']
+                encoded,selection,positions,valid = encode(model,public,args.budget)
+                if args.mode == 'metric':
+                    k = max(1,round(args.budget*valid.shape[1]))
+                    indices = topk_region_indices(torch.rand(valid.shape,device=device),valid,k)
+                    with torch.no_grad():
+                        full = model.fuse_mask(encoded,torch.ones_like(selection['logits']))
+                        sparse = model.fuse_indices(encoded,indices)
+                    target = torch.log(labels['true_costs'])
+                    loss = .5*(F.smooth_l1_loss(torch.log(model.metric_head(full)),target)+
+                               F.smooth_l1_loss(torch.log(model.metric_head(sparse)),target))
+                    metrics = {'cost_regression':loss}
+                elif args.mode == 'distill':
+                    loss,metrics = distill_loss(model,encoded,selection,positions,valid,labels,proxy_paths(public,labels),args)
+                else:
+                    loss,metrics = rl_loss(model,reference,env,encoded,selection,positions,valid,public,labels,args)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f'nonfinite {args.mode} loss; refusing to update weights')
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(parameters,args.grad_clip,error_if_nonfinite=True)
+                optimizer.step()
+                progress.step(args.mode, len(public['image']))
+                logs.append({k:float(v.detach()) for k,v in dict(metrics,loss=loss,grad_norm=grad_norm).items()})
+            append_json(output/'updates.jsonl', dict(stage=args.mode, epoch=epoch+1,
+                        metrics=logs[-1], progress=progress.snapshot()))
+        with progress.measure(env, 'evaluation'):
+            report = (evaluate(model,validation_loader,env,args,device,['learned'],output/f'val_{epoch+1}.jsonl')
+                      if args.mode=='rl' else validate_proxy(model,validation_loader,args,device))
         score = report['learned']['task_loss'] if args.mode=='rl' else report['proxy_validation_loss']
-        entry = {'epoch':epoch+1,'train':{k:float(np.mean([x[k] for x in logs])) for k in logs[0]},'validation':report}
-        with (output/'metrics.jsonl').open('a') as stream:stream.write(json.dumps(entry)+'\n')
+        if not np.isfinite(score):
+            raise FloatingPointError('nonfinite validation loss; refusing to select a checkpoint')
+        entry = {'stage':args.mode, 'epoch':epoch+1,
+                 'train':{k:float(np.mean([x[k] for x in logs])) for k in logs[0]},
+                 'validation':report, 'progress':progress.snapshot(), 'is_new_best':score < best}
+        append_json(output/'metrics.jsonl', entry)
+        if curve_path is not None and args.mode == 'rl':
+            append_json(curve_path, entry)
         print(json.dumps(entry),flush=True)
+        save_checkpoint(model, loader.dataset, args, output/'last.pt', epoch+1, report, progress)
         if score < best:
             best = score
-            saved = {name:getattr(model,name).state_dict() for name in ('selector','mask_flow','metric_head')}
-            saved.update(contract=CONTRACT,environment=environment_contract(args.model_representation),dataset_signature=dataset.signature,
-                         stage=args.mode,args=vars(args),epoch=epoch+1,validation=report)
-            torch.save(saved,output/'best.pt')
+            save_checkpoint(model, loader.dataset, args, output/'best.pt', epoch+1, report, progress)
+    # The next stage starts from the validation-selected checkpoint, not last.
+    return load_stage_weights(model, output/'best.pt')
+
+
+def run_experiment(model, loader, validation_loader, env, args, device, output):
+    progress = LearningProgress()
+    curve = output/'learning_curve.jsonl'
+    initial_args = copy.copy(args)
+    initial_args.mode = 'untrained'
+    save_checkpoint(model, loader.dataset, initial_args, output/'untrained.pt', 0, {}, progress)
+    with progress.measure(env, 'evaluation'):
+        before = evaluate(model,validation_loader,env,args,device,
+                          ['untrained']+args.reference_modes,output/'before.jsonl')
+    append_json(curve, dict(stage='untrained',validation=before,progress=progress.snapshot()))
+    write_json(output/'before_summary.json', before)
+    for stage, epochs in (('metric',args.metric_epochs),('distill',args.distill_epochs)):
+        stage_args = copy.copy(args)
+        stage_args.mode, stage_args.epochs, stage_args.output = stage, epochs, str(output/stage)
+        train_stage(model,loader,validation_loader,env,stage_args,device,output/stage,progress)
+    with progress.measure(env, 'evaluation'):
+        distilled = evaluate(model,validation_loader,env,args,device,['distilled'],output/'distilled.jsonl')
+    append_json(curve,dict(stage='distilled',validation=distilled,progress=progress.snapshot()))
+    write_json(output/'distilled_summary.json', distilled)
+    # RL can use a smaller, predeclared prefix of TRAIN; validation never trains.
+    rl_dataset = TilebasedDatasetV85(args.data, 'train',
+        min(len(loader.dataset), args.rl_limit) if args.rl_limit else len(loader.dataset))
+    rl_loader = DataLoader(rl_dataset,batch_size=args.batch,shuffle=True,num_workers=args.workers)
+    rl_args = copy.copy(args)
+    rl_args.mode, rl_args.epochs, rl_args.limit, rl_args.output = 'rl', args.rl_epochs, len(rl_dataset), str(output/'rl')
+    best = train_stage(model,rl_loader,validation_loader,env,rl_args,device,output/'rl',progress,
+                       initial_validation=distilled['distilled'],curve_path=curve)
+    with progress.measure(env, 'evaluation'):
+        after = evaluate(model,validation_loader,env,args,device,['learned'],output/'after.jsonl')
+    append_json(curve,dict(stage='selected_best',validation=after,progress=progress.snapshot()))
+    old_rows = read_outcomes(output/'before.jsonl','untrained')
+    new_rows = read_outcomes(output/'after.jsonl','learned')
+    comparisons = {'untrained_to_learned':paired_learning_report(old_rows,new_rows),
+                   'distilled_to_learned':paired_learning_report(
+                       read_outcomes(output/'distilled.jsonl','distilled'),new_rows)}
+    for mode in args.reference_modes:
+        comparisons[mode+'_to_learned'] = paired_learning_report(
+            read_outcomes(output/'before.jsonl',mode),new_rows,require_same_budget=mode!='full')
+    report = dict(evaluation_split='val', before=before, distilled=distilled, after=after,
+        comparisons=comparisons, budget=args.budget,
+        visual_token_reduction=1.-after['learned']['token_ratio'],
+        selected_checkpoint='rl/best.pt', selected_stage=best['stage'], selected_epoch=best['epoch'],
+        selected_checkpoint_progress=best['progress'], progress=progress.snapshot(),
+        train_tasks=len(loader.dataset), rl_train_tasks=len(rl_dataset), validation_tasks=len(validation_loader.dataset),
+        selection_rule='Minimum penalized validation task loss among distilled initialization and RL epoch endpoints; ties keep earlier weights.',
+        note='Validation-only feasibility run, not a held-out test result. '
+             'Wall time excludes model loading. Formal solver calls exclude training proxy solves; '
+             'GT/uniform diagnostic solves are counted separately. Token ratio is not end-to-end speedup.')
+    write_json(output/'summary.json',report)
+    print(json.dumps(report,indent=2),flush=True)
 
 if __name__ == '__main__':
     main()

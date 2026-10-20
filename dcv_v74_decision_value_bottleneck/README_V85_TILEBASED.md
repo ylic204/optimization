@@ -5,26 +5,93 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
-## 当前默认：围绕 S→G 建立通路图，不重建完整地图
+## 当前主实验：学习选择器，以更少视觉 token 完成规划
 
-`run_tilebased_v85.py` 默认 `--model-representation corridor --modeling-prompt navigation`。
-Full、Random、initial、learned 共用同一英文环境 prompt、建模 schema、解码上限、几何转换和求解器。
-本轮直接验证最终路径质量，不需要再先运行 VQA 或重新预处理数据。
+使用 `--mode experiment`，一次加载冻结 Qwen，依次执行：
+
+1. 保存**未训练选择器及 FM/ND 场**，在固定 val 查询上评估其固定预算输出和 Full 参考。
+2. `metric` 预热训练专用代理头，选择器和 Qwen 冻结。
+3. `distill` 用代理任务梯度训练选择器与 FM/ND，代理头和 Qwen 冻结；评估蒸馏后真实规划表现。
+4. `rl` 用冻结 Qwen 生成的 S→G 通路图及真实求解器反馈，继续训练选择器与 FM/ND。
+5. 按 val 全样本任务损失选检查点，比较**同预算训练前后**及 Full 的任务质量。
+
+主方法始终是可学习选择器。Random 仅用 `--reference-modes full random` 加入辅助对照，默认不跑。
+`untrained` 是随机初始化网络执行同一选择/更新机制后的固定预算输出，不是均匀随机抽区域。
+旧模式 `initial` 是**当前权重**不经过 FM/ND 时的选择器输出，用于模块消融，不能当成训练前基线。
+所有方案共用英文环境 prompt、通路图 schema、解码上限、几何转换和求解器。
+不需要重做数据，不需要先运行 VQA；下面保留的 VQA/旧矩阵诊断均为可选工具。
+
+在脚本目录运行第一轮小规模学习实验：
 
 ```bash
 python run_tilebased_v85.py \
-  --mode evaluate --model-representation corridor --modeling-prompt navigation \
+  --mode experiment \
   --data /data/v85_tilebased/pkmn \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --device cuda:0 --load-4bit \
-  --split val --limit 40 --batch 1 \
-  --modes full random --budget 0.15 --seed 1234 \
+  --device cuda:0 --load-4bit --batch 1 \
+  --limit 128 --rl-limit 32 --val-limit 16 \
+  --metric-epochs 3 --distill-epochs 3 --rl-epochs 2 \
+  --rl-group-size 2 --budget 0.15 --seed 1234 \
   --modeling-max-new-tokens 4096 \
-  --output results/tilebased_corridor_r1
+  --output results/tilebased_selector_learning_r1
 ```
 
-保持此前量化设置；若此前未量化则去掉 `--load-4bit`。40 个任务、两个方案共 80 次建模。
-这是新表示的首轮实验命令，不是已经测得的性能提升。
+保持已有模型精度；未量化则去掉 `--load-4bit`。输出目录必须新建或为空。
+默认 `--model-representation corridor --modeling-prompt navigation`，不生成完整地形矩阵。
+`--limit` 为 train 任务数，`--rl-limit` 为其中用于昂贵 RL 的前 N 个任务，`--val-limit` 为独立 val 查询数。
+取预先确定的清单前缀，不按 GT、路径差异或运行结果筛选；训练时打乱顺序。0 表示不限制。
+`--metric-epochs/--distill-epochs/--rl-epochs` 控制一键实验，`--epochs` 仅控制单阶段训练。
+一键实验从头开始，不接受 `--checkpoint`；已有检查点继续训练使用本文第 7 节的单阶段入口。
+
+这条命令的 RL 训练包含 `32 × 2 × (1 + 2) = 192` 次冻结建模，
+额外验证包含 `16 × (2 + 1 + 2 + 1) = 96` 次，共 288 次；
+一次 RL 查询包括当前选择器初始输出和 2 个采样集合。metric/distill 不调用生成建模器。
+这些是任务数而非地图数，同图多个 S/G 查询相关；该小实验用于确认学习信号，不能直接作为论文泛化结果。
+
+| 输出 | 用途 |
+|---|---|
+| `summary.json` | `before.untrained/full`、`distilled.distilled`、`after.learned`，配对改善、预算与累计开销 |
+| `before.jsonl`, `distilled.jsonl`, `after.jsonl` | 同批 val 查询的选择区域、生成实例、预测路径、GT 评价和失败原因 |
+| `learning_curve.jsonl` | 未训练、蒸馏完成、各 RL epoch、最终选定检查点的真实求解结果及累计训练量 |
+| `metric/distill/rl/updates.jsonl` | 每个优化步的损失、梯度范数、训练步数、调用量与耗时 |
+| `metric/distill/rl/metrics.jsonl` | 每个 epoch 的训练/验证指标及是否刷新最佳结果 |
+| `untrained.pt`, `metric/distill/rl/best.pt`, `metric/distill/rl/last.pt` | 初始权重、各阶段最佳/最后权重；不含 Qwen 权重或精确续训状态 |
+| `args.json`, `prompt_config.json` | 实际配置、数据签名和共用提示词 |
+
+优先看 `comparisons.untrained_to_learned.mean_task_loss_improvement`：训练前损失减训练后损失，
+正数表示改善，**失败样本仍计入**。同时看最优率、真实路径 regret 和成功率；成功仅表示建模并求解成功，不等于低成本。
+`comparisons.full_to_learned` 使用同一批任务但允许视觉预算不同，用于观察压缩后的质量差距。
+固定 `--budget 0.15` 对应保留 15/100 个视觉 token；预算满足是机制保证，**任务质量保持需要实测**。
+不要只凭 token 减少、格式成功率或训练 loss 下降宣称有效。
+
+`reward_std`、`advantage_abs` 若在 RL 中长期为 0，表示采样集合没有产生可区分的奖励；
+即使 KL/熵正则仍更新参数，也不能称为学到了任务有效的选择。
+`progress` 将代理头与选择器的优化步分开，训练和验证的建模调用/正式求解调用/诊断求解调用也分开。
+正式调用计数包括失败尝试；GT 通路内 oracle 与均匀成本诊断求解另计，代理候选路径求解不计入正式调用。
+`elapsed_seconds` 从模型加载完成后起计，包含预热、选择、训练、验证和检查点 I/O；
+`training_seconds/evaluation_seconds` 为对应计算块的墙钟时间，不包含块外 DataLoader 读取。
+后续用固定配置、多种子及更大划分比较达到目标质量所需步数、调用数和时间，不能预先保证快速收敛。
+
+RL 的 step 0 蒸馏权重也参与 val 检查点选择；若 RL 没有严格降低验证损失，`rl/best.pt` 保留该权重，
+`selected_stage=distill, selected_epoch=0` 会明确标注；`rl/last.pt` 仍保存真正经过 RL 的最终权重。
+每个阶段下一步都从 `best.pt` 开始；检查点选择不是泛化保证，不能用选择过的 val 指标代替独立 test 结果。
+配置在 val 上确定后，可用以下命令在 test 上正式评估：
+
+```bash
+python run_tilebased_v85.py \
+  --mode evaluate --split test --modes full learned \
+  --checkpoint results/tilebased_selector_learning_r1/rl/best.pt \
+  --data /data/v85_tilebased/pkmn \
+  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
+  --device cuda:0 --load-4bit --budget 0.15 \
+  --output results/tilebased_selector_test_r1
+```
+
+如要在 test 比较未训练权重，用 `untrained.pt` 另开输出目录并评估 `--modes learned`；
+此处 `learned` 表示执行检查点中的选择器+FM/ND，是否受训由检查点 `stage` 决定。保持其余配置相同。
+自定义了网络尺寸时，评估必须传入相同的 `hidden/latent-dim/mask-steps` 等参数。
+
+## 默认规划表示：围绕 S→G 建立通路图
 
 **VLM 输出什么？** `tilebased_sg_corridor_v1` 包含六个字段：
 
@@ -75,7 +142,7 @@ RL 已使用此接口：选择区域 → 冻结 Qwen 生成通路图 → 稀疏�
 `--compare-prompts` 始终在同一种表示内比较提示词，不能用于比较矩阵与通路图。
 `diagnose_tilebased_v85.py --probes matrix` 仍是旧矩阵接口诊断，不是当前默认规划任务。
 
-## 先检查导航 VQA：起终点、连接关系和路线代价
+## 可选导航 VQA：起终点、连接关系和路线代价
 
 `vqa_tilebased_v85.py` 使用英文 system prompt 定义俯视二维像素地图环境，
 明确没有天空、对象贴图的立体细节不改变俯视含义，结合纹理、形状和邻接区域理解地图。
@@ -172,7 +239,7 @@ Full 保留 100 个视觉 token，Random 保留 15 个。同一任务在两种�
 验证状态：集成与配对流程已用 CPU 测试，包含小型随机初始化真实 Qwen 的 system-prefix 位置编码和原生/裁剪输出一致性。
 这些测试不代表 Qwen3-VL-8B 的任务能力；当前工作环境没有服务器模型权重和 GPU，真实 8B 新旧提示词实验尚待运行，暂无提升数值。
 
-## 当前 Full 基线较弱时，先运行接口与识别诊断
+## 历史矩阵接口的可选诊断
 
 新增 `diagnose_tilebased_v85.py`，直接复用已经预处理的数据，无需重下载、重做 GT 或先训练。
 当 Full 成功率仅 65%、成功样本相对 regret 约 3.86 时，格式成功不能证明视觉建模有效；
@@ -379,7 +446,7 @@ print(labels['optimal_cost'])
 日志保留未裁剪 regret；失败成本为 null。完整 GT 图连通，但 VLM 提出的通路图可能不连通。
 成功率反映模型及连接是否可求解；最优率与真实成本差距评价路线质量。
 
-## 6. 先运行完整视觉基线
+## 6. 可选：单独运行完整视觉基线
 
 模型阶段使用现有 Qwen 环境，依赖见仓库 `requirements.txt`。CPU 预处理不需要安装完整模型依赖。
 建议在已有能运行 Qwen3-VL-8B 的环境中执行：
@@ -402,7 +469,7 @@ python run_tilebased_v85.py \
 **不含共享的 early vision、选择器和 mask rollout，因此不是完整端到端加速比**。
 100→15 tokens 是后续视觉层/merger/LLM 保留量；剪枝前视觉层仍处理完整图像。
 
-## 7. 三阶段训练
+## 7. 可选：手动执行各训练阶段
 
 共同参数可按已有机器设置，以下命令使用默认网络尺寸。各阶段只从指定 checkpoint 初始化权重，
 不承诺恢复优化器或随机状态；输出目录必须是新的。
@@ -460,8 +527,15 @@ DGD/FM 监督的对象是 mask 更新方向，不是 GT 路径的 flow matching�
 
 ## 8. 验证
 
+本次一键学习实验更新通过 41 项 CPU 测试（`test_v85_tilebased_learning.py`、
+`test_v85_tilebased.py`、`test_v85_tilebased_corridor.py`、`test_v85_tilebased_prompts.py`、
+`test_v85_tilebased_vqa.py`）。包含真实三阶段优化器更新、Qwen 冻结、代理头冻结、同预算配对、
+失败样本保留、正式/诊断调用计数、最佳权重恢复及 RL 无改善时保留蒸馏权重。
+这是小型冻结生成替身与实际 Dijkstra 的流程验证，**尚未在 Qwen3-VL-8B 上运行这轮训练，无提升数值**。
+以下为更广的历史回归套件，部分测试需要 Transformers：
+
 ```bash
-python -m pytest -q test_v85_tilebased_corridor.py test_v85_tilebased_prompts.py test_v85_tilebased.py test_v85_tilebased_diagnostics.py test_v85_solver_environment.py test_v85_gradient_flow.py test_v85_posttraining.py
+python -m pytest -q test_v85_tilebased_learning.py test_v85_tilebased_corridor.py test_v85_tilebased_prompts.py test_v85_tilebased.py test_v85_tilebased_diagnostics.py test_v85_solver_environment.py test_v85_gradient_flow.py test_v85_posttraining.py
 ```
 
 包含：八邻接/起点成本、同成本不同路径、GT 连通性、非法模型拒绝、标签隔离、

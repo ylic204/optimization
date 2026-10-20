@@ -143,5 +143,26 @@
     "model_status": "CPU contract tests use a frozen generation double and actual sparse graph solver. No Qwen3-VL-8B performance run here.",
     "training_scope": "metric/distill retain the training-only dense cost proxy; formal RL/evaluate consume only VLM corridor output.",
     "new_default": "--model-representation corridor --modeling-prompt navigation"
+  },
+  "selector_learning_experiment_validation": {
+    "date": "2026-10-20",
+    "tests_passed": 41,
+    "torch_version": "2.14.1+cpu",
+    "files": [
+      "test_v85_tilebased_learning.py",
+      "test_v85_tilebased.py",
+      "test_v85_tilebased_corridor.py",
+      "test_v85_tilebased_prompts.py",
+      "test_v85_tilebased_vqa.py"
+    ],
+    "checks": [
+      "Single-backbone experiment runs metric, distill and RL optimization, followed by fixed-budget untrained/trained comparisons",
+      "Frozen backbone and frozen post-warmup proxy remain unchanged; selector and mask-flow updates verified",
+      "Per-stage best weights restored; RL ties retain distilled initialization with explicit stage metadata",
+      "Failures retained in paired task-loss comparisons; matching sample IDs and budgets validated while allowing different masks",
+      "Training/evaluation modeling attempts, formal solves and evaluation-only diagnostic solves counted separately",
+      "No test split opened during training/validation; standalone CLI stages and prompt comparisons remain compatible"
+    ],
+    "actual_8b_training": "Not run: no server Qwen3-VL-8B weights or GPU here. Tests use a frozen generation double with actual solver; no performance or convergence claim."
   }
 }

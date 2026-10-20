@@ -28,6 +28,9 @@ class FrozenTilebasedSolverEnvironment:
         self.prompt_variant = prompt_variant
         self.backbone, self.region_grid = backbone, region_grid
         self.max_new_tokens, self.failure_cost = max_new_tokens, failure_cost
+        # Attempts, including failed generation/solving. Training proxy solves
+        # are deliberately excluded; these counters describe the formal env.
+        self.calls = dict(modeling_calls=0, formal_solver_calls=0, diagnostic_solver_calls=0)
 
     @torch.no_grad()
     def evaluate(self, encoded, indices, public_inputs, supervision):
@@ -54,6 +57,7 @@ class FrozenTilebasedSolverEnvironment:
                 item['system_prompt'] = system
                 item['prompt_sha256'] = hashlib.sha256((system+'\n'+prompt).encode()).hexdigest()
                 generation_kwargs = {'system_prompt':system} if system else {}
+                self.calls['modeling_calls'] += 1
                 if hasattr(self.backbone, 'generate_selected_report'):
                     generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                     answer = generation['text']
@@ -65,6 +69,7 @@ class FrozenTilebasedSolverEnvironment:
                     modeled = validate_corridor(answer,dataset,source,target)
                     graph = compile_corridor(modeled)
                     item['status'] = 'solver_failure'
+                    self.calls['formal_solver_calls'] += 1
                     route,estimated = solve_corridor(graph)
                     item['graph_connected'] = route is not None
                     item['compiled_graph'] = dict(nodes_rc=[list(p) for p in modeled['nodes']],
@@ -73,6 +78,7 @@ class FrozenTilebasedSolverEnvironment:
                     item['matrix_diagnostics'] = matrix_diagnostics(answer)
                     modeled_costs = validate_model(answer, dataset, source, target)
                     item['status'] = 'solver_failure'
+                    self.calls['formal_solver_calls'] += 1
                     route = shortest_path(modeled_costs, source, target)
                 if route is None:
                     raise ValueError('generated model has no S-to-G path; no fallback routing is applied')
@@ -83,10 +89,12 @@ class FrozenTilebasedSolverEnvironment:
                 item['loss'] = min(measured['relative_regret'], self.failure_cost*.999)
                 truth = supervision['true_costs'][row].cpu().numpy()
                 if self.model_representation == 'corridor':
+                    self.calls['diagnostic_solver_calls'] += 1
                     item.update(corridor_evaluation(graph,route,estimated,truth,float(supervision['optimal_cost'][row])))
                 else:
                     item['cost_cell_accuracy'] = float(np.isclose(modeled_costs, truth, rtol=1e-5, atol=1e-5).mean())
                     item['cost_mae'] = float(np.abs(modeled_costs-truth).mean())
+                self.calls['diagnostic_solver_calls'] += 1
                 uniform = shortest_path(np.ones_like(truth), source, target)
                 item['same_path_as_uniform_cost'] = bool(np.array_equal(route, uniform))
             except (ValueError, KeyError, TypeError, OverflowError) as exc:
