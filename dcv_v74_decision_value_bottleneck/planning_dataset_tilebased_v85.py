@@ -37,9 +37,12 @@ class TilebasedDatasetV85(Dataset):
             raise ValueError('empty Tilebased split')
         self._cache, self.cache_maps = OrderedDict(), max(1, cache_maps)
         self.bounds = region_bounds(self.config['region_grid'], self.config['grid_shape'])
-        self.signature = json.dumps({k: self.config[k] for k in
+        signature_fields = {k: self.config[k] for k in
             ('contract', 'dataset', 'upstream_revision', 'grid_shape', 'image_side', 'region_grid',
-             'coordinate_order', 'graph', 'cost_convention', 'legend')}, sort_keys=True)
+             'coordinate_order', 'graph', 'cost_convention', 'legend')}
+        if 'task_filter' in self.config:
+            signature_fields['task_filter'] = self.config['task_filter']
+        self.signature = json.dumps(signature_fields, sort_keys=True)
 
     def __len__(self):
         return len(self.records)

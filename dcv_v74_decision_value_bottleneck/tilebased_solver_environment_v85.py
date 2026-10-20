@@ -54,7 +54,8 @@ class FrozenTilebasedSolverEnvironment:
             item = {'sample_id': public_inputs['sample_id'][row], 'model_representation':self.model_representation, 'environment_contract':self.contract, 'status': 'model_failure',
                     'loss': self.failure_cost, 'selected_indices': chosen,
                     'retained_tokens': len(chosen), 'total_tokens': self.region_grid**2,
-                    'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None}
+                    'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None,
+                    'spl': 0.0, 'cost_efficiency': 0.0, 'path_length': None, 'shortest_path_length': None}
             try:
                 item['modeling_prompt'] = prompt
                 item['modeling_prompt_variant'] = self.prompt_variant
@@ -131,6 +132,14 @@ def summarize_outcomes(results):
               'success_rate': len(success)/len(results),
               'task_loss': float(np.mean([x['loss'] for x in results])),
               'optimal_rate_all': sum(bool(x['optimal']) for x in results)/len(results)}
+    # Failures contribute zero, with ALL cases in the denominator.
+    # Do not silently assign zero to successful legacy logs lacking metrics.
+    result['sr'] = result['success_rate']
+    for field, name in (('spl','spl'), ('cost_efficiency','success_weighted_cost_efficiency')):
+        if all(field in x for x in success):
+            result[name] = sum(float(x[field]) for x in success)/len(results)
+    if success and all('path_length' in x for x in success):
+        result['path_length_successful'] = float(np.mean([x['path_length'] for x in success]))
     for status in ('model_failure', 'solver_failure'):
         result[status+'_rate'] = sum(x['status'] == status for x in results)/len(results)
     for field in ('relative_regret', 'true_cost'):

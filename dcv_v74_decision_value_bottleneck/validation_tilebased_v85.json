@@ -189,5 +189,54 @@
       "Streaming guard detects certain invalid outputs; it is not grammar-constrained decoding",
       "Original dataset endpoints, GT and costs unchanged"
     ]
+  },
+  "navigation_subset_metrics_validation": {
+    "date": "2026-10-20",
+    "tests_passed": 60,
+    "new_test_file": "test_v85_tilebased_navigation_metrics.py",
+    "checks": [
+      "Fixed lake/ocean goal exclusion; original files, endpoints and retained manifest IDs preserved",
+      "Filter policy included in data signature",
+      "Unit-eight-neighbor shortest-length SPL independent of cost-optimal GT length",
+      "Success-weighted true-cost efficiency, with failed cases contributing zero",
+      "Multiple equally optimal routes accepted and stationary S=G handled"
+    ],
+    "real_filter_report": {
+      "policy": {
+        "name": "pkmn_no_water_goal_v1",
+        "endpoint": "target",
+        "excluded_terrain": [
+          "lake",
+          "ocean"
+        ],
+        "excluded_costs": [
+          6.0,
+          10.0
+        ],
+        "source_filter": false,
+        "traversal_rules_changed": false
+      },
+      "splits": {
+        "train": {
+          "original_tasks": 12000,
+          "retained_tasks": 8658,
+          "excluded_water_goal": 3342,
+          "retained_maps": 2543
+        },
+        "val": {
+          "original_tasks": 2000,
+          "retained_tasks": 1398,
+          "excluded_water_goal": 602,
+          "retained_maps": 410
+        },
+        "test": {
+          "original_tasks": 2000,
+          "retained_tasks": 1468,
+          "excluded_water_goal": 532,
+          "retained_maps": 434
+        }
+      }
+    },
+    "actual_qwen_run": "Not run; original full dataset metrics cannot be directly compared to filtered subset metrics."
   }
 }

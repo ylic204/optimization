@@ -201,6 +201,13 @@ def evaluate_path(path, true_costs, source, target, optimal_cost):
     validate_path(path, source, target, true_costs.shape)
     cost = path_cost(true_costs, path)
     regret = max(0., (cost - float(optimal_cost)) / max(float(optimal_cost), 1e-8))
+    # Unit-length eight-neighbor moves, matching the current graph contract.
+    # The minimum-cost GT may be longer; it is NOT the shortest-length oracle.
+    length = len(path)-1
+    shortest_length = int(np.abs(np.asarray(source)-np.asarray(target)).max())
+    spl = shortest_length/max(length,shortest_length) if shortest_length else float(length == 0)
     return {'true_cost': cost, 'optimal_cost': float(optimal_cost),
+            'path_length': length, 'shortest_path_length': shortest_length, 'spl': float(spl),
+            'cost_efficiency': float(optimal_cost)/max(cost,float(optimal_cost)),
             'relative_regret': regret, 'optimal': bool(np.isclose(cost, optimal_cost, atol=1e-5, rtol=1e-5)),
             'path_rc': np.asarray(path).tolist()}

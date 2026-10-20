@@ -8,6 +8,7 @@
 
 - `download_tilebased_v85.py`：固定版本下载、SHA256 校验及离线复用。
 - `preprocess_tilebased_v85.py`：保留官方地图划分，恢复并校验全部原始 GT，自动生成任务文本。
+- `filter_tilebased_v85.py`：固定排除 lake/ocean 终点，保留其余原始任务与 GT；主报告提供 SR、步长 SPL 及成功加权成本效率，不要求路径逐格匹配。
 - `planning_dataset_tilebased_v85.py`：将模型公开输入与真实成本/GT 分开读取。
 - `tilebased_solver_environment_v85.py`：冻结 Qwen 默认生成 S→G 通路图，稀疏 Dijkstra 求解，真实路径成本反馈；无需生成完整地形矩阵。
 - `tilebased_segments_v85.py`：默认直接输出坐标连接与成本，程序建立节点索引；流式检查重复/非法连接，保留原始 S/G、GT 和地形成本。

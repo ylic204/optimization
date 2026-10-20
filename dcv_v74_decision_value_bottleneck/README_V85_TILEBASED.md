@@ -5,6 +5,56 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
+## 当前样本协议：排除水域终点，按到达与成本评价
+
+先对已经预处理的数据执行固定筛选，无需重新下载，也不重新采样 S/G：
+
+```bash
+python filter_tilebased_v85.py --data /data/v85_tilebased/pkmn --output /data/v85_tilebased/pkmn_no_water_goal
+```
+
+仅排除原始目标格为 lake=6 或 ocean=10 的任务。按已核对的公开成本映射判断，
+不凭图片颜色，不依据模型结果或 GT 难度筛样本。保留任务的 ID、顺序、原始划分、S/G、图像及 GT 不变。
+这是原基准的预定义子集，不是原始完整基准；所有方法必须使用同一子集。
+本轮只筛终点，未过滤起点，也未把途中的水域/wall 改成禁止通行；因此无需重新计算 GT。
+若以后要求完全禁止涉水，需要修改通行图并重新求解 GT，不能沿用当前标签。
+
+完整 Pokémon 数据实际筛选统计：
+
+| split | 原任务数 | 排除水域终点 | 保留任务数 |
+|---|---:|---:|---:|
+| train | 12000 | 3342 | 8658 |
+| val | 2000 | 602 | 1398 |
+| test | 2000 | 532 | 1468 |
+
+输出 `filter_report.json` 和每个 split 的 `excluded_tasks.jsonl`，记录固定规则、统计和被排除 ID。
+地图文件复制到新目录，原始数据不修改；后续训练、Full/各基线和可视化统一指定新 `--data`。
+筛选规则进入 dataset signature，因此旧未筛选数据的 checkpoint 不会被静默混用；主实验需在新子集重新训练。
+历史完整数据结果与新子集结果不能直接作为配对提升比较。
+
+**不要求预测路径与 GT 逐格一致。** 成功指输出合法、连续、在地图范围内，且起终点等于公开 S/G。
+当前没有额外不可通行格，所以 SR 是到达成功率，不是现实物理避障安全率。
+
+| 汇总字段 | 定义 | 方向 |
+|---|---|---|
+| `sr` / `success_rate` | 全部任务中合法到达 G 的比例 | 越高越好 |
+| `spl` | $N^{-1}\sum_i S_i L_i^*/\max(L_i,L_i^*)$ | 越高越好 |
+| `success_weighted_cost_efficiency` | $N^{-1}\sum_i S_i C_i^*/\max(C_i,C_i^*)$ | 越高越好 |
+| `true_cost_successful` | 成功路径在真实地形上的平均累计成本 | 同任务下越低越好 |
+
+SPL 是距离效率；当前采用八邻接单位步长（斜步也为 1），$L_i$ 是实际移动步数，不是经过格子数，
+$L_i^*=\max(|r_G-r_S|,|c_G-c_S|)$。这是本栅格图的最短步数，不用最小地形成本 GT 的长度代替。
+$S=G$ 且合法停留的 SPL 记 1。若改变通行约束或斜步长度，此闭式最短步数不再适用。
+
+成本效率是 **cost-based analogue，不叫标准 SPL**。$C_i$ 用真实地形标签评价，包含起点和终点；
+$C_i^*$ 是原始 GT 最优成本，不使用 Qwen 自报成本。
+两种效率都对全部样本平均，失败贡献 0；同成本不同形状的路线同等计分。
+高 SPL 可能来自穿过高成本区域的短路径，因此最小地形成本任务应结合 SR 与成本效率看结果。
+`optimal_rate_all` 保留为辅助诊断，原本也是“成本是否最优”，不是逐格路径匹配率。
+
+任务损失仍为原来的成本 regret 与失败惩罚，本轮只更新样本协议及评价指标。
+新的日志包含逐样本 `spl/cost_efficiency/path_length/shortest_path_length`；旧日志不会被误称已包含新指标。
+
 ## 本轮修复：直接输出坐标连接，减少无关的格式负担
 
 默认切换为 `--model-representation segments`（`tilebased_sg_segments_v2`）。
@@ -21,7 +71,7 @@ Full、未训练及已训练选择器使用同一表示、环境提示词和生�
 可先在此前相同的 16 个 val 查询运行 Full，观察格式失败和成本误差是否降低：
 
 ```bash
-python run_tilebased_v85.py --mode evaluate --split val --modes full --limit 16 --data /data/v85_tilebased/pkmn --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct --device cuda:0 --load-4bit --model-representation segments --modeling-max-new-tokens 4096 --seed 1234 --output results/tilebased_segments_full_r2
+python run_tilebased_v85.py --mode evaluate --split val --modes full --limit 16 --data /data/v85_tilebased/pkmn_no_water_goal --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct --device cuda:0 --load-4bit --model-representation segments --modeling-max-new-tokens 4096 --seed 1234 --output results/tilebased_no_water_goal_full_r3
 ```
 
 下方一键实验直接使用新接口训练可学习选择器，并保留 Full 参考；无需重新下载或预处理。
@@ -33,7 +83,7 @@ python run_tilebased_v85.py --mode evaluate --split val --modes full --limit 16 
 依赖仅为 NumPy、Pillow。请使用与这次运行对应的预处理目录及 split。
 
 ```bash
-python visualize_tilebased_v85.py --data /data/v85_tilebased/pkmn --outcomes results/tilebased_segments_full_r2/outcomes.jsonl --split val --mode full --output results/tilebased_segments_full_r2/path_visualizations
+python visualize_tilebased_v85.py --data /data/v85_tilebased/pkmn_no_water_goal --outcomes results/tilebased_no_water_goal_full_r3/outcomes.jsonl --split val --mode full --output results/tilebased_no_water_goal_full_r3/path_visualizations
 ```
 
 打开输出目录中的 `index.html`，或直接看 `0000_paths.png` 等图片。
@@ -71,14 +121,14 @@ python visualize_tilebased_v85.py --data /data/v85_tilebased/pkmn --outcomes res
 ```bash
 python run_tilebased_v85.py \
   --mode experiment \
-  --data /data/v85_tilebased/pkmn \
+  --data /data/v85_tilebased/pkmn_no_water_goal \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
   --device cuda:0 --load-4bit --batch 1 \
   --limit 128 --rl-limit 32 --val-limit 16 \
   --metric-epochs 3 --distill-epochs 3 --rl-epochs 2 \
   --rl-group-size 2 --budget 0.15 --seed 1234 \
   --modeling-max-new-tokens 4096 \
-  --output results/tilebased_selector_learning_r2
+  --output results/tilebased_selector_learning_no_water_goal_r3
 ```
 
 保持已有模型精度；未量化则去掉 `--load-4bit`。输出目录必须新建或为空。
@@ -128,11 +178,11 @@ RL 的 step 0 蒸馏权重也参与 val 检查点选择；若 RL 没有严格降
 ```bash
 python run_tilebased_v85.py \
   --mode evaluate --split test --modes full learned \
-  --checkpoint results/tilebased_selector_learning_r2/rl/best.pt \
-  --data /data/v85_tilebased/pkmn \
+  --checkpoint results/tilebased_selector_learning_no_water_goal_r3/rl/best.pt \
+  --data /data/v85_tilebased/pkmn_no_water_goal \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
   --device cuda:0 --load-4bit --budget 0.15 \
-  --output results/tilebased_selector_test_r2
+  --output results/tilebased_selector_test_no_water_goal_r3
 ```
 
 如要在 test 比较未训练权重，用 `untrained.pt` 另开输出目录并评估 `--modes learned`；
@@ -591,7 +641,12 @@ DGD/FM 监督的对象是 mask 更新方向，不是 GT 路径的 flow matching�
 
 ## 8. 验证
 
-本轮通过 57 项 CPU 测试，涉及 `test_v85_tilebased_segments.py`、
+本次固定子集与 SR/SPL/成本效率更新共通过 60 项 CPU 测试，新增
+`test_v85_tilebased_navigation_metrics.py`，验证失败计零、最短步数与成本区分、同成本不同路径、
+S=G、筛选前后数据不变及筛选协议进入检查点签名。实际完整数据筛选统计见本文开头。
+没有重新运行预训练 Qwen；不能据此声称新子集上的模型性能提升。
+
+坐标连接更新通过 57 项 CPU 测试，涉及 `test_v85_tilebased_segments.py`、
 `test_v85_tilebased_learning.py`、`test_v85_tilebased.py`、`test_v85_tilebased_corridor.py`、
 `test_v85_tilebased_prompts.py` 和 `test_v85_tilebased_vqa.py`。
 覆盖直接坐标建模、重复/非法连接停止、完整 JSON 停止、GT 隔离、实际稀疏求解及 RL 梯度，
