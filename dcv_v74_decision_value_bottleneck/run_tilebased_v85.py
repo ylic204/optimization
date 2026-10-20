@@ -23,7 +23,7 @@ from tilebased_core_v85 import CONTRACT, shortest_path, path_cost
 from tilebased_prompts_v85 import prompt_metadata
 from tilebased_prompt_comparison_v85 import paired_prompt_report
 from tilebased_solver_environment_v85 import (FrozenTilebasedSolverEnvironment,
-    ENVIRONMENT_CONTRACT, summarize_outcomes)
+    ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, environment_contract, summarize_outcomes)
 
 
 class TileCostHead(nn.Module):
@@ -219,7 +219,7 @@ def validate_proxy(model, loader, args, device):
 def validate_checkpoint(ckpt, dataset, args):
     if ckpt.get('contract') != CONTRACT or ckpt.get('dataset_signature') != dataset.signature:
         raise ValueError('checkpoint/data contract mismatch; legacy BEV checkpoints are not Tilebased checkpoints')
-    if ckpt.get('environment') != ENVIRONMENT_CONTRACT:
+    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT):
         raise ValueError('checkpoint solver environment mismatch')
     for name in ('hidden','latent_dim','mask_steps','prune_layer','max_text_length','mask_step_size'):
         if ckpt['args'][name] != getattr(args, name):
@@ -265,6 +265,7 @@ def parse_args():
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
+    p.add_argument('--model-representation', choices=['corridor','matrix'], default='corridor')
     p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
     p.add_argument('--compare-prompts', action='store_true', help='evaluate legacy/navigation on identical selected regions in one run')
     p.add_argument('--lr', type=float, default=2e-4)
@@ -298,15 +299,17 @@ def main():
     dataset = TilebasedDatasetV85(args.data, args.split if args.mode == 'evaluate' else 'train', args.limit)
     args.region_grid = dataset.config['region_grid']
     variants = ['legacy','navigation'] if args.compare_prompts else [args.modeling_prompt]
-    prompt_config = {variant:prompt_metadata(variant,dataset.config['dataset']) for variant in variants}
+    prompt_config = {variant:prompt_metadata(variant,dataset.config['dataset'],args.model_representation) for variant in variants}
     args.modeling_prompt_metadata = prompt_config
     args.dataset_signature = dataset.signature
     args.torch_version = str(torch.__version__)
     args.checkpoint_modeling_prompt = None
+    args.checkpoint_model_representation = None
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True) if args.checkpoint else None
     if checkpoint:
         validate_checkpoint(checkpoint, dataset, args)
         args.checkpoint_modeling_prompt = checkpoint['args'].get('modeling_prompt','legacy')
+        args.checkpoint_model_representation = checkpoint['args'].get('model_representation','matrix')
     model = build_v85_model(args, device)
     if model.backbone.target_image_side != dataset.config['image_side']:
         raise ValueError('Qwen patch/merge geometry would resize native images; incompatible backbone')
@@ -321,7 +324,7 @@ def main():
     (output/'prompt_config.json').write_text(json.dumps(prompt_config,indent=2)+'\n')
     loader = DataLoader(dataset,batch_size=args.batch,shuffle=args.mode!='evaluate',num_workers=args.workers)
     environments = {variant:FrozenTilebasedSolverEnvironment(model.backbone,args.region_grid,
-        args.modeling_max_new_tokens,args.failure_cost,prompt_variant=variant) for variant in variants}
+        args.modeling_max_new_tokens,args.failure_cost,prompt_variant=variant,model_representation=args.model_representation) for variant in variants}
     env = environments if args.compare_prompts else environments[args.modeling_prompt]
     if args.mode == 'evaluate':
         report = evaluate(model,loader,env,args,device,args.modes,output/'outcomes.jsonl')
@@ -376,7 +379,7 @@ def main():
         if score < best:
             best = score
             saved = {name:getattr(model,name).state_dict() for name in ('selector','mask_flow','metric_head')}
-            saved.update(contract=CONTRACT,environment=ENVIRONMENT_CONTRACT,dataset_signature=dataset.signature,
+            saved.update(contract=CONTRACT,environment=environment_contract(args.model_representation),dataset_signature=dataset.signature,
                          stage=args.mode,args=vars(args),epoch=epoch+1,validation=report)
             torch.save(saved,output/'best.pt')
 

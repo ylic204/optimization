@@ -207,7 +207,7 @@ def test_all_stage_cli_chain_with_tiny_frozen_model(tmp_path, monkeypatch):
     previous=None
     for mode in ('metric','distill','rl','evaluate'):
         out=tmp_path/mode
-        argv=['run_tilebased_v85.py','--mode',mode,'--data',str(data),'--vlm-model','test-double',
+        argv=['run_tilebased_v85.py','--mode',mode,'--data',str(data),'--vlm-model','test-double','--model-representation','matrix',
               '--device','cpu','--output',str(out),'--epochs','1','--hidden','16','--latent-dim','8',
               '--mask-steps','2','--rl-group-size','2']
         if previous:argv += ['--checkpoint',str(previous)]

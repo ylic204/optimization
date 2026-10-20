@@ -68,7 +68,7 @@ def test_compare_cli_runs_same_images_queries_regions_and_records_prompts(tmp_pa
     monkeypatch.setattr(runner,'build_v85_model',build)
     out=tmp_path/'comparison'
     monkeypatch.setattr(sys,'argv',['run','--mode','evaluate','--compare-prompts','--data',str(data),
-        '--split','train','--vlm-model','test-double','--device','cpu','--output',str(out),
+        '--split','train','--vlm-model','test-double','--model-representation','matrix','--device','cpu','--output',str(out),
         '--modes','full','random','--budget','.15'])
     runner.main()
     for a,b in zip(calls[::2],calls[1::2]):

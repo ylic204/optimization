@@ -121,5 +121,27 @@
       "generation_calls": 160,
       "performance_improvement": null
     }
+  },
+  "sg_corridor_validation": {
+    "date": "2026-10-20",
+    "tests_passed": 38,
+    "files": [
+      "test_v85_tilebased_corridor.py",
+      "test_v85_tilebased.py",
+      "test_v85_tilebased_prompts.py",
+      "test_v85_tilebased_vqa.py"
+    ],
+    "checks": [
+      "Reversible deterministic geometry, eight-neighbor steps and bounds",
+      "Dijkstra chooses between proposed direct and detour connections",
+      "GT-based regret decomposition is evaluation-only and does not repair routing",
+      "Disconnected graph penalized; malformed schemas and invalid indices/costs rejected",
+      "Actual default evaluate CLI uses corridor schema and same system prompt for Full/Random",
+      "Solver reward backpropagates through the existing policy loss into selector and mask flow",
+      "Legacy matrix CLI/training chain retained explicitly"
+    ],
+    "model_status": "CPU contract tests use a frozen generation double and actual sparse graph solver. No Qwen3-VL-8B performance run here.",
+    "training_scope": "metric/distill retain the training-only dense cost proxy; formal RL/evaluate consume only VLM corridor output.",
+    "new_default": "--model-representation corridor --modeling-prompt navigation"
   }
 }

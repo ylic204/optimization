@@ -5,6 +5,76 @@
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。
 视觉 token 预算属于选择器，不属于路径规划问题。
 
+## 当前默认：围绕 S→G 建立通路图，不重建完整地图
+
+`run_tilebased_v85.py` 默认 `--model-representation corridor --modeling-prompt navigation`。
+Full、Random、initial、learned 共用同一英文环境 prompt、建模 schema、解码上限、几何转换和求解器。
+本轮直接验证最终路径质量，不需要再先运行 VQA 或重新预处理数据。
+
+```bash
+python run_tilebased_v85.py \
+  --mode evaluate --model-representation corridor --modeling-prompt navigation \
+  --data /data/v85_tilebased/pkmn \
+  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
+  --device cuda:0 --load-4bit \
+  --split val --limit 40 --batch 1 \
+  --modes full random --budget 0.15 --seed 1234 \
+  --modeling-max-new-tokens 4096 \
+  --output results/tilebased_corridor_r1
+```
+
+保持此前量化设置；若此前未量化则去掉 `--load-4bit`。40 个任务、两个方案共 80 次建模。
+这是新表示的首轮实验命令，不是已经测得的性能提升。
+
+**VLM 输出什么？** `tilebased_sg_corridor_v1` 包含六个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `schema` | `tilebased_sg_corridor_v1` |
+| `source_rc`, `target_rc` | 公开 S/G，零起始行列坐标 |
+| `source_cost` | 对起点成本的估计，只计一次 |
+| `nodes_rc` | 少量路标点，0 为 S，1 为 G，其余可放在转折、连接点或成本变化处 |
+| `edges` | `[起点编号, 终点编号, 平均到达成本]` 的有向连接列表 |
+
+图中可以包含多条备选通路及共享连接，求解器决定最终路径；不要求 VLM 输出完整路线或 400 个成本格子。
+最多 32 个路标和 64 条连接是输出 schema 的大小限制，不是导航任务的新资源约束。
+可只输出一个有证据支持的通路，不强制凑出多条；遗漏有价值备选路线会体现在最终 regret 中。
+
+**如何得到实际路径？** 两个路标间的连接是直线段，沿较长轴用最近整数插值展开成八邻接步；
+正反方向使用同一规范端点次序，半整数向上取整。转弯和成本变化用额外路标表达。
+每一步的代价是该段预测的平均到达成本，排除出发格、包括到达格；起点单独计入，斜步不乘距离系数。
+段平均成本可为公开最小/最大地形成本之间的连续数值，不要求它等于单一地形类别。
+同一采样格处的交叉连接共享节点；重叠的同向步对成本估计取平均。不在这些连接上的邻接边不会自动添加。
+稀疏 Dijkstra 在展开后的通路图上求解。这个过程中**不读取 GT 成本、不调用 GT 绕路，也不从完整地图补全连接**。
+生成图不连通时记 `solver_failure`，不会用 GT 或直线兜底。
+
+这仍保留了栅格坐标作为统一空间坐标及评价工具，但没有把全图逐格识别作为 VLM 的任务。
+当前数据集所有地形均为有限成本，未建模连接表示搜索范围没有覆盖，不表示那里物理不可通行。
+新表示限制了可搜索的路径集合，不能宣称与完整栅格优化等价；需要靠结果评估这一近似的影响。
+
+**评价与训练反馈：** 生成路线后才读取完整 GT 成本，计算真实路径成本、最优率、相对 regret 和原有失败惩罚。
+主要结果仍是最终任务质量与视觉预算；不再要求完整矩阵准确率。日志另记录：
+
+- `compiled_graph`：实际送入求解器的空间节点、单位连接和预测成本。
+- `corridor_restriction_regret`：在生成通路图内使用真实成本所得最优值，相对完整 GT 最优值的差距。
+- `corridor_cost_model_regret`：实际所选路径相对上述通路图内最优值的差距。
+- `path_cost_relative_error`：预测路径成本与真实路径成本的相对误差。
+- `waypoint_count/segment_count/modeled_cell_count/modeled_arc_count`：建模规模；与视觉 token 数分开统计。
+
+前两项均除以完整 GT 最优成本，理论上相加等于该有效路径的未裁剪 regret。
+通路图内的 GT 求解**仅在评价阶段诊断，不替换实际预测路径，也不进入 prompt**。
+成功率是建模并求解成功率，不能当作避障安全率。
+
+RL 已使用此接口：选择区域 → 冻结 Qwen 生成通路图 → 稀疏求解 → 真实路径成本反馈。
+当前 `metric/distill` 仍保留训练专用的地形成本代理头及候选路径代理损失，用于获得 mask 梯度；
+这个代理头内部使用完整训练标签，**不向正式 VLM 提供矩阵、不决定 RL/evaluate 的路径**。
+它不是通路图求解器的精确可微替代。旧 metric/distill checkpoint 可以初始化，新 RL 应按通路图环境训练。
+旧 RL checkpoint 也可做迁移评估，但日志会标记原表示；它不等于已完成通路图奖励下训练。
+
+复现旧的矩阵实验需显式添加 `--model-representation matrix`，包括下面保留的新旧提示词对照命令。
+`--compare-prompts` 始终在同一种表示内比较提示词，不能用于比较矩阵与通路图。
+`diagnose_tilebased_v85.py --probes matrix` 仍是旧矩阵接口诊断，不是当前默认规划任务。
+
 ## 先检查导航 VQA：起终点、连接关系和路线代价
 
 `vqa_tilebased_v85.py` 使用英文 system prompt 定义俯视二维像素地图环境，
@@ -43,7 +113,7 @@ NPZ 只读取 `image`；任务清单只提取查询标识和公开端点，任�
 原图 `map_*_input.png`、回答 `map_*_answer.txt`、`answers.jsonl` 和配置。
 JSONL 保存公开查询、实际提示词、chat 文本、视觉 token 数及停止原因。
 人工检查端点定位、区域连接和成本判断是否有可见依据；**生成结束不等于回答正确，自述可行不等于求解器验证**。
-VQA 不输出完整路径、成本矩阵或模型 JSON，不能替代后续格子定位和规划成本评价。
+VQA 不输出完整路径、成本矩阵或模型 JSON，不能替代正式建模和规划成本评价。
 
 脚本使用官方 processor 和 `model.generate` 调用冻结 Qwen，不经过选择器或求解器；
 保留 `mm_token_type_ids` 并检查原始 320×320 图像网格。
@@ -51,7 +121,7 @@ VQA 不输出完整路径、成本矩阵或模型 JSON，不能替代后续格�
 同一英文环境提示词已接入 `run_tilebased_v85.py` 的正式建模与 RL 求解器反馈，默认使用 `navigation`。
 正式调用只输出成本模型 JSON，不先生成 VQA 回答，也不把 VQA 回答当成 GT。
 
-## 新旧提示词的配对规划实验
+## 历史矩阵接口：新旧提示词的配对规划实验
 
 新增 `--modeling-prompt navigation|legacy`（默认 `navigation`）和 `--compare-prompts`。
 `navigation` 使用独立 system message 加导航建模指令；`legacy` 保留原来的 user prompt 且没有 system message。
@@ -63,7 +133,7 @@ metric/distill 的代理损失不变。本次没有微调 Qwen，也没有更改
 
 ```bash
 python run_tilebased_v85.py \
-  --mode evaluate --compare-prompts \
+  --mode evaluate --model-representation matrix --compare-prompts \
   --data /data/v85_tilebased/pkmn \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
   --device cuda:0 --load-4bit \
@@ -173,7 +243,7 @@ python diagnose_tilebased_v85.py \
 矩阵 `cost_cell_accuracy_successful` 在全部地形格上计算；`cost_mae_successful` 是平均成本绝对误差。
 `same_path_as_uniform_cost` 表示与统一成本 Dijkstra 返回的路径完全相同，仅作诊断，不是最优性的判据。
 
-正式 `run_tilebased_v85.py` 的日志也增加这些矩阵诊断及 `generation` 字段；
+`run_tilebased_v85.py --model-representation matrix` 的日志也保存这些矩阵诊断及 `generation` 字段；
 `finish_reason=length` 表示耗尽输出预算，`eos` 表示遇到结束 token；`generated_tokens` 不包含 EOS。
 继续严格拒绝错误形状和非法成本，不自动补齐矩阵、不从 GT 修复输出、不改变 reward。
 旧 checkpoint 和已生成数据的契约保持兼容。诊断脚本不会训练或更新任何模型参数。
@@ -298,24 +368,16 @@ print(labels['optimal_cost'])
 
 ## 5. 冻结模型与求解器
 
-生成 JSON 的 schema 是 `tilebased_node_cost_path_v1`，包含：
-`schema, source_rc, target_rc, node_costs`。
-节点成本矩阵必须与原网格一致，成本属于公开词表，起终点必须与任务一致。
-解析器拒绝额外字段、重复键、非有限值、负值和不合法的坐标。
-不会执行模型生成的 Python，也不把 GT 成本补回预测矩阵。
-
-这里 VLM 在**固定优化问题族内实例化视觉参数**；图的邻接规则、流守恒和目标形式由模板固定。
-它不训练新的优化结构推理能力，也不直接输出轨迹。缺失视觉区域保持未知语义，
-允许 VLM 根据保留证据推断成本；推断错误由真实成本评价承担，不默认为零成本/免费通行。
-
-Dijkstra 从模型预测矩阵求解，随后才读取真实标签计算：
+默认生成 `tilebased_sg_corridor_v1`，字段和几何规则见本文开头。VLM 根据当前任务和保留视觉信息，
+提出空间连接及成本估计；稀疏 Dijkstra 在生成的通路子图上求解，随后才读取完整标签评价。
+`--model-representation matrix` 保留旧 `tilebased_node_cost_path_v1`，仅用于复现旧实验。
+解析器均拒绝额外字段、重复键、非有限值及非法坐标，不执行模型生成的代码。
 
 `relative_regret = max(0, (true_path_cost - optimal_cost) / optimal_cost)`。
 
-成功 loss 为 `min(relative_regret, .999 * failure_cost)`；建模或求解失败记 `failure_cost`，
-默认 10。日志始终保留未裁剪 regret；失败的成本/差距记 null。
-当前原始图是所有节点有限成本的连通图，**成功率主要反映格式与求解流程是否成功**，
-不是车辆安全性或真实避障率；最优率与成本差距是主要质量指标。
+成功 loss 为 `min(relative_regret, .999 * failure_cost)`；建模或求解失败记 `failure_cost`，默认 10。
+日志保留未裁剪 regret；失败成本为 null。完整 GT 图连通，但 VLM 提出的通路图可能不连通。
+成功率反映模型及连接是否可求解；最优率与真实成本差距评价路线质量。
 
 ## 6. 先运行完整视觉基线
 
@@ -332,7 +394,7 @@ python run_tilebased_v85.py \
 ```
 
 不需要 checkpoint 就能运行 full/random，检查冻结 VLM 是否能识别地形成本并生成可解实例。
-`--modeling-max-new-tokens 4096` 为 20×20 成本 JSON 留出空间；输出截断按建模失败处理。
+`--modeling-max-new-tokens 4096` 保留统一的解码上限；实际生成长度另行记录。当前输出为少量通路连接，输出截断按建模失败处理。
 预处理后的图像不放大；程序核对 Qwen 实际 patch/merge 几何，若会改变输入尺度则报错。
 
 `summary.json` 汇总主指标；`outcomes.jsonl` 记录每个样本的选择区域、原始模型回答、
@@ -399,7 +461,7 @@ DGD/FM 监督的对象是 mask 更新方向，不是 GT 路径的 flow matching�
 ## 8. 验证
 
 ```bash
-python -m pytest -q test_v85_tilebased.py test_v85_tilebased_diagnostics.py test_v85_solver_environment.py test_v85_gradient_flow.py test_v85_posttraining.py
+python -m pytest -q test_v85_tilebased_corridor.py test_v85_tilebased_prompts.py test_v85_tilebased.py test_v85_tilebased_diagnostics.py test_v85_solver_environment.py test_v85_gradient_flow.py test_v85_posttraining.py
 ```
 
 包含：八邻接/起点成本、同成本不同路径、GT 连通性、非法模型拒绝、标签隔离、
