@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from tilebased_core_v85 import evaluate_path, validate_path
+from tilebased_core_v85 import evaluate_path, validate_path, LAND_PROTOCOL
 
 
 def font(size):
@@ -18,7 +18,7 @@ def font(size):
         return ImageFont.load_default()
 
 
-def render(image, source, target, predicted, gt, arcs, title, note, side=480):
+def render(image, source, target, predicted, gt, arcs, title, note, side=480, region_model=None, land=False):
     rows, cols = image['shape']
     rgb = Image.fromarray(image['rgb']).resize((side, side), Image.Resampling.NEAREST)
     top, bottom, gap = 52, 44, 16
@@ -48,15 +48,25 @@ def render(image, source, target, predicted, gt, arcs, title, note, side=480):
     panels = [
         ('1. Original input + public S/G', None, None, 'Top-down image; rows down, columns right'),
         ('2. Qwen model -> solver path', predicted, '#e21b63', 'Pink = recorded solver path; arrows = direction'),
-        ('3. Original dataset GT', gt, '#008fa8', 'Cyan = dataset minimum-cost path'),
-        ('4. Proposed graph + solver path', predicted, '#e21b63', 'Orange = compiled connections; pink = chosen path'),
+        ('3. Land reference' if land else '3. Original dataset GT', gt, '#008fa8', 'Cyan = minimum-cost reference under current rules'),
+        ('4. Proposed graph + solver path', predicted, '#e21b63', 'Orange = modeled areas; blue = predicted water' if region_model is not None else 'Orange = compiled connections; pink = chosen path'),
     ]
     for index,(label,route,color,caption) in enumerate(panels):
         x=gap+(index%2)*(side+gap); y=64+gap+(index//2)*(panel_h+gap)
         draw.rectangle((x,y,x+side,y+panel_h),fill='white')
         draw.text((x+10,y+14),label,font=font(18),fill='#172a3a')
         layer=rgb.copy(); d=ImageDraw.Draw(layer)
-        if index==3 and arcs:
+        if index==3 and region_model is not None:
+            overlay=Image.new('RGBA',(side,side),(0,0,0,0)); od=ImageDraw.Draw(overlay)
+            for region in region_model.get('regions',[]):
+                r0,c0,r1,c1=region['bounds_rc']
+                od.rectangle((c0*side/cols,r0*side/rows,(c1+1)*side/cols-1,(r1+1)*side/rows-1),
+                             fill=(255,170,0,25),outline=(255,150,0,240),width=2)
+            for r0,c0,r1,c1 in region_model.get('blocked_regions',[]):
+                od.rectangle((c0*side/cols,r0*side/rows,(c1+1)*side/cols-1,(r1+1)*side/rows-1),
+                             fill=(0,100,255,60),outline=(0,100,255,230),width=2)
+            layer=Image.alpha_composite(layer.convert('RGBA'),overlay).convert('RGB');d=ImageDraw.Draw(layer)
+        elif index==3 and arcs:
             for a,b,_ in arcs:
                 d.line([point(a),point(b)],fill='#ff9c00',width=3)
         if route is not None:
@@ -91,6 +101,7 @@ def main():
     if args.output.exists() and any(args.output.iterdir()):
         p.error('output directory must be new or empty')
     config=json.loads((args.data/'dataset.json').read_text())
+    land=config.get('navigation_protocol')==LAND_PROTOCOL
     folder=args.data/args.split
     records={r['sample_id']:r for r in (json.loads(s) for s in (folder/'tasks.jsonl').read_text().splitlines() if s.strip())}
     outcomes=[json.loads(s) for s in args.outcomes.read_text().splitlines() if s.strip()]
@@ -109,14 +120,25 @@ def main():
             source=data['sources_rc'][ti,si].tolist();target=data['targets_rc'][ti].tolist()
             gt=data['gt_path_rc'][ti,si,:int(data['gt_path_length'][ti,si])].tolist()
             optimum=float(data['optimal_cost'][ti,si])
+            allowed=data['allowed_mask'] if land else None
+            shortest_length=int(data['shortest_path_length'][ti,si]) if land else None
         if source!=task['source_rc'] or target!=task['target_rc']:raise ValueError(f'{sid}: manifest endpoints mismatch')
         if hashlib.sha256(rgb.tobytes()).hexdigest()!=task['map_sha256']:raise ValueError(f'{sid}: image checksum mismatch')
         if row.get('gt_path_rc') is not None and row['gt_path_rc']!=gt:raise ValueError(f'{sid}: log GT differs from dataset')
-        validate_path(gt,source,target,costs.shape)
+        validate_path(gt,source,target,costs.shape,allowed,no_corner_cut=land)
         predicted=row.get('path_rc')
-        measured=None
+        measured=None;violation=None
         if predicted is not None:
-            measured=evaluate_path(predicted,costs,source,target,optimum)
+            # Invalid but actually selected paths must remain visible.
+            validate_path(predicted,source,target,costs.shape)
+            try:
+                measured=evaluate_path(predicted,costs,source,target,optimum,allowed=allowed,
+                                       no_corner_cut=land,shortest_length=shortest_length)
+            except ValueError as exc:
+                if row['status']!='constraint_failure':raise
+                violation=str(exc)
+            if violation is not None:
+                measured=dict(true_cost=None,spl=0.,cost_efficiency=0.,constraint_violation=violation)
             if row.get('true_cost') is not None and not np.isclose(measured['true_cost'],row['true_cost']):
                 raise ValueError(f'{sid}: recorded cost differs from dataset')
         arcs=row.get('compiled_graph',{}).get('arcs')
@@ -126,8 +148,10 @@ def main():
                 validate_path([a,b],a,b,costs.shape)
         title=f"{sid} | {row.get('mode','unknown')} | {row['status']}"
         note=f"S={source} G={target} | GT cost={optimum:.2f}"
-        if measured:note+=f" | Path cost={measured['true_cost']:.2f} | Regret={measured['relative_regret']:.3f}"
-        image=render(dict(rgb=rgb,shape=costs.shape),source,target,predicted,gt,arcs,title,note,args.panel_size)
+        if violation:note+=' | INVALID: '+violation
+        elif measured:note+=f" | Path cost={measured['true_cost']:.2f} | Regret={measured['relative_regret']:.3f}"
+        image=render(dict(rgb=rgb,shape=costs.shape),source,target,predicted,gt,arcs,title,note,args.panel_size,
+            region_model=row.get('compiled_graph') if row.get('model_representation')=='regions' else None,land=land)
         filename=f'{i:04d}_paths.png';image.save(args.output/filename)
         detail=dict(sample_id=sid,mode=row.get('mode'),status=row['status'],source_rc=source,target_rc=target,
                     image_file=filename,optimal_cost=optimum,measured=measured,error=row.get('error'),
@@ -137,7 +161,7 @@ def main():
         audit.append({k:v for k,v in detail.items() if k not in ('model_answer','compiled_graph','path_rc','gt_path_rc')})
         cards.append(f'<article><h2>{html.escape(title)}</h2><p>{html.escape(note)}</p><a href="{filename}"><img src="{filename}" loading="lazy"></a><p><a href="{i:04d}_details.json">Coordinates and model answer</a></p></article>')
         print(f'{i+1}/{len(outcomes)} {sid} -> {filename}')
-    (args.output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Recorded planning paths</title><style>body{font:16px sans-serif;background:#edf1f5;margin:24px}article{max-width:1100px;margin:24px auto}img{width:100%}h2{font-size:20px}</style><h1>Recorded Qwen + solver paths vs dataset GT</h1><p>Offline visualization only. No model inference, rerouting or route repair. Pink: solver path. Cyan: original GT. Orange: proposed graph. Finite-cost water/wall are not forbidden in this benchmark.</p>'+''.join(cards),encoding='utf-8')
+    (args.output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Recorded planning paths</title><style>body{font:16px sans-serif;background:#edf1f5;margin:24px}article{max-width:1100px;margin:24px auto}img{width:100%}h2{font-size:20px}</style><h1>Recorded Qwen + solver paths vs dataset GT</h1><p>Offline visualization only. No model inference, rerouting or route repair. Pink: solver path. Cyan: reference under current dataset rules. Orange: proposed graph or regions. Land protocol forbids lake/ocean; wall retains its finite cost. Failed predicted routes are shown, never repaired.</p>'+''.join(cards),encoding='utf-8')
     (args.output/'manifest.json').write_text(json.dumps(dict(outcomes=str(args.outcomes),dataset=config['dataset'],split=args.split,samples=audit),indent=2),encoding='utf-8')
     print(f'Open {args.output / "index.html"}')
 

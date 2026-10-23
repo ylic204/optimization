@@ -20,13 +20,13 @@ from gradient_flow_selector_v85 import (build_v85_model, GradientFlowSelectorV85
 from qwen3vl_selector_v79 import topk_region_indices
 from rl_posttraining_v85 import sample_region_action, policy_gradient_loss
 from planning_dataset_tilebased_v85 import TilebasedDatasetV85
-from tilebased_core_v85 import CONTRACT, shortest_path, path_cost
+from tilebased_core_v85 import CONTRACT, shortest_path, path_cost, LAND_PROTOCOL
 from tilebased_prompts_v85 import prompt_metadata
 from tilebased_prompt_comparison_v85 import paired_prompt_report
 from tilebased_learning_v85 import (LearningProgress, write_json, append_json,
     read_outcomes, paired_learning_report)
 from tilebased_solver_environment_v85 import (FrozenTilebasedSolverEnvironment,
-    ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, SEGMENT_ENVIRONMENT_CONTRACT,
+    ENVIRONMENT_CONTRACT, CORRIDOR_ENVIRONMENT_CONTRACT, SEGMENT_ENVIRONMENT_CONTRACT, REGION_ENVIRONMENT_CONTRACT,
     environment_contract, summarize_outcomes)
 
 
@@ -81,7 +81,10 @@ def proxy_paths(public, labels, count=8):
         masks, costs_out, seen = [], [], set()
         for j in range(count*5):
             weights = costs if j == 0 else np.ones_like(costs) if j == 1 else costs*np.exp(rng.normal(0, 1.5, costs.shape))
-            route = shortest_path(weights, source, target)
+            land = public.get('navigation_protocol',['original']*len(labels['true_costs']))[row] == LAND_PROTOCOL
+            allowed = labels['allowed_mask'][row].detach().cpu().numpy() if land else None
+            route = shortest_path(weights, source, target, allowed, no_corner_cut=land)
+            if route is None:raise ValueError('training reference is unreachable under the declared protocol')
             key = tuple(map(tuple, route))
             if key in seen:
                 continue
@@ -110,7 +113,9 @@ def proxy_values(model, encoded, mask, labels, candidates, temperature):
     probabilities = torch.softmax((-predicted_cost/(scale[:,None]*temperature)).masked_fill(~valid, -torch.inf), -1)
     regret = (true_cost-scale[:,None]).clamp_min(0)/scale[:,None]
     task = (probabilities*regret).sum(-1)
-    regression = F.smooth_l1_loss(torch.log(predicted), torch.log(labels['true_costs']), reduction='none').mean((-1,-2))
+    errors = F.smooth_l1_loss(torch.log(predicted), torch.log(labels['true_costs']), reduction='none')
+    allowed = labels.get('allowed_mask',torch.ones_like(predicted,dtype=torch.bool)).float()
+    regression = (errors*allowed).sum((-1,-2))/allowed.sum((-1,-2)).clamp_min(1)
     return task, regression
 
 
@@ -230,7 +235,7 @@ def validate_proxy(model, loader, args, device):
 def validate_checkpoint(ckpt, dataset, args):
     if ckpt.get('contract') != CONTRACT or ckpt.get('dataset_signature') != dataset.signature:
         raise ValueError('checkpoint/data contract mismatch; legacy BEV checkpoints are not Tilebased checkpoints')
-    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT):
+    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT,REGION_ENVIRONMENT_CONTRACT):
         raise ValueError('checkpoint solver environment mismatch')
     for name in ('hidden','latent_dim','mask_steps','prune_layer','max_text_length','mask_step_size'):
         if ckpt['args'][name] != getattr(args, name):
@@ -282,7 +287,7 @@ def parse_args():
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
-    p.add_argument('--model-representation', choices=['segments','corridor','matrix'], default='segments')
+    p.add_argument('--model-representation', choices=['auto','regions','segments','corridor','matrix'], default='auto')
     p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
     p.add_argument('--compare-prompts', action='store_true', help='evaluate legacy/navigation on identical selected regions in one run')
     p.add_argument('--lr', type=float, default=2e-4)
@@ -320,6 +325,12 @@ def main():
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f'{output} is not empty; choose a fresh run directory')
     dataset = TilebasedDatasetV85(args.data, args.split if args.mode == 'evaluate' else 'train', args.limit)
+    land = dataset.config.get('navigation_protocol') == LAND_PROTOCOL
+    if args.model_representation == 'auto':args.model_representation = 'regions' if land else 'segments'
+    if land != (args.model_representation == 'regions'):
+        raise ValueError('regions requires rebuilt land data; use prepare_tilebased_land_v85.py first')
+    args.navigation_protocol = dataset.config.get('navigation_protocol','original')
+    print(f'Tilebased data: {Path(args.data).resolve()} | protocol={args.navigation_protocol} | representation={args.model_representation} | tasks={len(dataset)}', flush=True)
     args.region_grid = dataset.config['region_grid']
     variants = ['legacy','navigation'] if args.compare_prompts else [args.modeling_prompt]
     prompt_config = {variant:prompt_metadata(variant,dataset.config['dataset'],args.model_representation) for variant in variants}

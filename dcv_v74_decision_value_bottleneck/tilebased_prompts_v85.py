@@ -4,18 +4,20 @@ from pathlib import Path
 from tilebased_core_v85 import DATASETS, build_model_prompt
 from tilebased_corridor_v85 import CORRIDOR_SCHEMA, MAX_NODES, MAX_EDGES
 from tilebased_segments_v85 import SEGMENT_SCHEMA
+from tilebased_regions_v85 import regions_user_prompt
 
 SYSTEM_FILE = Path(__file__).resolve().parent/'prompts/tilebased_vqa_system_v85.txt'
 
 
-def modeling_system_prompt(variant, dataset):
+def modeling_system_prompt(variant, dataset, model_representation="matrix"):
     if variant == 'legacy':
         return ''
     if variant != 'navigation':
         raise ValueError(f'unknown modeling prompt variant: {variant}')
     if dataset != 'pkmn':
         raise ValueError('navigation environment prompt targets pkmn; use --modeling-prompt legacy for other datasets')
-    prompt = SYSTEM_FILE.read_text(encoding='utf-8').strip()
+    system_file = SYSTEM_FILE.with_name('tilebased_land_system_v85.txt') if model_representation=='regions' else SYSTEM_FILE
+    prompt = system_file.read_text(encoding='utf-8').strip()
     if not prompt:
         raise ValueError('empty navigation environment prompt')
     return prompt
@@ -23,6 +25,9 @@ def modeling_system_prompt(variant, dataset):
 
 def modeling_user_prompt(variant, task, dataset, source, target, indices, region_grid, legend,
                          model_representation='matrix'):
+    if model_representation == 'regions':
+        if variant not in ('legacy','navigation'):raise ValueError('unknown prompt variant')
+        return regions_user_prompt(task,dataset,source,target,indices,region_grid,legend)
     if model_representation == 'segments':
         if variant not in ('legacy','navigation'):
             raise ValueError('unknown prompt variant')
@@ -54,7 +59,7 @@ def modeling_user_prompt(variant, task, dataset, source, target, indices, region
 
 
 def prompt_metadata(variant, dataset, model_representation='matrix'):
-    system = modeling_system_prompt(variant,dataset)
+    system = modeling_system_prompt(variant,dataset,model_representation)
     return dict(modeling_prompt_variant=variant,model_representation=model_representation,system_prompt=system,
                 system_prompt_sha256=hashlib.sha256(system.encode()).hexdigest())
 

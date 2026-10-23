@@ -238,5 +238,35 @@
       }
     },
     "actual_qwen_run": "Not run; original full dataset metrics cannot be directly compared to filtered subset metrics."
+  },
+  "land_region_algorithm_validation": {
+    "date": "2026-10-23",
+    "tests_passed": 73,
+    "test_files": [
+      "test_v85_tilebased_land.py",
+      "test_v85_tilebased_navigation_metrics.py",
+      "test_v85_tilebased_segments.py",
+      "test_v85_tilebased_learning.py",
+      "test_v85_tilebased.py",
+      "test_v85_tilebased_corridor.py",
+      "test_v85_tilebased_prompts.py",
+      "test_v85_tilebased_vqa.py"
+    ],
+    "protocol": "pkmn_land_no_water_no_corner_cut_v1",
+    "schema": "tilebased_land_regions_v3",
+    "checks": [
+      "Solver turns within wide modeled areas and selects lower-cost detours",
+      "Water overrides regions; no diagonal corner cutting or implicit endpoint insertion",
+      "Identical model inputs produce identical actual routes after hidden water labels change; unsafe routes fail instead of being repaired",
+      "Offline conversion removes water endpoints and disconnected tasks; stores original GT and recomputes land cost and length references",
+      "Training proxy candidates obey land rules; three-stage learning works on both legacy and land protocols",
+      "Invalid actual paths remain visible; region boxes and predicted water render separately",
+      "Land VQA uses forbidden-water rules"
+    ],
+    "limitations": [
+      "No pretrained Qwen3-VL-8B or GPU experiment performed; no accuracy or speedup claim",
+      "Reference conversion verified on controlled map fixtures, not a new full original-dataset run",
+      "Rectangle predictions can still omit useful routes or misclassify water; no optimality or feasibility guarantee for generated models"
+    ]
   }
 }

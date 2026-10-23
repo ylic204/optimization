@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from tilebased_core_v85 import CONTRACT, DATASETS, coordinate, task_text
+from tilebased_core_v85 import CONTRACT, DATASETS, coordinate, task_text, LAND_PROTOCOL, land_mask
 
 
 def region_bounds(region_grid, shape):
@@ -24,6 +24,9 @@ class TilebasedDatasetV85(Dataset):
             raise ValueError('incomplete or incompatible Tilebased export; rerun preprocessing')
         if split not in ('train', 'val', 'test'):
             raise ValueError('split must be train, val or test')
+        self.protocol = self.config.get('navigation_protocol','original')
+        if self.protocol not in ('original',LAND_PROTOCOL):
+            raise ValueError('unknown navigation protocol')
         self.dataset = self.config['dataset']
         spec = DATASETS[self.dataset]
         if (self.config['grid_shape'] != [spec['grid']]*2 or
@@ -42,6 +45,8 @@ class TilebasedDatasetV85(Dataset):
              'coordinate_order', 'graph', 'cost_convention', 'legend')}
         if 'task_filter' in self.config:
             signature_fields['task_filter'] = self.config['task_filter']
+        if self.protocol != 'original':
+            signature_fields['navigation_protocol'] = self.protocol
         self.signature = json.dumps(signature_fields, sort_keys=True)
 
     def __len__(self):
@@ -64,23 +69,33 @@ class TilebasedDatasetV85(Dataset):
         source, target = data['sources_rc'][ti, si].astype(np.int64), data['targets_rc'][ti].astype(np.int64)
         if list(coordinate(source, shape)) != record['source_rc'] or list(coordinate(target, shape)) != record['target_rc']:
             raise ValueError('task manifest endpoints do not match labels')
-        expected = task_text(self.dataset, source, target)
+        expected = task_text(self.dataset, source, target, land_only=self.protocol==LAND_PROTOCOL)
         if expected != record['task_text']:
             raise ValueError('task text differs from its endpoint/graph contract')
         image = data['image']
         side = self.config['image_side']
         if image.shape != (side, side, 3) or image.dtype != np.uint8 or data['true_costs'].shape != shape:
             raise ValueError('invalid native map or label shape')
+        allowed = np.ones(shape,bool)
+        shortest_length = int(np.abs(source-target).max())
+        if self.protocol == LAND_PROTOCOL:
+            allowed = data['allowed_mask']
+            if not np.array_equal(allowed,land_mask(data['true_costs'])) or not allowed[tuple(source)] or not allowed[tuple(target)]:
+                raise ValueError('land mask/endpoints mismatch')
+            shortest_length = int(data['shortest_path_length'][ti,si])
+            if shortest_length < 0:raise ValueError('unreachable land reference')
         # Explicit separation: only public_inputs is passed to the model/prompt.
         return {'public_inputs': {
                     'image': torch.from_numpy(image.copy()).permute(2,0,1).float()/255.,
                     'task_text': expected, 'source_rc': torch.from_numpy(source.copy()),
                     'target_rc': torch.from_numpy(target.copy()),
                     'region_world_bounds': torch.from_numpy(self.bounds.copy()),
-                    'dataset': self.dataset, 'legend': self.config['legend'],
+                    'navigation_protocol': self.protocol, 'dataset': self.dataset, 'legend': self.config['legend'],
                     'sample_id': record['sample_id']},
                 'supervision': {
                     'true_costs': torch.from_numpy(data['true_costs'].copy()).float(),
+                    'allowed_mask': torch.from_numpy(allowed.copy()),
+                    'shortest_path_length': torch.tensor(shortest_length),
                     'gt_path_mask': torch.from_numpy(data['gt_path_mask'][ti, si].copy()),
                     'gt_path_rc': torch.from_numpy(data['gt_path_rc'][ti, si].copy()).long(),
                     'gt_path_length': torch.tensor(int(data['gt_path_length'][ti, si])),

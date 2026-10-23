@@ -52,10 +52,16 @@ def test_formal_attempt_counters_include_model_failures_and_separate_diagnostics
     assert progress.values['evaluation_formal_solver_calls'] == 0
 
 
-def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(tmp_path, monkeypatch):
+@pytest.mark.parametrize("land", [False, True])
+def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(tmp_path, monkeypatch, land):
     import run_tilebased_v85 as runner
     data = tmp_path/'data'; data.mkdir(); fixture_export(data)
     shutil.copytree(data/'train', data/'val')
+    if land:
+        from prepare_tilebased_land_v85 import prepare_land
+        shutil.copytree(data/'train',data/'test')
+        rebuilt=tmp_path/'land';prepare_land(data,rebuilt);data=rebuilt
+        shutil.rmtree(data/'test')
     # Deliberately no test split: the learning experiment must not read test.
     builds = []
     frozen = {}
@@ -67,6 +73,10 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
         model.backbone.answer = json.dumps(dict(schema=SEGMENT_SCHEMA, source_rc=[0,0],
             target_rc=[19,19], source_cost=1,
             segments=[dict(from_rc=[0,0],to_rc=[19,19],mean_cost=1)]))
+        if land:
+            from tilebased_regions_v85 import REGION_SCHEMA
+            model.backbone.answer=json.dumps(dict(schema=REGION_SCHEMA,source_rc=[0,0],target_rc=[19,19],
+                regions=[dict(bounds_rc=[0,0,19,19],cost=1)],blocked_regions=[]))
         frozen.update(copy.deepcopy(model.backbone.state_dict()))
         builds.append(model)
         return model
@@ -118,4 +128,4 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
     assert updates[0]['metrics']['informative_reward_group_rate'] == 0
     assert updates[0]['metrics']['all_samples_failed_group_rate'] == 0
     assert updates[0]['metrics']['sampled_success_rate'] == 1
-    assert json.loads((out/'args.json').read_text())['model_representation'] == 'segments'
+    assert json.loads((out/'args.json').read_text())['model_representation'] == ('regions' if land else 'segments')

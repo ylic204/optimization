@@ -1,5 +1,13 @@
 # V8.5 — BEV Selector with Frozen LLM Modeling and Solver Feedback
 
+## 当前 Tilebased 算法：区域建模与陆地规划
+
+**运行入口：[README_V85_TILEBASED_LAND.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED_LAND.md)。**
+Qwen 生成有面积的通道区域、区域成本和预测水域边界；Dijkstra 在区域内部选择路线。
+同时排除水域起终点，禁止涉水/斜穿水角，重新生成最小成本与最短步数参考解。
+真实水域标签仅用于离线参考与事后评价，模型漏识别的水域不会被求解器自动纠正。
+仍学习固定预算视觉选择器，冻结 Qwen，保留代理预热、梯度蒸馏/FM/ND 和求解器反馈 RL。
+
 ## Tilebased 最小地形成本路径适配
 
 新增分支 `v85-tilebased-llm-solver`，基于 `v85-bev-selector-llm-solver`。

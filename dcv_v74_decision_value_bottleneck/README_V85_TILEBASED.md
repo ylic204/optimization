@@ -1,5 +1,11 @@
 # V8.5 Tilebased：冻结 VLM 建模与最小地形成本路径
 
+**当前推荐算法已更新为区域建模与陆地规划，请先使用 [README_V85_TILEBASED_LAND.md](README_V85_TILEBASED_LAND.md)。**
+新版本同时排除水域 S/G、禁止涉水并重算参考解；`regions` 提供区域内部的路径优化空间。
+下面保留原始有限成本协议、仅过滤水域终点和线段接口的历史说明，用于旧实验复现。
+CLI 默认现为 `auto`（依据数据协议选择），不是把旧数据默认为陆地数据。
+
+
 本分支 `v85-tilebased-llm-solver` **基于用户指定的 `v85-bev-selector-llm-solver`**
 （基线提交 `fbe42f1`），接入 Tilebased navigation datasets。
 主任务只有“从给定 S 到 G，最小化累计地形成本”，**不增加步数/能源约束，不做探索、记忆或车辆控制**。

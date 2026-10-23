@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 from PIL import Image
-from tilebased_core_v85 import CONTRACT, DATASETS, PKMN_LEGEND, coordinate, task_text
+from tilebased_core_v85 import CONTRACT, DATASETS, PKMN_LEGEND, coordinate, task_text, LAND_PROTOCOL
 
 from tilebased_prompts_v85 import SYSTEM_FILE
 QUESTIONS = '''Perform navigation-focused VQA only. Answer the following questions briefly in English using visible evidence and the public task rules.
@@ -42,14 +42,15 @@ def load_public_tasks(root, split, indices, task_index):
     return tasks
 
 
-def navigation_question(task):
+def navigation_question(task, land_only=False, legend=PKMN_LEGEND):
     grid = DATASETS['pkmn']['grid']
-    return (f"PUBLIC NAVIGATION TASK\n{task_text('pkmn',task['source_rc'],task['target_rc'])}\n"
+    questions = QUESTIONS.replace('All cells in this benchmark are traversable: distinguish a costly crossing from an impossible crossing. Reachability follows from the supplied graph rules and is not evidence of visual understanding.', 'Lake and ocean are forbidden. Diagonal movement cannot cut water corners. Identify usable land passages and distinguish blocked crossings from costly land.') if land_only else QUESTIONS
+    return (f"PUBLIC NAVIGATION TASK\n{task_text('pkmn',task['source_rc'],task['target_rc'],land_only=land_only)}\n"
             f"The image covers the full {grid}x{grid} grid; each cell is 16x16 pixels. "
             "S/G are specified by coordinates, not added visual markers.\n"
-            f"Public terrain-cost legend: {PKMN_LEGEND}\n"
+            f"Public terrain-cost legend: {legend}\n"
             "The legend defines rules, not the actual category or cost of any image cell.\n\n"
-            + QUESTIONS)
+            + questions)
 
 
 def load_maps(root, split, indices):
@@ -158,14 +159,18 @@ def main():
     out = Path(a.output)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise FileExistsError('use a fresh output directory')
+    config, maps = load_maps(a.data,a.split,a.map_indices)
+    land = config.get('navigation_protocol')==LAND_PROTOCOL
+    if land and a.system_prompt_file==str(SYSTEM_FILE):
+        a.system_prompt_file=str(SYSTEM_FILE.with_name('tilebased_land_system_v85.txt'))
     system_prompt = Path(a.system_prompt_file).read_text(encoding='utf-8').strip()
     if not system_prompt:raise ValueError('system prompt must not be empty')
-    config, maps = load_maps(a.data,a.split,a.map_indices)
     tasks = load_public_tasks(a.data,a.split,a.map_indices,a.task_index)
-    prompts = {index:navigation_question(tasks[index]) for index,_ in maps}
+    legend = config["legend"] if land else config.get("legend",PKMN_LEGEND)
+    prompts = {index:navigation_question(tasks[index],land,legend) for index,_ in maps}
     out.mkdir(parents=True,exist_ok=True)
     (out/'system_prompt.txt').write_text(system_prompt+'\n',encoding='utf-8')
-    (out/'questions.txt').write_text(QUESTIONS+'\n',encoding='utf-8')
+    (out/'questions.txt').write_text(next(iter(prompts.values()))+'\n',encoding='utf-8')
     settings = dict(vars(a),vqa_contract='tilebased_navigation_vqa_v2',public_tasks=tasks,
                     dataset=config['dataset'],upstream_revision=config.get('upstream_revision'),
                     system_sha256=hashlib.sha256(system_prompt.encode()).hexdigest())

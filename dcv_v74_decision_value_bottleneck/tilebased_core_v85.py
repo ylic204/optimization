@@ -4,12 +4,15 @@ Upstream eight-neighbor node-cost graph: all finite cells are traversable,
 including Pokemon wall=25; diagonals have no sqrt(2) multiplier. Reporting
 includes both endpoints, as sum(costs * path_mask). Including the source
 adds the same constant to every route and preserves the upstream optimum.
+The separate LAND_PROTOCOL supplies a forbidden-water mask and no-corner-cut
+rule; legacy calls retain the original finite-cost graph by default.
 """
 import heapq
 import json
 import numpy as np
 
 CONTRACT = "tilebased_mincost_v85_r1"
+LAND_PROTOCOL = "pkmn_land_no_water_no_corner_cut_v1"
 MODEL_SCHEMA = "tilebased_node_cost_path_v1"
 UPSTREAM_REV = "384900fd82d8404a6eb0deb326412755620f3747"
 DATASETS = {
@@ -39,7 +42,7 @@ def neighbors(node, shape):
                 yield v
 
 
-def shortest_path(costs, source, target, allowed=None):
+def shortest_path(costs, source, target, allowed=None, no_corner_cut=False):
     costs = np.asarray(costs, dtype=np.float64)
     if costs.ndim != 2 or not np.isfinite(costs).all() or (costs <= 0).any():
         raise ValueError("costs must be a positive finite matrix")
@@ -63,7 +66,7 @@ def shortest_path(costs, source, target, allowed=None):
                 node = parents[node]
             return np.asarray(path[::-1], dtype=np.int64)
         for nxt in neighbors(node, costs.shape):
-            if not allowed[nxt]:
+            if not allowed[nxt] or (no_corner_cut and not diagonal_clear(node, nxt, allowed)):
                 continue
             distance = value + float(costs[nxt])
             if distance < distances.get(nxt, float('inf')):
@@ -77,7 +80,15 @@ def path_cost(costs, path):
     return float(np.asarray(costs, dtype=np.float64)[p[:, 0], p[:, 1]].sum())
 
 
-def validate_path(path, source, target, shape):
+def diagonal_clear(a, b, allowed):
+    return a[0] == b[0] or a[1] == b[1] or (allowed[a[0], b[1]] and allowed[b[0], a[1]])
+
+
+def land_mask(costs):
+    return ~np.isclose(np.asarray(costs)[..., None], [6., 10.], atol=1e-5, rtol=0).any(-1)
+
+
+def validate_path(path, source, target, shape, allowed=None, no_corner_cut=False):
     a = np.asarray(path)
     if a.ndim != 2 or a.shape[1] != 2 or not len(a) or a.dtype.kind not in 'iu':
         raise ValueError("path must be a nonempty integer [N,2] array")
@@ -87,6 +98,14 @@ def validate_path(path, source, target, shape):
         raise ValueError("path endpoints mismatch")
     if len(a) > 1 and not (np.abs(np.diff(a, axis=0)).max(axis=1) == 1).all():
         raise ValueError("path contains non-neighbor moves")
+    if allowed is not None:
+        allowed = np.asarray(allowed, dtype=bool)
+        if allowed.shape != tuple(shape):
+            raise ValueError('allowed mask shape mismatch')
+        if not allowed[a[:, 0], a[:, 1]].all():
+            raise ValueError('path enters forbidden water')
+        if no_corner_cut and any(not diagonal_clear(u, v, allowed) for u, v in zip(a, a[1:])):
+            raise ValueError('path cuts a forbidden corner')
     if len(set(map(tuple, a))) != len(a):
         raise ValueError("path has repeated nodes")
 
@@ -106,7 +125,15 @@ def verify_gt(costs, mask, source, target):
     return ordered, optimum
 
 
-def task_text(dataset, source, target):
+def task_text(dataset, source, target, land_only=False):
+    if land_only:
+        return (f"Find a minimum total terrain-cost LAND path on this {DATASETS[dataset]['grid']}x{DATASETS[dataset]['grid']} map "
+                f"from S={list(map(int, source))} to G={list(map(int, target))}. "
+                "Coordinates are zero-based [row,column], row down, column right. "
+                "Lake and ocean are forbidden. Both endpoints are on non-water terrain. "
+                "Use eight-neighbor unit steps; diagonal moves require both adjacent orthogonal cells to be traversable. "
+                "Count source and target costs. Other terrain, including wall, retains its public finite cost. "
+                "No step, time or energy constraint.")
     n = DATASETS[dataset]['grid']
     return (f"Find a minimum total terrain-cost path on this {n}x{n} map from "
             f"S={list(map(int, source))} to G={list(map(int, target))}. "
@@ -197,14 +224,23 @@ def validate_model(answer, dataset, source, target):
     return costs.astype(np.float64)
 
 
-def evaluate_path(path, true_costs, source, target, optimal_cost):
-    validate_path(path, source, target, true_costs.shape)
+def evaluate_path(path, true_costs, source, target, optimal_cost, allowed=None,
+                  no_corner_cut=False, shortest_length=None):
+    validate_path(path, source, target, true_costs.shape, allowed, no_corner_cut)
     cost = path_cost(true_costs, path)
     regret = max(0., (cost - float(optimal_cost)) / max(float(optimal_cost), 1e-8))
     # Unit-length eight-neighbor moves, matching the current graph contract.
     # The minimum-cost GT may be longer; it is NOT the shortest-length oracle.
     length = len(path)-1
-    shortest_length = int(np.abs(np.asarray(source)-np.asarray(target)).max())
+    if shortest_length is None:
+        if allowed is not None:
+            reference = shortest_path(np.ones_like(true_costs), source, target, allowed, no_corner_cut)
+            if reference is None:
+                raise ValueError('reference goal unreachable')
+            shortest_length = len(reference)-1
+        else:
+            shortest_length = int(np.abs(np.asarray(source)-np.asarray(target)).max())
+    shortest_length = int(shortest_length)
     spl = shortest_length/max(length,shortest_length) if shortest_length else float(length == 0)
     return {'true_cost': cost, 'optimal_cost': float(optimal_cost),
             'path_length': length, 'shortest_path_length': shortest_length, 'spl': float(spl),

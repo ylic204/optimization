@@ -166,6 +166,8 @@ def main():
     if out.exists() and any(out.iterdir()):raise FileExistsError('use a fresh diagnostic output directory')
     if not a.rescore_from and not a.vlm_model:p.error('--vlm-model is required unless --rescore-from is used')
     ds=TilebasedDatasetV85(a.data,a.split)
+    if ds.config.get('navigation_protocol'):
+        raise ValueError('legacy cell/matrix diagnostics require original data; use land VQA or regions evaluate for land data')
     if a.rescore_from:
         rescore_saved_cells(a.rescore_from,ds,out)
         return
