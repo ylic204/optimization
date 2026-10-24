@@ -4,7 +4,8 @@ from tilebased_core_v85 import DATASETS, parse_model_json, neighbors, diagonal_c
 from tilebased_segments_v85 import json_coordinate
 from tilebased_corridor_v85 import _cost
 
-REGION_SCHEMA = 'tilebased_land_regions_v3'
+REGION_SCHEMA = 'tilebased_land_polygons_v4'
+LEGACY_REGION_SCHEMA = 'tilebased_land_regions_v3'
 MAX_REGIONS = 64
 
 
@@ -17,10 +18,72 @@ def bounds(value, shape):
     return r0,c0,r1,c1
 
 
+def _cross(a,b,c):
+    return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+
+
+def _on(a,b,p):
+    return _cross(a,b,p)==0 and all(min(a[k],b[k])<=p[k]<=max(a[k],b[k]) for k in (0,1))
+
+
+def _intersects(a,b,c,d):
+    x,y,z,w=_cross(a,b,c),_cross(a,b,d),_cross(c,d,a),_cross(c,d,b)
+    return (x*y<0 and z*w<0) or any((_on(a,b,c),_on(a,b,d),_on(c,d,a),_on(c,d,b)))
+
+
+def geometry(value,shape):
+    if not isinstance(value,dict):
+        return {'bounds_rc':list(bounds(value,shape))}  # legacy blocked box
+    if set(value)=={'bounds_rc'}:
+        return {'bounds_rc':list(bounds(value['bounds_rc'],shape))}
+    if set(value)!={'polygon_rc'}:
+        raise ValueError('geometry requires polygon_rc or legacy bounds_rc')
+    vertices=value['polygon_rc']
+    if not isinstance(vertices,list) or not 3<=len(vertices)<=64:
+        raise ValueError('polygon requires 3 to 64 vertices')
+    pts=[]
+    for v in vertices:
+        if not isinstance(v,list) or len(v)!=2 or any(type(x) is not int for x in v):
+            raise ValueError('polygon vertices must be integer grid-corner [row,col] pairs')
+        if not all(0<=v[k]<=shape[k] for k in (0,1)):
+            raise ValueError('polygon vertex outside grid')
+        pts.append(tuple(v))
+    if len(set(pts))!=len(pts):raise ValueError('duplicate polygon vertex; do not repeat first vertex')
+    n=len(pts)
+    if sum(pts[i][0]*pts[(i+1)%n][1]-pts[(i+1)%n][0]*pts[i][1] for i in range(n))==0:
+        raise ValueError('zero-area polygon')
+    for i in range(n):
+        a,b,c=pts[i-1],pts[i],pts[(i+1)%n]
+        if _cross(a,b,c)==0 and sum((a[k]-b[k])*(c[k]-b[k]) for k in (0,1))>0:
+            raise ValueError('polygon backtracking edge')
+        for j in range(i+1,n):
+            if j==i+1 or (i==0 and j==n-1):continue
+            if _intersects(pts[i],pts[(i+1)%n],pts[j],pts[(j+1)%n]):
+                raise ValueError('self-intersecting polygon')
+    return {'polygon_rc':[list(p) for p in pts]}
+
+
+def geometry_mask(geom,shape):
+    mask=np.zeros(shape,bool)
+    if 'bounds_rc' in geom:
+        r0,c0,r1,c1=geom['bounds_rc'];mask[r0:r1+1,c0:c1+1]=True
+        return mask
+    pts=geom['polygon_rc']
+    for r,c in np.ndindex(shape):
+        point=(r+.5,c+.5);inside=False
+        for a,b in zip(pts,pts[1:]+pts[:1]):
+            if _on(a,b,point):inside=True;break
+            if (a[0]>point[0])!=(b[0]>point[0]):
+                crossing=a[1]+(point[0]-a[0])*(b[1]-a[1])/(b[0]-a[0])
+                if point[1]<crossing:inside=not inside
+        mask[r,c]=inside
+    return mask
+
+
 def validate_regions(answer, dataset, source, target):
     obj=parse_model_json(answer)
     required={'schema','source_rc','target_rc','regions','blocked_regions'}
-    if not isinstance(obj,dict) or set(obj)!=required or obj['schema']!=REGION_SCHEMA:
+    if not isinstance(obj,dict) or set(obj)!=required or obj['schema'] not in (REGION_SCHEMA,LEGACY_REGION_SCHEMA):
         raise ValueError('expected five-key land-region model')
     shape=(DATASETS[dataset]['grid'],)*2
     if json_coordinate(obj['source_rc'],shape)!=tuple(source) or json_coordinate(obj['target_rc'],shape)!=tuple(target):
@@ -28,28 +91,30 @@ def validate_regions(answer, dataset, source, target):
     low,high=min(DATASETS[dataset]['cost_values']),max(DATASETS[dataset]['cost_values'])
     for key in ('regions','blocked_regions'):
         if not isinstance(obj[key],list) or len(obj[key])>MAX_REGIONS:
-            raise ValueError(f'{key} must contain at most {MAX_REGIONS} rectangles')
+            raise ValueError(f'{key} must contain at most {MAX_REGIONS} regions')
     regions=[];seen=set()
     for region in obj['regions']:
-        if not isinstance(region,dict) or set(region)!={'bounds_rc','cost'}:
-            raise ValueError('regions require bounds_rc and cost')
-        box=bounds(region['bounds_rc'],shape)
-        if box in seen:raise ValueError('duplicate region bounds')
-        seen.add(box);regions.append((box,_cost(region['cost'],low,high)))
-    blocked=[bounds(b,shape) for b in obj['blocked_regions']]
-    if len(set(blocked))!=len(blocked):raise ValueError('duplicate blocked bounds')
+        if not isinstance(region,dict) or 'cost' not in region:
+            raise ValueError('regions require geometry and cost')
+        geom=geometry({k:v for k,v in region.items() if k!='cost'},shape)
+        signature=geometry_mask(geom,shape).tobytes()
+        if signature in seen:raise ValueError('duplicate region coverage')
+        seen.add(signature);regions.append((geom,_cost(region['cost'],low,high)))
+    blocked=[geometry(b,shape) for b in obj['blocked_regions']]
+    if len({geometry_mask(g,shape).tobytes() for g in blocked})!=len(blocked):
+        raise ValueError('duplicate blocked coverage')
     return dict(regions=regions,blocked=blocked,source=tuple(source),target=tuple(target),shape=shape)
 
 
 def compile_regions(model):
     # Dense arrays here are INTERNAL graph bookkeeping, not VLM output or labels.
     costs=np.zeros(model['shape'],dtype=float);covered=np.zeros(model['shape'],bool)
-    for (r0,c0,r1,c1),cost in model['regions']:
-        area=np.s_[r0:r1+1,c0:c1+1]
+    for geom,cost in model['regions']:
+        area=geometry_mask(geom,model['shape'])
         costs[area]=np.maximum(costs[area],cost);covered[area]=True
     blocked=np.zeros(model['shape'],bool)
-    for r0,c0,r1,c1 in model['blocked']:
-        blocked[r0:r1+1,c0:c1+1]=True
+    for geom in model['blocked']:
+        blocked |= geometry_mask(geom,model['shape'])
     allowed=covered & ~blocked
     arcs={}
     for a in (tuple(map(int,p)) for p in np.argwhere(allowed)):
@@ -72,20 +137,24 @@ def regions_user_prompt(task,dataset,source,target,indices,region_grid,legend):
     return (f'{task}\nImage: {side}x{side} pixels; terrain grid: {n}x{n}; each terrain cell: {side//n} pixels. '
         f'{visible}\nPublic legend: {legend}\n'
         'Model task-relevant LAND AREAS and their cost differences for a solver. '
-        'Cover useful passages and plausible lower-cost detours with rectangles of visible usable width. '
+        'Cover useful passages and plausible lower-cost detours with multiple simple polygons of visible usable width. '
         'The solver chooses each step anywhere inside their union. Do not draw a single waypoint chain. '
-        'Split rectangles along coastlines, turns and terrain-cost boundaries. Use several rectangles for irregular shapes. '
+        'Follow coastlines and turns with concave polygons; split regions at terrain-cost boundaries. Multiple disconnected regions and multiple blocked polygons are allowed. Represent holes using blocked polygons. '
         'Do not cover unrelated terrain merely to fill the map; do not output a full cost matrix. '
         'Cost is an estimated per-cell traversal cost within a region. Preserve visible cost differences. '
-        'Describe water intersecting or bordering proposed areas using blocked rectangles. '
-        'Blocked rectangles override all traversable rectangles. Uncovered cells are outside the proposed search space. '
-        'Overlapping traversable rectangles use the maximum declared cost, independent of ordering. '
+        'Describe water intersecting or bordering proposed areas using blocked polygons. '
+        'Blocked polygons override all traversable polygons. Uncovered cells are outside the proposed search space. '
+        'Overlapping traversable polygons use the maximum declared cost, independent of ordering. '
         'Neighbors are connected automatically; diagonal steps require BOTH orthogonal side cells to be covered and unblocked. '
         'No hidden true terrain or GT will repair your model. Include S and G within connected modeled land areas.\n'
         f'Return exactly one JSON object with schema="{REGION_SCHEMA}", source_rc={list(map(int,source))}, '
-        f'target_rc={list(map(int,target))}, regions=[{{"bounds_rc":[r0,c0,r1,c1],"cost":number}}], '
-        'blocked_regions=[[r0,c0,r1,c1]]. Bounds are inclusive integers, row down, column right, '
-        f'0 through {n-1}. Costs are finite in [1,25]. At most {MAX_REGIONS} rectangles per list. '
+        f'target_rc={list(map(int,target))}, regions=[{{"polygon_rc":[[r0,c0],[r1,c1],[r2,c2]],"cost":number}}], '
+        'blocked_regions=[{"polygon_rc":[[r0,c0],[r1,c1],[r2,c2]]}]. '
+        f'Polygon vertices are integer GRID CORNERS from 0 through {n}, row down, column right. '
+        'Cell [r,c] has center [r+0.5,c+0.5]; centers inside or on a polygon are included. '
+        'S/G remain cell indices. List 3 to 64 boundary vertices in order, clockwise or counterclockwise; '
+        'do not repeat the first vertex, cross edges or backtrack. Concave shapes are allowed. '
+        f'Costs are finite in [1,25]. At most {MAX_REGIONS} regions per list. '
         'An empty list is allowed but missing S/G coverage will fail. Close the JSON after the lists. '
         'No explanation, node IDs, edges, final path or extra keys.')
 

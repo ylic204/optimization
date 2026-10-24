@@ -58,13 +58,19 @@ def render(image, source, target, predicted, gt, arcs, title, note, side=480, re
         layer=rgb.copy(); d=ImageDraw.Draw(layer)
         if index==3 and region_model is not None:
             overlay=Image.new('RGBA',(side,side),(0,0,0,0)); od=ImageDraw.Draw(overlay)
+            def draw_geometry(geom,fill,outline):
+                if isinstance(geom,dict) and 'polygon_rc' in geom:
+                    points=[(c*side/cols,r*side/rows) for r,c in geom['polygon_rc']]
+                    od.polygon(points,fill=fill)
+                    od.line(points+points[:1],fill=outline,width=2)
+                else:
+                    r0,c0,r1,c1=geom['bounds_rc'] if isinstance(geom,dict) else geom
+                    od.rectangle((c0*side/cols,r0*side/rows,(c1+1)*side/cols-1,(r1+1)*side/rows-1),
+                                 fill=fill,outline=outline,width=2)
             for region in region_model.get('regions',[]):
-                r0,c0,r1,c1=region['bounds_rc']
-                od.rectangle((c0*side/cols,r0*side/rows,(c1+1)*side/cols-1,(r1+1)*side/rows-1),
-                             fill=(255,170,0,25),outline=(255,150,0,240),width=2)
-            for r0,c0,r1,c1 in region_model.get('blocked_regions',[]):
-                od.rectangle((c0*side/cols,r0*side/rows,(c1+1)*side/cols-1,(r1+1)*side/rows-1),
-                             fill=(0,100,255,60),outline=(0,100,255,230),width=2)
+                draw_geometry(region,(255,170,0,25),(255,150,0,240))
+            for geom in region_model.get('blocked_regions',[]):
+                draw_geometry(geom,(0,100,255,60),(0,100,255,230))
             layer=Image.alpha_composite(layer.convert('RGBA'),overlay).convert('RGB');d=ImageDraw.Draw(layer)
         elif index==3 and arcs:
             for a,b,_ in arcs:

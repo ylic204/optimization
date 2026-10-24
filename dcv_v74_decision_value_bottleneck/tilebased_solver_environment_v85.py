@@ -92,8 +92,8 @@ class FrozenTilebasedSolverEnvironment:
                     item['status'] = 'solver_failure'
                     item.update({key:graph[key] for key in ('region_count','blocked_region_count','modeled_cell_count','modeled_arc_count')})
                     item['compiled_graph'] = dict(nodes_rc=np.argwhere(graph['allowed']).tolist(),
-                        regions=[dict(bounds_rc=list(box),cost=cost) for box,cost in modeled['regions']],
-                        blocked_regions=[list(box) for box in modeled['blocked']],
+                        regions=[dict(geom,cost=cost) for geom,cost in modeled['regions']],
+                        blocked_regions=modeled['blocked'],
                         arcs=[[list(a),list(b),c] for (a,b),c in sorted(graph['arcs'].items())])
                     self.calls['formal_solver_calls'] += 1
                     route,estimated = solve_corridor(graph) if graph['endpoints_covered'] else (None,None)

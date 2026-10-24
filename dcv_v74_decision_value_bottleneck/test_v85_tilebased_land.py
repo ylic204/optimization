@@ -131,13 +131,17 @@ def test_rebuilt_references_endpoint_filter_spl_and_public_label_separation(tmp_
     with pytest.raises(ValueError):prepare_land(out,tmp_path/'again')
 
 
-def test_visualizer_preserves_invalid_actual_path_and_labels_land_reference(tmp_path):
+@pytest.mark.parametrize("polygon", [False, True])
+def test_visualizer_preserves_invalid_actual_path_and_labels_land_reference(tmp_path, polygon):
     _,out,_=fixture_land(tmp_path)
     record=json.loads((out/'val/tasks.jsonl').read_text())
     with np.load(out/'val/000000.npz') as data:gt=data['gt_path_rc'][0,0,:int(data['gt_path_length'][0,0])].tolist()
     path=[[i,i] for i in range(20)]
     row=dict(sample_id=record['sample_id'],mode='full',status='constraint_failure',model_representation='regions',
              path_rc=path,gt_path_rc=gt,true_cost=None,compiled_graph=dict(regions=[dict(bounds_rc=[0,0,19,19],cost=1)],blocked_regions=[],arcs=[]))
+    if polygon:
+        row['compiled_graph']['regions']=[dict(polygon_rc=[[0,0],[0,20],[20,20],[20,0]],cost=1)]
+        row['compiled_graph']['blocked_regions']=[dict(polygon_rc=[[1,1],[1,2],[2,2],[2,1]])]
     log=tmp_path/'outcomes.jsonl';log.write_text(json.dumps(row)+'\n')
     images=tmp_path/'images'
     subprocess.run([sys.executable,str(Path(__file__).with_name('visualize_tilebased_v85.py')),
@@ -154,3 +158,47 @@ def test_land_vqa_uses_forbidden_water_rules():
     assert 'Lake and ocean are forbidden' in prompt
     assert 'All cells in this benchmark are traversable' not in prompt
     assert 'lake=6' not in prompt
+
+
+def test_concave_polygon_preserves_missing_corner_and_winding():
+    from tilebased_regions_v85 import geometry, geometry_mask
+    points=[[0,0],[0,5],[2,5],[2,2],[5,2],[5,0]]
+    mask=geometry_mask(geometry({'polygon_rc':points},(20,20)),(20,20))
+    assert mask.sum()==16 and mask[0,4] and mask[4,0] and not mask[4,4]
+    assert np.array_equal(mask,geometry_mask(geometry({'polygon_rc':points[::-1]},(20,20)),(20,20)))
+
+
+def test_multiple_polygons_and_irregular_holes_solver():
+    obj=model_answer()
+    obj['regions']=[{'polygon_rc':[[0,0],[0,5],[5,5],[5,0]],'cost':2},
+                    {'polygon_rc':[[0,0],[0,5],[1,5],[1,0]],'cost':1}]
+    obj['blocked_regions']=[{'polygon_rc':[[1,2],[1,3],[2,3],[2,4],[3,4],[3,2]]},
+                            {'polygon_rc':[[4,0],[4,1],[5,1],[5,0]]}]
+    graph=compiled(obj)
+    route,cost=solve_corridor(graph)
+    assert route is not None and cost>0
+    assert not graph['allowed'][1,2] and not graph['allowed'][2,3] and not graph['allowed'][4,0]
+    assert all(graph['allowed'][tuple(p)] for p in route)
+    assert graph['costs'][0,0]==2  # max overlap, not order-dependent override
+    obj['regions'].reverse()
+    assert np.array_equal(graph['allowed'],compiled(obj)['allowed'])
+
+
+@pytest.mark.parametrize('points',[
+    [[0,0],[4,4],[0,4],[4,0]],
+    [[0,0],[0,4],[0,2],[4,2],[4,0]],
+    [[0,0],[0,4],[4,4],[0,0]],
+    [[0,0],[0,21],[4,4]],
+    [[0,0],[0,1],[0,2]],
+])
+def test_reject_invalid_polygons(points):
+    obj=model_answer();obj['regions']=[{'polygon_rc':points,'cost':1}]
+    with pytest.raises(ValueError):compiled(obj)
+
+
+def test_polygon_prompt_and_old_schema_compatibility():
+    from tilebased_regions_v85 import regions_user_prompt, LEGACY_REGION_SCHEMA
+    text=regions_user_prompt('go','pkmn',[2,0],[2,4],range(100),10,{})
+    assert 'polygon_rc' in text and 'GRID CORNERS' in text and 'bounds_rc' not in text
+    obj=model_answer();obj['schema']=LEGACY_REGION_SCHEMA
+    assert compiled(obj)['endpoints_covered']
