@@ -74,11 +74,8 @@ class FrozenTilebasedSolverEnvironment:
             trace = None
             try:
                 if self.model_representation == 'algebra':
-                    from tilebased_model_templates_v85 import retrieve_template
-                    from tilebased_patch_nodes_v85 import patch_registry
-                    from tilebased_core_v85 import DATASETS
-                    item['patch_node_registry'] = patch_registry((DATASETS[dataset]['grid'],)*2, self.region_grid, source, target)
-                    item['modeling_template'] = retrieve_template(public_inputs['task_text'][row])
+                    from tilebased_symbolic_v85 import SCHEMA, MODEL_EXAMPLE
+                    item['modeling_template'] = {'template_id':'symbolic_grid_flow_v1', 'schema':SCHEMA}
                 item['modeling_prompt'] = prompt
                 item['modeling_prompt_variant'] = self.prompt_variant
                 item['system_prompt'] = system
@@ -107,18 +104,19 @@ class FrozenTilebasedSolverEnvironment:
                 if finish == 'length':
                     item['failure_category'] = 'length_limit'
                 if self.model_representation == 'algebra':
-                    from tilebased_algebra_v85 import compile_model, solve_model, validate_output, decode_route, ModelError
-                    if finish == 'array_limit':raise ModelError('model_error', generation_kwargs['output_guard'].error)
-                    if finish == 'length':raise ModelError('length_limit','generated algebra was truncated')
-                    from tilebased_algebra_v85 import parse_answer
-                    from tilebased_patch_nodes_v85 import patch_registry, validate_patch_bindings
-                    item['generated_model'] = parse_answer(answer)
-                    compiled = compile_model(answer)
+                    from tilebased_algebra_v85 import solve_model, parse_answer, ModelError
+                    from tilebased_symbolic_v85 import compile_symbolic, decode_symbolic
                     from tilebased_core_v85 import DATASETS
-                    binding = validate_output(compiled, (DATASETS[dataset]['grid'],)*2)
-                    item['patch_node_registry'] = patch_registry((DATASETS[dataset]['grid'],)*2, self.region_grid, source, target)
-                    item['patch_nodes'] = validate_patch_bindings(compiled, binding, item['patch_node_registry'])
-                    item['generated_model'] = compiled['raw']
+                    if finish == 'array_limit':raise ModelError('model_error', generation_kwargs['output_guard'].error)
+                    if finish == 'length':raise ModelError('length_limit','generated symbolic model was truncated')
+                    item['generated_model'] = parse_answer(answer)
+                    compiled, evidence = compile_symbolic(answer, (DATASETS[dataset]['grid'],)*2,
+                        source, target, chosen, self.region_grid)
+                    item['scene_estimate'] = evidence
+                    item['symbolic_model'] = compiled['symbolic_raw']['model']
+                    item['expanded_model'] = compiled['raw']
+                    item['modeled_cell_count'] = DATASETS[dataset]['grid']**2
+                    item['modeled_arc_count'] = len(compiled['grid_arcs'])
                     item['compiled_model'] = dict(variable_labels=compiled['labels'],
                         objective_coefficients=compiled['c'].tolist(), objective_constant=compiled['constant'],
                         objective_sense=compiled['sense'], lower=compiled['lower'].tolist(), upper=compiled['upper'].tolist(),
@@ -132,9 +130,10 @@ class FrozenTilebasedSolverEnvironment:
                     item['solver_result'] = solution
                     if solution['status'] != 'optimal':raise ModelError(solution['status'],solution['message'])
                     item['status'] = 'model_failure'
-                    route = decode_route(compiled,solution,binding,source,target)
+                    route = decode_symbolic(compiled,solution,source,target)
                     item['generated_objective_value'] = solution['objective_value']
-                    item['compiled_graph'] = dict(arcs=[[list(a),list(b),0.] for path in binding[1].values() for a,b in zip(path,path[1:])])
+                    width=compiled['grid_shape'][1]
+                    item['compiled_graph'] = dict(arcs=[[list(divmod(a,width)),list(divmod(b,width)),0.] for a,b in compiled['grid_arcs']])
                 elif land:
                     modeled = validate_regions(answer,dataset,source,target)
                     graph = compile_regions(modeled)

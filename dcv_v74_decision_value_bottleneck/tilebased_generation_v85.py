@@ -72,12 +72,13 @@ def export_model_artifacts(trace, item, enabled=False):
     if trace is None or trace.path is None: return
     base=trace.path.with_suffix('')
     artifacts={}
-    for key in ('patch_node_registry','generated_model','compiled_model','solver_result'):
+    for key in ('generated_model','symbolic_model','scene_estimate','expanded_model','compiled_model','solver_result','path_rc'):
         if key in item:
             path=base.with_name(base.name+'.'+key+'.json')
             path.write_text(json.dumps(item[key],indent=2,ensure_ascii=False,allow_nan=False)+'\n',encoding='utf-8')
             artifacts[key]=str(path.resolve())
-    raw=item.get('generated_model')
+    raw=item.get('symbolic_model',item.get('generated_model'))
+    if isinstance(raw,dict) and isinstance(raw.get('model'),dict): raw=raw['model']
     if isinstance(raw,dict):
         lines=['QWEN-GENERATED MATHEMATICAL MODEL (unvalidated unless compilation succeeded)',
                'Sets: '+json.dumps(raw.get('sets'),ensure_ascii=False),
@@ -92,7 +93,7 @@ def export_model_artifacts(trace, item, enabled=False):
     item['model_artifacts']=artifacts
     report=base.with_name(base.name+'.status.json')
     report.write_text(json.dumps({k:item.get(k) for k in
-        ('sample_id','status','failure_category','error','model_answer_file','model_artifacts','patch_nodes')},indent=2)+'\n',encoding='utf-8')
+        ('sample_id','status','failure_category','error','model_answer_file','model_artifacts')},indent=2)+'\n',encoding='utf-8')
     item['model_status_file']=str(report.resolve())
     if enabled:
         if isinstance(raw,dict):

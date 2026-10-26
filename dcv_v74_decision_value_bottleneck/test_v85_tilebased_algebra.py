@@ -89,13 +89,8 @@ def test_no_hidden_terrain_or_dijkstra_in_formal_model(monkeypatch):
     model,public,labels,args=setup_tiny()
     public.update(source_rc=torch.tensor([[0,0]]),target_rc=torch.tensor([[0,2]]),
         navigation_protocol=[LAND_PROTOCOL],task_text=[task_text('pkmn',[0,0],[0,2],True)])
-    def patch_example():
-        obj=example()
-        obj['sets']['N']=[0,1,11,2]
-        obj['parameters'].update(tail=[0,1,0,11],head=[1,2,11,2],s=0,t=2,allowed=[1]*4)
-        obj['constraints'][0]['rhs']='1 if n == 0 else (-1 if n == 2 else 0)'
-        return obj
-    model.backbone.answer=json.dumps(patch_example());encoded,*_=encode(model,public,args.budget)
+    from test_v85_symbolic import example as symbolic_example
+    model.backbone.answer=json.dumps(symbolic_example((20,20)));encoded,*_=encode(model,public,args.budget)
     env=environment.FrozenTilebasedSolverEnvironment(model.backbone,2,prompt_variant='navigation',model_representation='algebra')
     labels=dict(true_costs=torch.ones((1,20,20)),allowed_mask=torch.ones((1,20,20),dtype=torch.bool),
                 optimal_cost=torch.tensor([3.]),shortest_path_length=torch.tensor([2]))
@@ -106,11 +101,12 @@ def test_no_hidden_terrain_or_dijkstra_in_formal_model(monkeypatch):
     good=env.evaluate(encoded,indices,public,labels)[0]
     assert good['status']=='success' and good['solver_result']['objective_value']==3
     assert good['compiled_model']['constraints'][0]['lower']==1
-    labels['allowed_mask'][0,0,1]=False;labels['true_costs'][0,0,1]=6
+    r,c=good['path_rc'][1]
+    labels['allowed_mask'][0,r,c]=False;labels['true_costs'][0,r,c]=6
     bad=env.evaluate(encoded,indices,public,labels)[0]
     assert bad['status']=='constraint_failure' and bad['path_rc']==good['path_rc']
     assert bad['generated_model']==good['generated_model'] and bad['solver_result']==good['solver_result']
-    obj=patch_example();obj['constraints']=[];model.backbone.answer=json.dumps(obj)
+    obj=symbolic_example((20,20));obj['model']['constraints']=[];model.backbone.answer=json.dumps(obj)
     missing=env.evaluate(encoded,indices,public,labels)[0]
     assert missing['failure_category']=='invalid_solution' and missing['solver_result']['constraint_count']==0
     model.backbone.answer='{}'
@@ -122,7 +118,8 @@ def test_prompt_is_shared_and_retrieves_path_template():
     from tilebased_prompts_v85 import modeling_system_prompt,modeling_user_prompt
     p=modeling_user_prompt('navigation','Find a minimum total terrain-cost LAND path','pkmn',[0,0],[0,2],[0,1],2,{},'algebra')
     assert 'variables' in p and 'constraints' in p and 'objective' in p
-    assert 'tail[e]' in p and 'head[e]' in p and 'land_flow_v1' in p
+    assert 'tail[e]' in p and 'head[e]' in p and 'tilebased_symbolic_v1' in p
+    assert 'polyline_rc' not in p
     assert 'sky' in modeling_system_prompt('navigation','pkmn','algebra')
     with pytest.raises(ValueError):modeling_system_prompt('legacy','pkmn','algebra')
 

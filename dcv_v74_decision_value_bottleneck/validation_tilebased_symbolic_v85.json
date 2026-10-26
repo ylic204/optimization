@@ -1,0 +1,24 @@
+{
+  "schema": "tilebased_symbolic_v1",
+  "environment_contract": "frozen_tilebased_symbolic_scene_milp_v3",
+  "cpu_tests": {
+    "passed": 30,
+    "command": "python -m unittest test_v85_symbolic_environment test_v85_symbolic test_v85_generation test_v85_path_template test_v85_patch_nodes"
+  },
+  "real_qwen_run": false,
+  "native_custom_equivalence_tested": false,
+  "verified": [
+    "generated objective changes chosen path",
+    "generated constraints determine water and corner feasibility",
+    "no missing-constraint fallback",
+    "20x20 expansion matches independent reference on supplied evidence",
+    "changing GT affects evaluation only, not generated model or solver assignment",
+    "partial observation does not delete planning nodes",
+    "raw/symbolic/expanded/solver/path artifacts exported"
+  ],
+  "limitations": [
+    "visual evidence accuracy unverified",
+    "unknown cells use explicit fixed cost 25 and are not automatically forbidden",
+    "full Torch/Transformers regression not run; CPU integration uses frozen-response mock"
+  ]
+}

@@ -1,4 +1,5 @@
-"""Public task taxonomy and authored modeling guidance; never solver defaults.
+"""LEGACY candidate-graph template, not used by the formal symbolic pipeline.
+Public task taxonomy and authored modeling guidance; never solver defaults.
 Inspired by MM-Agent's analysis -> method retrieval -> formulation workflow.
 No upstream code copied. Only the current benchmark family is supported.
 """

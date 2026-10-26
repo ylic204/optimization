@@ -14,7 +14,7 @@ from scipy.sparse import coo_matrix
 from tilebased_corridor_v85 import raster_segment
 
 SCHEMA = 'tilebased_algebra_v1'
-CONTRACT = 'frozen_tilebased_generated_milp_patch_ports_v2'
+CONTRACT = 'frozen_tilebased_symbolic_scene_milp_v3'
 
 
 class ModelError(ValueError):
@@ -61,9 +61,10 @@ def scalar(x):
 
 class Expressions:
     """Small AST interpreter, never Python eval/exec. Bounded symbolic expansion."""
-    def __init__(self,context):
+    def __init__(self,context,domain_limit=1024,expression_budget=200000):
         self.context=context
-        self.remaining=200000
+        self.domain_limit=domain_limit
+        self.remaining=expression_budget
 
     def parse(self,text,local=None):
         if type(text) in (int,float):return number(text)
@@ -135,7 +136,7 @@ class Expressions:
             if g.is_async or not isinstance(g.target,ast.Name):fail('invalid sum index')
             if g.target.id in ctx:fail('sum index shadows existing symbol')
             seq=sub(g.iter)
-            if not isinstance(seq,list) or len(seq)>1024:fail('sum domain must be a finite set')
+            if not isinstance(seq,list) or len(seq)>self.domain_limit:fail('sum domain must be a finite set')
             total=Linear(0,{})
             for value in seq:
                 inner=dict(ctx,**{g.target.id:value})
@@ -167,7 +168,11 @@ def parse_answer(answer):
         raise ModelError('format_error',str(exc)) from exc
 
 
-def compile_model(answer):
+def compile_model(answer, *, expanded_grid=False):
+    # Larger bounds only for compiler-expanded geometry, never a model-controlled flag.
+    domain_limit=8192 if expanded_grid else 1024
+    variable_limit=8192 if expanded_grid else 1024
+    row_limit=16384 if expanded_grid else 4096
     obj=parse_answer(answer)
     keys(obj,{'schema','sets','parameters','variables','objective','constraints','output'})
     if obj['schema']!=SCHEMA:fail('unsupported algebra schema')
@@ -179,20 +184,20 @@ def compile_model(answer):
             if k in ctx:fail('duplicate symbol')
             ctx[k]=None
     for k,values in obj['sets'].items():
-        if not isinstance(values,list) or len(values)>1024 or any(type(v) is not int or abs(v)>100000 for v in values) or len(set(values))!=len(values):fail('sets require unique bounded integers')
+        if not isinstance(values,list) or len(values)>domain_limit or any(type(v) is not int or abs(v)>100000 for v in values) or len(set(values))!=len(values):fail('sets require unique bounded integers')
         ctx[k]=values
     def parameter(v,depth=0,path='parameters'):
         if depth>4:fail('parameter nesting limit')
         if isinstance(v,list):
-            if len(v)>1024:fail('parameter size limit')
+            if len(v)>domain_limit:fail('parameter size limit')
             return [parameter(x,depth+1,f'{path}[{i}]') for i,x in enumerate(v)]
         if isinstance(v,dict):
-            if len(v)>1024:fail(f'{path}: parameter size limit')
+            if len(v)>domain_limit:fail(f'{path}: parameter size limit')
             return {k:parameter(x,depth+1,f'{path}.{k}') for k,x in v.items()}
         try:return number(v)
         except ModelError as exc:fail(f'{path}: {exc}')
     for k,v in obj['parameters'].items():ctx[k]=parameter(v,path=f'parameters.{k}')
-    exp=Expressions(ctx);labels=[];lower=[];upper=[];integrality=[];domains={}
+    exp=Expressions(ctx,domain_limit,2000000 if expanded_grid else 200000);labels=[];lower=[];upper=[];integrality=[];domains={}
     for k,v in obj['variables'].items():
         keys(v,{'index','type','lb','ub'})
         if v['type'] not in ('binary','integer','continuous'):fail('unknown variable type')
@@ -203,7 +208,7 @@ def compile_model(answer):
         if v['type']=='binary' and (lo<0 or hi>1):fail('binary bounds must lie in [0,1]')
         family={}
         for i in indices:
-            if len(labels)>=1024:fail('variable expansion limit')
+            if len(labels)>=variable_limit:fail('variable expansion limit')
             family[i]=Linear(0,{len(labels):1});labels.append([k,i]);lower.append(lo);upper.append(hi);integrality.append(int(v['type']!='continuous'))
         ctx[k]=family[None] if v['index'] is None else family
         domains[k]=indices
@@ -223,7 +228,7 @@ def compile_model(answer):
             if index in ctx or not isinstance(setname,str) or setname not in obj['sets']:fail('invalid forall index/domain')
             instances=[{index:i} for i in obj['sets'][setname]]
         for local in instances:
-            if len(rows)>=4096:fail('constraint expansion limit')
+            if len(rows)>=row_limit:fail('constraint expansion limit')
             row=Linear.cast(exp.parse(rule['lhs'],local)).add(exp.parse(rule['rhs'],local),-1)
             rows.append(row.coefficients);cl.append(-row.constant if rule['sense']!='<=' else -np.inf);cu.append(-row.constant if rule['sense']!='>=' else np.inf)
     c=np.zeros(len(labels))
@@ -294,44 +299,6 @@ def decode_route(m,report,binding,source,target):
 
 
 def algebra_prompt(task,dataset,source,target,indices,region_grid,legend):
-    from tilebased_core_v85 import DATASETS
-    n=DATASETS[dataset]['grid'];side=DATASETS[dataset]['image_side']
-    from tilebased_model_templates_v85 import template_prompt
-    from tilebased_patch_nodes_v85 import patch_registry, registry_prompt
-    registry=patch_registry((n,n),region_grid,source,target)
-    guidance=template_prompt(task)+registry_prompt(registry)
-    visibility = ("Full image: all visual positions retained." if len(indices) == region_grid**2 else
-                  f"Retained positions on the {region_grid}x{region_grid} visual grid: {list(map(int,indices))}.")
-    return guidance + f'''{task}
-Top-down pixel-art image: {side}x{side}; terrain grid {n}x{n}. Cell coordinates [row,column], zero-based.
-S={list(map(int,source))}; G={list(map(int,target))}. Public terrain rules: {legend}
-{visibility}
-Missing appearance is unknown. Construct the optimization problem yourself from the task and visible evidence.
-Declare decision variables, the objective and ALL necessary constraints. No route constraints, endpoint constraints,
-connectivity constraints, costs or forbidden-region constraints will be supplied or repaired by the program.
-Model useful alternatives and their estimated costs. Do not output a predetermined final route or a full terrain matrix.
-The solver executes precisely your generated linear/integer model. Merely describing constraints in prose has no effect.
-Return only valid JSON with these seven keys:
-"schema":"{SCHEMA}", "sets":{{...}}, "parameters":{{...}}, "variables":{{...}},
-"objective":{{"sense":"min" or "max","expression":"..."}}, "constraints":[...], "output":{{...}}.
-sets: named lists of unique integer indices. parameters: named finite numbers or numeric arrays (indexed from zero).
-variables: named declarations {{"index":"SET_NAME" or null,"type":"binary" or "integer" or "continuous","lb":"expression","ub":"expression"}}.
-Use explicit finite bounds. Variables with null index are scalars. Indexed variables are referenced as x[i].
-Each constraint is {{"name":"identifier","forall":{{"i":"SET_NAME"}} or {{}},"lhs":"expression","sense":"==" or "<=" or ">=","rhs":"expression"}}.
-Expressions support numbers, named parameters, array indexing, variables, +, -, multiplication/division by parameters,
-and sum(expr for i in SET if parameter_condition). Example of syntax only: sum(price[j]*z[j] for j in ITEMS).
-Conditional expressions (a if parameter_condition else b), comparisons and and/or are allowed on PARAMETERS only.
-Do not multiply decision variables, use decision-dependent conditions, Python calls other than sum, attributes, or imports.
-Indices in sums/forall must not shadow existing names. Bounds must be parameter-only scalar expressions.
-Expressions can be JSON strings or numeric constants. Use the retrieved path template as guidance;
-instantiate and return the full mathematical model, including all constraints, yourself.
-Output decoding contract: "output":{{"variable":"YOUR_ARC_SELECTION_VARIABLE","arcs":[{{"index":integer,"polyline_rc":[[row,col],...]}}]}}.
-Bind each index of one declared variable family to one directed spatial connection. Selected connections must have value 1,
-others 0. Each connection may bend: give its ordered polyline cell coordinates; preserve alternative connections where useful.
-Adjacent polyline points are interpolated into eight-neighbor unit steps, geometrically only, without obstacle repair.
-Model costs for all entered cells on each connection and include the starting cell cost in the objective.
-Connections join only at their stated endpoints; geometric crossings do not add connections or constraints.
-The decoder only follows the solver-selected arcs from S to G. Branches, cycles, unused selected arcs and gaps fail;
-it never selects a better subset or solves another path problem. Your constraints must enforce a valid selection.
-At most 256 geometry arcs, 64 points per arc, 1024 expanded variables and 4096 expanded constraints.
-No bounds_rc, polygons, matrix, explanation, markdown or extra top-level keys. Close the JSON completely.'''
+    """Compatibility entry point; formal generation now uses symbolic sets."""
+    from tilebased_symbolic_v85 import symbolic_prompt
+    return symbolic_prompt(task,dataset,source,target,indices,region_grid,legend)

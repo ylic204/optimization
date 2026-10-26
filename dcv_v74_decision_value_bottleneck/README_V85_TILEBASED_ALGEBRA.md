@@ -1,213 +1,152 @@
-# 路径规划模板指导更新
+# V8.5 — Visual evidence, symbolic optimization, solver-generated trajectory
 
-参考 MM-Agent 固定版本 `74d84f393a0557d41ae45a01625d15e0d61df983`：
-- [方法检索](https://github.com/usail-hkust/LLM-MM-Agent/blob/74d84f393a0557d41ae45a01625d15e0d61df983/MMAgent/agent/retrieve_method.py)：层次方法库，embedding 或 LLM 打分。
-- [建模流程](https://github.com/usail-hkust/LLM-MM-Agent/blob/74d84f393a0557d41ae45a01625d15e0d61df983/MMAgent/utils/mathematical_modeling.py)：分析、检索、公式与建模。
+Current branch: `v85-tilebased-llm-solver`. Current generated schema:
+`tilebased_symbolic_v1`; environment contract: `frozen_tilebased_symbolic_scene_milp_v3`.
+The CLI name `--model-representation algebra` is retained; land data `auto` selects it.
 
-本实现借鉴工作流，未复制上游实现。当前任务类别由公开 benchmark 任务规则确定为 path_planning/minimum_terrain_cost，检索唯一适用的 land_flow_v1 模板；这不是通用 LLM 分类器，不扩展到其他竞赛任务。未知任务明确拒绝。
+## What changed
 
-新提示词提供完整路径模型范例：成本是参数，binary 连接选择变量、成本目标、逐节点流量守恒、度数上界与禁行约束；要求 Qwen 用当前图像实例化全部内容。模板仅进入提示词，不送进编译器作为默认约束。原始生成结果仍独立校验、编译、求解；遗漏约束不会自动补上。所有 baseline 共用模板，新增文本 token 计入输入统计。
+Frozen Qwen receives selected visual features plus the task. In ONE generation it
+outputs (1) compact scene evidence and (2) a complete indexed mathematical model.
+The compiler expands geometric sets and generated expressions; HiGHS chooses the
+trajectory. Qwen does not enumerate nodes/arcs, output parameter matrices, or draw
+candidate routes. Visual patches are observation units, not planning nodes.
+The previous candidate-graph/patch-port approach is retired from the formal path.
+Its documentation is archived in `README_V85_ALGEBRA_HISTORY.md`.
 
-兼容数值表达式与字符串键参数字典，避免把正常 JSON 数字误判为数学错误。非线性乘积、未定义符号和缺少输出绑定仍拒绝。每条日志保存 modeling_template，验证签名包含模板模块；旧 Full 报告须重跑。当前没有增加自动重试或声称复现 MM-Agent 全部多轮流程。
+This adopts a neural-symbolic separation of visual facts and mathematical reasoning,
+not a reproduction of a particular neuro-symbolic planner. The modeling template
+provides mathematical guidance (inspired by the previously examined MM-Agent
+workflow); no retrieval agent, extra LLM call, or memory system is introduced.
 
-命令不变，请将结果目录改为 `results/tilebased_algebra_template_full_r2`。数据无需重建，真实 Qwen 效果仍须运行验证。
+## Generated output
 
----
+Exactly three top-level fields: `schema`, `scene`, `model`.
 
-# V8.5：Qwen 生成数学模型，HiGHS 求解
+- `scene.regions`: up to 64 visual evidence regions, each with `geometry`, per-cell
+  `cost` in [1,25], and boolean `blocked`. Geometry is an inclusive cell box
+  `bounds_rc` or a simple, possibly concave, `polygon_rc` with grid-corner vertices.
+  Multiple regions express terrain differences and water boundaries. These are
+  perception facts, not prescribed routes or a replacement for the mathematical model.
+- `model.sets`: one `grid_cells` and one `neighbor_pairs` operator (4 or 8 neighbors).
+  These are declarative set constructors, never lists of IDs.
+- `model.parameters`: aliases bound to estimated scene fields and public geometry/task
+  data, or finite scalar constants. Explicit arrays and GT bindings are rejected.
+- `model.variables`, `objective`, `constraints`: generated indexed linear/integer
+  expressions, evaluated by the bounded AST interpreter (no Python eval/exec).
+- `model.output`: the indexed movement variable to decode after solving, e.g.
+  `{"variable":"x","index":"A"}`. No geometry list is generated.
 
-当前分支 `v85-tilebased-llm-solver`。陆地数据的 `auto` 默认改为 `algebra`。
-**正式流程：视觉 token → 冻结 Qwen → 变量、目标、约束 → 表达式编译 → HiGHS → 真实地图独立评价。**
-
-不再把区域或连接成本送入固定的 Dijkstra 模板作为正式求解。历史 `regions/segments/matrix` 显式选项仅用于复现旧实验。
-新模式支持线性规划和混合整数线性规划，不宣称支持任意非线性数学模型。求解接口通过 `scipy.optimize.milp` 调用 HiGHS（依赖已包含在 requirements.txt）。
-
-## 生成模型与执行边界
-
-Qwen 输出 `tilebased_algebra_v1` JSON：
-
-| 字段 | 内容 |
-|---|---|
-| `sets` | 命名的有限整数索引集合 |
-| `parameters` | 由视觉及任务得到的数值、数组，例如成本与连接关系 |
-| `variables` | 自主声明的标量／索引变量、类型及有限上下界 |
-| `objective` | `min/max` 和实际执行的线性表达式 |
-| `constraints` | 自主声明的等式／不等式及 `forall` 索引 |
-| `output` | 把某一变量族的选中项绑定到空间连接，用于还原轨迹 |
-
-连同 `schema` 一共七个字段。变量名称和约束数量不固定。编译器不会插入流量守恒、起终点、连通性、禁行或其他路径约束。**漏写约束时，求解器照常求解漏写约束的模型，解码失败就计为失败。**
-
-表达式例子（仅为语法示例，不是预填的导航模型）：
-
+Example declarations:
 ```json
-{
-  "variables": {
-    "z": {"index":"ITEMS", "type":"binary", "lb":"0", "ub":"1"}
-  },
-  "objective": {"sense":"min", "expression":"sum(price[j]*z[j] for j in ITEMS)"},
-  "constraints": [
-    {"name":"capacity", "forall":{}, "lhs":"sum(weight[j]*z[j] for j in ITEMS)", "sense":"<=", "rhs":"capacity"}
-  ]
-}
+{"sets":{"V":{"op":"grid_cells"},"A":{"op":"neighbor_pairs","of":"V","connectivity":8}},
+ "parameters":{"c":"scene.cost","s":"task.source","g":"task.goal",
+ "tail":"space.tail","head":"space.head","outgoing":"space.outgoing","incoming":"space.incoming"},
+ "variables":{"x":{"index":"A","type":"binary","lb":0,"ub":1}},
+ "objective":{"sense":"min","expression":"c[s] + sum(c[head[e]]*x[e] for e in A)"}}
 ```
+This excerpt is NOT a complete model. The full executable prompt example is
+`MODEL_EXAMPLE` in `tilebased_symbolic_v85.py`, including flow, degree, blocked-cell
+and diagonal-corner constraints. Qwen must output these expressions itself.
 
-完整 JSON 还需要集合、参数、schema 与输出绑定；上述片段不可以直接用于导航。
-表达式支持数值、参数数组索引、决策变量、加减、参数乘除、有限求和、参数条件与条件表达式。
-支持参数字典的字符串键索引、JSON 数值常量。仍不支持变量乘变量、变量条件、任意函数调用、属性、导入或执行 Python。使用 AST 解释器，不使用 `eval/exec`。
-每条约束可有一个 `forall` 索引，每个求和有一个生成器；可以使用多个求和。索引不能遮蔽已有名称。
+Supported parameter sources: `scene.cost`, `scene.blocked`, `scene.unknown`,
+`scene.corner_blocked`, `task.source`, `task.goal`, `space.tail`, `space.head`,
+`space.outgoing`, `space.incoming`, `space.step_length`. A move has unit length,
+including diagonals, matching this dataset's evaluation protocol. Source-cell
+cost must be included by the generated objective. S=G uses the same flow balance
+expression and a singleton decoded route when no movement is selected.
 
-### 路径输出接口不是预制优化模型
+## What the compiler does and does not do
 
-`output={"variable":"x", "arcs":[{"index":0,"polyline_rc":[[0,0],[0,2],[1,2]]}, ...]}`。
+Geometry creates all in-bounds neighboring moves, INCLUDING moves through blocked
+cells. It neither filters water nor installs flow constraints. Generated equations
+must exclude blocked endpoints and diagonal corner cuts. Changing or deleting
+constraints changes the actual solved model; missing constraints are never repaired.
+The compiler supports up to 8192 expanded variables and 16384 rows on bounded grids;
+this is distinct from the short generated JSON. Sparse incoming/outgoing incidence
+lists avoid expensive all-edge filtering for every node.
 
-- 每个索引绑定一条有方向、可拐弯的空间连接。Qwen 可声明多个候选连接和辅助变量。
-- polyline 是连接的空间几何，不是指定最终路线；HiGHS 根据**生成的目标和约束**选择变量值。
-- 线段仅进行固定八邻域几何展开，不用真实地图绕障或补路。相交连接不会自动添加转接边。
-- 解码器要求绑定变量的求解值为 0/1，只跟随已经选中的连接；遇到缺口、分叉、重复格子或多余选中连接，记录 `invalid_solution`。
-- 不从错误解中抽取一个较好子路径，不再运行 Dijkstra 修复它。
-- 这是用于当前导航任务的输出约定，数学结构仍由 Qwen 生成。空间建模仍可能遗漏候选路线；改为完整数学模型并不能消除视觉误识别。
+The decoder follows the solver's selected moves. Branches, gaps, cycles, fractional
+route values and unused selected components fail. It does not run Dijkstra to fix
+the result. Dijkstra remains only for independent evaluation diagnostics/references.
+No teacher labels, GT cost grid or reference trajectory enters scene compilation.
+All methods use the same environment interpretation and symbolic modeling prompt.
 
-最多 1024 个展开变量、4096 条展开约束、256 个输出连接；每个连接最多 64 个点。求解时间上限 30 秒。超时不算成功，不自动接受尚未证明最优的 incumbent。
+## Unknown evidence and partial observations
 
-## 先做 Full
+Uncovered cells are UNKNOWN: fixed cost 25, blocked=false. This is an explicit,
+shared pessimistic-cost assumption, not a claim that they are land. Missing visual
+tokens never delete nodes. Predicted evidence in unretained regions is logged as
+inferred evidence. Overlapping evidence uses maximum declared cost and blocked OR.
+No GT repairs evidence. Unknown policy, coverage, direct visibility and inferred
+coverage are exported. This policy can bias routes and cannot guarantee true-world
+feasibility; independent land-map evaluation remains mandatory. Full may also
+leave unknown regions if Qwen omits evidence.
 
-继续使用 `pkmn_land_v3`，无需重新预处理。不要复用区域版本结果或检查点。
-所有 Full/random/learned 方法统一使用英文环境提示词及同一建模语法，只有任务和保留的视觉位置不同。
+## Run Full first
+
+No dataset preprocessing changes are needed for existing land data. Use a NEW output
+folder and no old checkpoint. Old Full reports/checkpoints have incompatible signatures.
 
 ```bash
 python run_tilebased_v85.py \
-  --mode evaluate --split val --modes full --limit 32 \
+  --mode evaluate --split val --modes full --limit 2 \
   --data /data/v85_tilebased/pkmn_land_v3 \
   --model-representation algebra --modeling-prompt navigation \
   --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
   --device cuda:0 --load-4bit --batch 1 \
   --modeling-max-new-tokens 8192 --seed 1234 \
-  --output results/tilebased_algebra_full_r1
-
-python validate_tilebased_full_v85.py --run results/tilebased_algebra_full_r1
-
-python visualize_tilebased_v85.py \
-  --data /data/v85_tilebased/pkmn_land_v3 \
-  --outcomes results/tilebased_algebra_full_r1/outcomes.jsonl \
-  --split val --mode full \
-  --output results/tilebased_algebra_full_r1/path_visualizations
+  --output results/tilebased_symbolic_full_smoke
 ```
 
-`outcomes.jsonl` 保存原始 `model_answer`、`generated_model`、实际编译的 `compiled_model`（变量、目标系数、约束系数和上下界）、`solver_result`（变量解、目标值、状态）、路径和具体 `error`。
-`full_validation.json` 是训练前检查报告；`failure_examples.json` 汇总每类失败的前两个完整例子。
+Inspect this small run, then repeat with `--limit 32` and a new folder such as
+`results/tilebased_symbolic_full_r1`.
 
-当前工程检查门槛：至少 32 个不重复的 val 任务，HiGHS 最优返回率 ≥95%，真实任务 SR ≥90%。这是开始选择器实验的最低检查门槛，**不是统计上证明稳定的标准**；应扩展验证集并检查 SPL/成本质量。成本效率差时，即使通过，也应先改善 Full。
-检查失败脚本退出码为 2，仍保存报告和失败例子。不能用 test 调参或筛选成功样本后声称通过。
+```bash
+python validate_tilebased_full_v85.py --run results/tilebased_symbolic_full_r1
+```
 
-### 失败分类
+The existing training gate requires >=32 unique Full cases, >=95% optimal solver
+status and >=90% true-map SR. These are engineering readiness checks, not proof of
+statistical stability. Supply the resulting `full_validation.json` to subsequent
+training with `--full-validation`. Selector/proxy/distillation/RL mechanisms are
+unchanged; no claim is made that proxy gradients are exact derivatives of MILP.
 
-| category | 含义 |
+## Live output and saved interfaces
+
+Live Qwen text is printed in 16-token chunks; `--quiet-generation` hides printing
+but preserves files. Each attempt uses a unique filename under
+`<output>/model_answers/navigation/`:
+
+| Suffix | Contents |
 |---|---|
-| `format_error` | 非法／重复键 JSON |
-| `length_limit` | 生成截断 |
-| `model_error` | 缺字段、未定义符号、非法索引、非线性或错误输出绑定 |
-| `infeasible` | 生成的数学模型不可行 |
-| `solver_limit` / `solver_error` | 求解超时或异常 |
-| `invalid_solution` | 数学模型有解，但变量赋值不能解码为唯一完整 S→G 轨迹 |
-| `water_or_corner_violation` | 解码轨迹在真实地图中涉水或斜穿水角 |
+| `.txt` | Raw LLM text, including incomplete output |
+| `.generated_model.json` | Parsed scene + model response, potentially invalid |
+| `.symbolic_model.json` | The generated model before expansion |
+| `.scene_estimate.json` | Estimated costs/blocked/unknown/visibility provenance |
+| `.expanded_model.json` | Instantiated sets/parameters plus generated expressions |
+| `.model.txt` | Readable generated variables, objective and constraint families |
+| `.compiled_model.json` | Numerical objective, bounds, integrality and sparse rows |
+| `.solver_result.json` | Solver termination and assignment |
+| `.path_rc.json` | Decoded trajectory, including routes that fail true-map checks |
+| `.status.json` | Sample ID, failure information and artifact paths |
 
-`status` 保留 model_failure / solver_failure / constraint_failure 以兼容已有汇总，具体原因看 category 和 error。SR/SPL/成本效率的失败项仍计零，task_loss 失败惩罚仍为 10；不会把失败样本移出分母。
-生成模型的目标值 `generated_objective_value` 与真实地形成本分别保存，二者不混用。
-真实成本／水域掩码／GT 在生成和正式求解后才读取。Dijkstra 仅保留在离线参考、训练代理和事后诊断，不进入 algebra 正式求解链。
+`outcomes.jsonl` retains the raw answer and stage records. Only reached stages are
+exported; failures do not fabricate downstream results. The terminal prints model
+expressions and expanded dimensions after each call. A streaming array limit
+stops invalid runaway output; it does not fix modeling or perception errors.
 
-## Full 通过后训练
+Failure categories distinguish format/model errors, length stops, infeasibility,
+solver limits, invalid assignments and independent map violations. SR, SPL and
+success-weighted cost efficiency remain primary evaluation summaries.
 
-`--full-validation` 必须引用上面的报告。程序会重查原始日志和配置，拒绝失败／修改／过期报告或不同数据、模型、解码预算与提示词。旧区域环境检查点不能迁移进来继续训练。
+## Verification and limitations
 
-```bash
-python run_tilebased_v85.py \
-  --mode experiment --data /data/v85_tilebased/pkmn_land_v3 \
-  --model-representation algebra --modeling-prompt navigation \
-  --full-validation results/tilebased_algebra_full_r1/full_validation.json \
-  --vlm-model /data/lyi/models/Qwen3-VL-8B-Instruct \
-  --device cuda:0 --load-4bit --batch 1 \
-  --modeling-max-new-tokens 8192 --seed 1234 \
-  --limit 128 --rl-limit 32 --val-limit 32 \
-  --metric-epochs 3 --distill-epochs 3 --rl-epochs 2 \
-  --rl-group-size 2 --budget 0.15 \
-  --output results/tilebased_algebra_selector_r1
-```
-
-保留 proxy→梯度蒸馏/FM/ND→求解反馈 RL。proxy 仍是训练用的地形决策代理，**不是生成式 MILP 的精确梯度**。正式 RL 的成功和成本来自本页的新建模／求解／评价流程。
-本次实现已进行 CPU 编译器、HiGHS、故障分类及环境测试；当前工作环境无用户服务器上的 Qwen 8B 权重和真实数据，未运行真实 Full、没有启动选择器训练，也不声称 SR 提升。
-
-### Live generation and bounded-array diagnostics (2026-10-26)
-
-The runner now prints Qwen output during decoding (chunks of 16 tokens), followed
-by the generation stop reason and the evaluated sample status/error. Add
-`--quiet-generation` to hide this terminal output. Both modes save each raw answer
-under `<output>/model_answers/<prompt_variant>/<unique-id>.txt`; `outcomes.jsonl`
-records its absolute `model_answer_file` path and still contains `model_answer`.
-Partial output is saved during generation, so it can be inspected before evaluation
-finishes. Repeated calls for the same sample never overwrite one another.
-
-The algebra streaming guard stops an array when it exceeds the compiler's existing
-1024-entry limit. The generation reason is `array_limit`, categorized as
-`model_error`, with the partial answer preserved. Equal costs within the limit
-are legal. This detects invalid output sooner; it does not repair or complete a
-model and cannot establish navigation success. Template v2 asks for compact,
-scene-grounded graphs and matching parameter lengths; Full prompts no longer
-list every visual position. Suggested graph sizes are guidance, not solver limits.
-
-First rerun Full on 2 samples using the existing evaluation command with
-`--limit 2 --output results/tilebased_algebra_stream_smoke`. Inspect live output
-and the raw files before spending time on a full 32-sample run. A two-sample run
-cannot pass the Full training gate. All methods share the changed prompt.
-
-Validation: 10 CPU unit tests (streaming guard/logging and executable template)
-passed, plus Python compilation and diff whitespace checks. No real Qwen GPU
-rerun or native/custom backend comparison was performed in this workspace;
-improved generation quality and SR remain unverified. The signature now includes
-the streaming helper and Qwen backend, invalidating older Full validation reports.
-
-### Fixed patch coordinates and model exports
-
-The formal algebra environment now uses contract
-`frozen_tilebased_generated_milp_patch_ports_v2` and template `land_patch_ports_v3`.
-Old algebra checkpoints/reports must not be reused. The expression compiler still
-executes the generated objective and constraints without inserting flow equations.
-
-A visual patch is a region, not a point with implicit internal connectivity. For
-20x20 terrain and 10x10 visual regions, each patch contains four fixed cell ports:
-`patch=(r//2)*10+c//2`, `port=(r%2)*2+c%2`, `node=patch*4+port`.
-The registry covers all patches, including visually unselected ones. It contains
-only geometry and public S/G, never terrain labels or GT. Missing observations do
-not delete planning nodes. S/G retain exact cell positions, even in the same patch.
-Qwen outputs only the referenced subset in N; E is contiguous local edge IDs.
-Tail/head must reference N, parameter arrays must match E, and polyline endpoints
-must match the registry coordinates. Different ports require explicit modeled
-connections. No terrain feasibility or route repair is supplied by the registry.
-This preserves mixed water/land cells but does not guarantee that Qwen finds all
-useful connections or estimates costs correctly.
-
-The node registry is described by a formula in the shared prompt, avoiding a long
-list of all coordinates. Patch IDs refer to the configured region grid, not every
-raw ViT patch before merging. Use a region grid that evenly divides the terrain
-raster. No data preprocessing or dataset replacement is required.
-
-Each call exports files alongside its raw `.txt` in `model_answers/navigation/`:
-- `.patch_node_registry.json`: public geometry and exact S/G identities;
-- `.generated_model.json`: parsed LLM JSON (may still be invalid);
-- `.model.txt`: readable variables, objective and constraint expressions;
-- `.compiled_model.json`: coefficients, bounds, integrality and sparse constraint rows;
-- `.solver_result.json`: solve status and assignment when a solver was called;
-- `.status.json`: sample ID, failure details, node coordinates and file paths.
-
-Only reached stages exist: invalid/truncated JSON has no generated/compiled model;
-semantic failures may have a generated model but no compiled export. Raw partial
-answers remain available. `outcomes.jsonl` also records `model_artifacts`,
-`patch_nodes`, and `model_status_file`. Terminal output shows live generation and
-then variables/objective/constraints and compiled dimensions unless
-`--quiet-generation` is used. Output is diagnostic; no artifact is treated as GT.
-
-Run the same Full evaluation command with a fresh output directory, e.g.
-`--limit 2 --output results/tilebased_patch_nodes_full_smoke`; inspect the files,
-then run 32 validation cases if the small run completes. Training remains gated.
-Validation: 17 CPU tests passed for patch mappings, endpoint consistency, parameter
-cardinality, no automatic constraint insertion, artifact export, streaming and the
-executable template. Real Qwen success and token savings have not been verified.
+CPU tests verify objective-dependent route changes, obstacle and corner constraints,
+missing-constraint behavior, aliases, unknown areas, polygon evidence, S=G,
+20x20 expansion vs an independent reference, artifact output, and end-to-end
+independence from changed GT labels using a frozen-response mock backend.
+Real Qwen generation, custom/native backend equivalence and improved navigation
+metrics have NOT been verified here. Keep full-vision validation before selector
+training. This implementation supports indexed linear/MILP expressions, not
+arbitrary nonlinear optimization or general PDDL task planning.

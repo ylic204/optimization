@@ -1,4 +1,5 @@
-"""Public geometric patch/port registry. No terrain or GT is read here."""
+"""LEGACY patch-port experiment, not used by the formal symbolic pipeline.
+Public geometric patch/port registry. No terrain or GT is read here."""
 import math
 
 

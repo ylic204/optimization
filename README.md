@@ -1,3 +1,5 @@
+> **当前路径规划接口已更新为紧凑符号建模（2026-10-26）。** Qwen 输出视觉环境证据和变量/目标/约束；编译器展开几何邻接与索引，HiGHS 生成轨迹。不再由 Qwen 枚举节点、连接或候选折线。CLI 仍使用 `--model-representation algebra`。详见 [当前运行说明](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED_ALGEBRA.md)。旧候选图、patch-port 说明仅供历史参考，旧验证报告与 checkpoint 不可直接复用。
+
 # V8.5 — BEV Selector with Frozen LLM Modeling and Solver Feedback
 
 ## 当前 Tilebased 算法：生成变量、目标与约束
