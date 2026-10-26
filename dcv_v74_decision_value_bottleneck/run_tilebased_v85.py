@@ -235,9 +235,10 @@ def validate_proxy(model, loader, args, device):
 def validate_checkpoint(ckpt, dataset, args):
     if ckpt.get('contract') != CONTRACT or ckpt.get('dataset_signature') != dataset.signature:
         raise ValueError('checkpoint/data contract mismatch; legacy BEV checkpoints are not Tilebased checkpoints')
-    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT,REGION_ENVIRONMENT_CONTRACT,'frozen_tilebased_generated_milp_v1'):
+    from tilebased_algebra_v85 import CONTRACT as ALGEBRA_CONTRACT
+    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT,REGION_ENVIRONMENT_CONTRACT,ALGEBRA_CONTRACT):
         raise ValueError('checkpoint solver environment mismatch')
-    if (args.model_representation == 'algebra' or ckpt.get('environment') == 'frozen_tilebased_generated_milp_v1') and ckpt.get('environment') != environment_contract(args.model_representation):
+    if (args.model_representation == 'algebra' or ckpt.get('environment') == ALGEBRA_CONTRACT) and ckpt.get('environment') != environment_contract(args.model_representation):
         raise ValueError('algebra training requires a checkpoint from the generated-model environment')
     for name in ('hidden','latent_dim','mask_steps','prune_layer','max_text_length','mask_step_size'):
         if ckpt['args'][name] != getattr(args, name):

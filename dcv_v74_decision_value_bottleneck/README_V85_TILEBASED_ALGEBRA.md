@@ -164,3 +164,50 @@ passed, plus Python compilation and diff whitespace checks. No real Qwen GPU
 rerun or native/custom backend comparison was performed in this workspace;
 improved generation quality and SR remain unverified. The signature now includes
 the streaming helper and Qwen backend, invalidating older Full validation reports.
+
+### Fixed patch coordinates and model exports
+
+The formal algebra environment now uses contract
+`frozen_tilebased_generated_milp_patch_ports_v2` and template `land_patch_ports_v3`.
+Old algebra checkpoints/reports must not be reused. The expression compiler still
+executes the generated objective and constraints without inserting flow equations.
+
+A visual patch is a region, not a point with implicit internal connectivity. For
+20x20 terrain and 10x10 visual regions, each patch contains four fixed cell ports:
+`patch=(r//2)*10+c//2`, `port=(r%2)*2+c%2`, `node=patch*4+port`.
+The registry covers all patches, including visually unselected ones. It contains
+only geometry and public S/G, never terrain labels or GT. Missing observations do
+not delete planning nodes. S/G retain exact cell positions, even in the same patch.
+Qwen outputs only the referenced subset in N; E is contiguous local edge IDs.
+Tail/head must reference N, parameter arrays must match E, and polyline endpoints
+must match the registry coordinates. Different ports require explicit modeled
+connections. No terrain feasibility or route repair is supplied by the registry.
+This preserves mixed water/land cells but does not guarantee that Qwen finds all
+useful connections or estimates costs correctly.
+
+The node registry is described by a formula in the shared prompt, avoiding a long
+list of all coordinates. Patch IDs refer to the configured region grid, not every
+raw ViT patch before merging. Use a region grid that evenly divides the terrain
+raster. No data preprocessing or dataset replacement is required.
+
+Each call exports files alongside its raw `.txt` in `model_answers/navigation/`:
+- `.patch_node_registry.json`: public geometry and exact S/G identities;
+- `.generated_model.json`: parsed LLM JSON (may still be invalid);
+- `.model.txt`: readable variables, objective and constraint expressions;
+- `.compiled_model.json`: coefficients, bounds, integrality and sparse constraint rows;
+- `.solver_result.json`: solve status and assignment when a solver was called;
+- `.status.json`: sample ID, failure details, node coordinates and file paths.
+
+Only reached stages exist: invalid/truncated JSON has no generated/compiled model;
+semantic failures may have a generated model but no compiled export. Raw partial
+answers remain available. `outcomes.jsonl` also records `model_artifacts`,
+`patch_nodes`, and `model_status_file`. Terminal output shows live generation and
+then variables/objective/constraints and compiled dimensions unless
+`--quiet-generation` is used. Output is diagnostic; no artifact is treated as GT.
+
+Run the same Full evaluation command with a fresh output directory, e.g.
+`--limit 2 --output results/tilebased_patch_nodes_full_smoke`; inspect the files,
+then run 32 validation cases if the small run completes. Training remains gated.
+Validation: 17 CPU tests passed for patch mappings, endpoint consistency, parameter
+cardinality, no automatic constraint insertion, artifact export, streaming and the
+executable template. Real Qwen success and token savings have not been verified.

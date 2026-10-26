@@ -6,7 +6,7 @@ import inspect
 import time
 import numpy as np
 import torch
-from tilebased_generation_v85 import AlgebraOutputGuard, GenerationTrace
+from tilebased_generation_v85 import AlgebraOutputGuard, GenerationTrace, export_model_artifacts
 from tilebased_core_v85 import validate_model, shortest_path, evaluate_path, matrix_diagnostics, LAND_PROTOCOL
 
 from tilebased_corridor_v85 import validate_corridor, compile_corridor, solve_corridor, corridor_evaluation
@@ -75,6 +75,9 @@ class FrozenTilebasedSolverEnvironment:
             try:
                 if self.model_representation == 'algebra':
                     from tilebased_model_templates_v85 import retrieve_template
+                    from tilebased_patch_nodes_v85 import patch_registry
+                    from tilebased_core_v85 import DATASETS
+                    item['patch_node_registry'] = patch_registry((DATASETS[dataset]['grid'],)*2, self.region_grid, source, target)
                     item['modeling_template'] = retrieve_template(public_inputs['task_text'][row])
                 item['modeling_prompt'] = prompt
                 item['modeling_prompt_variant'] = self.prompt_variant
@@ -107,9 +110,14 @@ class FrozenTilebasedSolverEnvironment:
                     from tilebased_algebra_v85 import compile_model, solve_model, validate_output, decode_route, ModelError
                     if finish == 'array_limit':raise ModelError('model_error', generation_kwargs['output_guard'].error)
                     if finish == 'length':raise ModelError('length_limit','generated algebra was truncated')
+                    from tilebased_algebra_v85 import parse_answer
+                    from tilebased_patch_nodes_v85 import patch_registry, validate_patch_bindings
+                    item['generated_model'] = parse_answer(answer)
                     compiled = compile_model(answer)
                     from tilebased_core_v85 import DATASETS
                     binding = validate_output(compiled, (DATASETS[dataset]['grid'],)*2)
+                    item['patch_node_registry'] = patch_registry((DATASETS[dataset]['grid'],)*2, self.region_grid, source, target)
+                    item['patch_nodes'] = validate_patch_bindings(compiled, binding, item['patch_node_registry'])
                     item['generated_model'] = compiled['raw']
                     item['compiled_model'] = dict(variable_labels=compiled['labels'],
                         objective_coefficients=compiled['c'].tolist(), objective_constant=compiled['constant'],
@@ -196,6 +204,7 @@ class FrozenTilebasedSolverEnvironment:
                 if hasattr(exc,'category'):item['failure_category'] = exc.category
                 item.setdefault('failure_category', ('model_error' if self.model_representation=='algebra' else 'invalid_model') if item['status']=='model_failure' else 'solver_error')
             item['environment_seconds'] = time.perf_counter() - start
+            export_model_artifacts(trace, item, self.stream_generation)
             if self.stream_generation:
                 print(f"[Result] sample={item['sample_id']} status={item['status']} failure={item.get('failure_category')} error={item.get('error', '')}", flush=True)
             results.append(item)

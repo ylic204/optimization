@@ -5,7 +5,7 @@ No upstream code copied. Only the current benchmark family is supported.
 import hashlib
 import json
 
-TEMPLATE_ID='path_planning/minimum_terrain_cost/land_flow_v2'
+TEMPLATE_ID='path_planning/minimum_terrain_cost/land_patch_ports_v3'
 
 
 def retrieve_template(task):
@@ -22,14 +22,12 @@ def retrieve_template(task):
 GUIDANCE='''RETRIEVED MODELING TEMPLATE: minimum terrain-cost directed S-to-G path.
 This is modeling guidance, not a model installed by the compiler. Return every variable,
 objective and constraint in your JSON. Adapt the template to the actual visible scene.
-1. Build a compact directed graph of task-relevant junctions and connections with alternatives.
-   Node identifiers are arbitrary integers, NOT visual token IDs. Define N and E only for
-   actual modeled nodes/arcs. Choose junctions from visible passage geometry.
-   Aim for a small graph (roughly 4-12 junctions and 4-24 connections when sufficient);
-   these are guidance, not hard limits. Preserve necessary bends and alternatives.
-   Use compact JSON arrays. Each tail/head/cost/allowed array has exactly len(E)
-   entries. Close each array immediately after its last entry; then write the
-   variables, objective, constraints and output. Never enumerate visual positions as nodes.
+1. Build task-relevant connections using the PUBLIC PATCH NODE REGISTRY below.
+   N contains fixed patch-port IDs, not arbitrary labels or visual sequence indices.
+   Each patch has separate cell ports to preserve mixed terrain and connectivity.
+   Only reference useful ports; do not enumerate all patches or all cells.
+   E contains local contiguous connection IDs. Prefer compact arrays; tail/head/cost/
+   allowed each have exactly len(E) entries. Preserve useful alternative routes.
 2. Supply numeric parameter arrays tail[e], head[e], cost[e], allowed[e], and scalar s,t,start_cost.
    cost[e] is a POSITIVE estimated total cost of all entered cells along that connection,
    excluding its departure and including its arrival. It is a PARAMETER, not a decision variable.
@@ -48,14 +46,16 @@ objective and constraint in your JSON. Adapt the template to the actual visible 
    all constraints are scalar linear expressions, S/G match the task, and JSON contains
    literal arrays, not Python list comprehensions, tuples, comments or missing keys.
 
-The following COMPLETE TINY EXAMPLE demonstrates executable syntax, NOT the current scene.
+The following COMPLETE TINY EXAMPLE uses a 4x4 terrain grid and 2x2 patch grid.
+Each patch has 4 ports. Nodes 0,1,4 are cells [0,0],[0,1],[0,2].
+It demonstrates executable syntax, NOT the current scene.
 Replace its nodes, endpoints, costs, allowed values and geometry using the current image.
 '''
 
 EXAMPLE={
- 'schema':'tilebased_algebra_v1','sets':{'N':[0,1,2],'E':[0,1,2]},
- 'parameters':{'tail':[0,1,0],'head':[1,2,2],'cost':[1,1,4],
-               'allowed':[1,1,1],'s':0,'t':2,'start_cost':1},
+ 'schema':'tilebased_algebra_v1','sets':{'N':[0,1,4],'E':[0,1,2]},
+ 'parameters':{'tail':[0,1,0],'head':[1,4,4],'cost':[1,1,4],
+               'allowed':[1,1,1],'s':0,'t':4,'start_cost':1},
  'variables':{'x':{'index':'E','type':'binary','lb':0,'ub':1}},
  'objective':{'sense':'min','expression':'start_cost + sum(cost[e]*x[e] for e in E)'},
  'constraints':[

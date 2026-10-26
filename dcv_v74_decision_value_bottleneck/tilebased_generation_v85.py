@@ -65,3 +65,41 @@ class GenerationTrace:
     def finish(self, text, reason):
         self(text)
         if self.enabled: print(f'\n[Qwen finish] reason={reason}', flush=True)
+
+
+def export_model_artifacts(trace, item, enabled=False):
+    """Persist partial/final modeling stages even when validation/solving fails."""
+    if trace is None or trace.path is None: return
+    base=trace.path.with_suffix('')
+    artifacts={}
+    for key in ('patch_node_registry','generated_model','compiled_model','solver_result'):
+        if key in item:
+            path=base.with_name(base.name+'.'+key+'.json')
+            path.write_text(json.dumps(item[key],indent=2,ensure_ascii=False,allow_nan=False)+'\n',encoding='utf-8')
+            artifacts[key]=str(path.resolve())
+    raw=item.get('generated_model')
+    if isinstance(raw,dict):
+        lines=['QWEN-GENERATED MATHEMATICAL MODEL (unvalidated unless compilation succeeded)',
+               'Sets: '+json.dumps(raw.get('sets'),ensure_ascii=False),
+               'Parameters: '+json.dumps(raw.get('parameters'),ensure_ascii=False),
+               'Variables: '+json.dumps(raw.get('variables'),ensure_ascii=False),
+               'Objective: '+json.dumps(raw.get('objective'),ensure_ascii=False), 'Constraints:']
+        for rule in raw.get('constraints',[]) if isinstance(raw.get('constraints'),list) else []:
+            lines.append(json.dumps(rule,ensure_ascii=False))
+        path=base.with_name(base.name+'.model.txt')
+        path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+        artifacts['readable_model']=str(path.resolve())
+    item['model_artifacts']=artifacts
+    report=base.with_name(base.name+'.status.json')
+    report.write_text(json.dumps({k:item.get(k) for k in
+        ('sample_id','status','failure_category','error','model_answer_file','model_artifacts','patch_nodes')},indent=2)+'\n',encoding='utf-8')
+    item['model_status_file']=str(report.resolve())
+    if enabled:
+        if isinstance(raw,dict):
+            print('[Generated model] objective='+json.dumps(raw.get('objective')),flush=True)
+            print('[Generated model] variables='+json.dumps(raw.get('variables')),flush=True)
+            print('[Generated model] constraints='+json.dumps(raw.get('constraints')),flush=True)
+        if 'compiled_model' in item:
+            m=item['compiled_model']
+            print(f"[Compiled model] variables={len(m['variable_labels'])} rows={len(m['constraints'])}",flush=True)
+        print('[Model files] '+json.dumps(artifacts),flush=True)

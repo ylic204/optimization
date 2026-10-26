@@ -14,7 +14,7 @@ from scipy.sparse import coo_matrix
 from tilebased_corridor_v85 import raster_segment
 
 SCHEMA = 'tilebased_algebra_v1'
-CONTRACT = 'frozen_tilebased_generated_milp_v1'
+CONTRACT = 'frozen_tilebased_generated_milp_patch_ports_v2'
 
 
 class ModelError(ValueError):
@@ -297,7 +297,9 @@ def algebra_prompt(task,dataset,source,target,indices,region_grid,legend):
     from tilebased_core_v85 import DATASETS
     n=DATASETS[dataset]['grid'];side=DATASETS[dataset]['image_side']
     from tilebased_model_templates_v85 import template_prompt
-    guidance=template_prompt(task)
+    from tilebased_patch_nodes_v85 import patch_registry, registry_prompt
+    registry=patch_registry((n,n),region_grid,source,target)
+    guidance=template_prompt(task)+registry_prompt(registry)
     visibility = ("Full image: all visual positions retained." if len(indices) == region_grid**2 else
                   f"Retained positions on the {region_grid}x{region_grid} visual grid: {list(map(int,indices))}.")
     return guidance + f'''{task}

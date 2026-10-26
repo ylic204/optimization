@@ -89,7 +89,13 @@ def test_no_hidden_terrain_or_dijkstra_in_formal_model(monkeypatch):
     model,public,labels,args=setup_tiny()
     public.update(source_rc=torch.tensor([[0,0]]),target_rc=torch.tensor([[0,2]]),
         navigation_protocol=[LAND_PROTOCOL],task_text=[task_text('pkmn',[0,0],[0,2],True)])
-    model.backbone.answer=json.dumps(example());encoded,*_=encode(model,public,args.budget)
+    def patch_example():
+        obj=example()
+        obj['sets']['N']=[0,1,11,2]
+        obj['parameters'].update(tail=[0,1,0,11],head=[1,2,11,2],s=0,t=2,allowed=[1]*4)
+        obj['constraints'][0]['rhs']='1 if n == 0 else (-1 if n == 2 else 0)'
+        return obj
+    model.backbone.answer=json.dumps(patch_example());encoded,*_=encode(model,public,args.budget)
     env=environment.FrozenTilebasedSolverEnvironment(model.backbone,2,prompt_variant='navigation',model_representation='algebra')
     labels=dict(true_costs=torch.ones((1,20,20)),allowed_mask=torch.ones((1,20,20),dtype=torch.bool),
                 optimal_cost=torch.tensor([3.]),shortest_path_length=torch.tensor([2]))
@@ -104,7 +110,7 @@ def test_no_hidden_terrain_or_dijkstra_in_formal_model(monkeypatch):
     bad=env.evaluate(encoded,indices,public,labels)[0]
     assert bad['status']=='constraint_failure' and bad['path_rc']==good['path_rc']
     assert bad['generated_model']==good['generated_model'] and bad['solver_result']==good['solver_result']
-    obj=example();obj['constraints']=[];model.backbone.answer=json.dumps(obj)
+    obj=patch_example();obj['constraints']=[];model.backbone.answer=json.dumps(obj)
     missing=env.evaluate(encoded,indices,public,labels)[0]
     assert missing['failure_category']=='invalid_solution' and missing['solver_result']['constraint_count']==0
     model.backbone.answer='{}'
