@@ -268,5 +268,30 @@
       "Reference conversion verified on controlled map fixtures, not a new full original-dataset run",
       "Rectangle predictions can still omit useful routes or misclassify water; no optimality or feasibility guarantee for generated models"
     ]
+  },
+  "generated_algebra_validation": {
+    "date": "2026-10-26",
+    "schema": "tilebased_algebra_v1",
+    "solver": "scipy.optimize.milp / HiGHS",
+    "cpu_tests_passed": 108,
+    "tests_skipped": 1,
+    "skip_reason": "transformers unavailable for optional native diagnostics test",
+    "checks": [
+      "Generated objective and constraints control solver results",
+      "No inferred flow/endpoints/connectivity constraints; omitted constraints yield invalid route rather than repair",
+      "Non-navigation integer and continuous LP models compile with generated variable domains",
+      "Malformed JSON, undefined symbols, nonlinear and unsafe expressions rejected with explicit categories",
+      "Infeasible models and invalid assignments remain failures",
+      "Changing privileged terrain changes evaluation, not generated model or selected route",
+      "Full audit precedes tiny-backbone three-stage training; frozen backbone unchanged",
+      "Historical region and segment workflows remain reproducible"
+    ],
+    "limitations": [
+      "No pretrained Qwen3-VL-8B generation or real Full validation performed",
+      "No real selector training initiated; small backbone tests are engineering checks only",
+      "Supported mathematical language is bounded LP/MILP, not arbitrary nonlinear code",
+      "Generated spatial connections may still omit useful routes; output decoder assumes selected directed arcs",
+      "Full gate thresholds are preliminary engineering criteria, not evidence of statistical stability"
+    ]
   }
 }

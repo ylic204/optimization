@@ -162,9 +162,11 @@ def main():
         detail=dict(sample_id=sid,mode=row.get('mode'),status=row['status'],source_rc=source,target_rc=target,
                     image_file=filename,optimal_cost=optimum,measured=measured,error=row.get('error'),
                     path_rc=predicted,gt_path_rc=gt,compiled_graph=row.get('compiled_graph'),
+                    generated_model=row.get('generated_model'),compiled_model=row.get('compiled_model'),
+                    solver_result=row.get('solver_result'),failure_category=row.get('failure_category'),
                     model_answer=row.get('model_answer'),selected_indices=row.get('selected_indices'))
         (args.output/f'{i:04d}_details.json').write_text(json.dumps(detail,indent=2),encoding='utf-8')
-        audit.append({k:v for k,v in detail.items() if k not in ('model_answer','compiled_graph','path_rc','gt_path_rc')})
+        audit.append({k:v for k,v in detail.items() if k not in ('model_answer','compiled_graph','path_rc','gt_path_rc','generated_model','compiled_model','solver_result')})
         cards.append(f'<article><h2>{html.escape(title)}</h2><p>{html.escape(note)}</p><a href="{filename}"><img src="{filename}" loading="lazy"></a><p><a href="{i:04d}_details.json">Coordinates and model answer</a></p></article>')
         print(f'{i+1}/{len(outcomes)} {sid} -> {filename}')
     (args.output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>Recorded planning paths</title><style>body{font:16px sans-serif;background:#edf1f5;margin:24px}article{max-width:1100px;margin:24px auto}img{width:100%}h2{font-size:20px}</style><h1>Recorded Qwen + solver paths vs dataset GT</h1><p>Offline visualization only. No model inference, rerouting or route repair. Pink: solver path. Cyan: reference under current dataset rules. Orange: proposed graph or regions. Land protocol forbids lake/ocean; wall retains its finite cost. Failed predicted routes are shown, never repaired.</p>'+''.join(cards),encoding='utf-8')

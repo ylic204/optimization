@@ -235,8 +235,10 @@ def validate_proxy(model, loader, args, device):
 def validate_checkpoint(ckpt, dataset, args):
     if ckpt.get('contract') != CONTRACT or ckpt.get('dataset_signature') != dataset.signature:
         raise ValueError('checkpoint/data contract mismatch; legacy BEV checkpoints are not Tilebased checkpoints')
-    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT,REGION_ENVIRONMENT_CONTRACT):
+    if ckpt.get('environment') not in (ENVIRONMENT_CONTRACT,CORRIDOR_ENVIRONMENT_CONTRACT,SEGMENT_ENVIRONMENT_CONTRACT,REGION_ENVIRONMENT_CONTRACT,'frozen_tilebased_generated_milp_v1'):
         raise ValueError('checkpoint solver environment mismatch')
+    if (args.model_representation == 'algebra' or ckpt.get('environment') == 'frozen_tilebased_generated_milp_v1') and ckpt.get('environment') != environment_contract(args.model_representation):
+        raise ValueError('algebra training requires a checkpoint from the generated-model environment')
     for name in ('hidden','latent_dim','mask_steps','prune_layer','max_text_length','mask_step_size'):
         if ckpt['args'][name] != getattr(args, name):
             raise ValueError(f'checkpoint architecture mismatch: {name}; use the saved arguments')
@@ -287,8 +289,9 @@ def parse_args():
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
-    p.add_argument('--model-representation', choices=['auto','regions','segments','corridor','matrix'], default='auto')
+    p.add_argument('--model-representation', choices=['auto','algebra','regions','segments','corridor','matrix'], default='auto')
     p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
+    p.add_argument('--full-validation', default='', help='passed Full validation report required before algebra training')
     p.add_argument('--compare-prompts', action='store_true', help='evaluate legacy/navigation on identical selected regions in one run')
     p.add_argument('--lr', type=float, default=2e-4)
     p.add_argument('--grad-clip', type=float, default=5.)
@@ -326,9 +329,11 @@ def main():
         raise FileExistsError(f'{output} is not empty; choose a fresh run directory')
     dataset = TilebasedDatasetV85(args.data, args.split if args.mode == 'evaluate' else 'train', args.limit)
     land = dataset.config.get('navigation_protocol') == LAND_PROTOCOL
-    if args.model_representation == 'auto':args.model_representation = 'regions' if land else 'segments'
-    if land != (args.model_representation == 'regions'):
-        raise ValueError('regions requires rebuilt land data; use prepare_tilebased_land_v85.py first')
+    if args.model_representation == 'auto':args.model_representation = 'algebra' if land else 'segments'
+    if land != (args.model_representation in ('regions','algebra')):
+        raise ValueError('algebra/regions requires rebuilt land data; use prepare_tilebased_land_v85.py first')
+    if args.model_representation == 'algebra' and (args.compare_prompts or args.modeling_prompt != 'navigation'):
+        raise ValueError('algebra uses the same navigation modeling prompt for every method')
     args.navigation_protocol = dataset.config.get('navigation_protocol','original')
     print(f'Tilebased data: {Path(args.data).resolve()} | protocol={args.navigation_protocol} | representation={args.model_representation} | tasks={len(dataset)}', flush=True)
     args.region_grid = dataset.config['region_grid']
@@ -336,6 +341,12 @@ def main():
     prompt_config = {variant:prompt_metadata(variant,dataset.config['dataset'],args.model_representation) for variant in variants}
     args.modeling_prompt_metadata = prompt_config
     args.dataset_signature = dataset.signature
+    if args.model_representation == 'algebra':
+        from validate_tilebased_full_v85 import code_signature
+        args.algebra_code_signature = code_signature()
+    if args.model_representation == 'algebra' and args.mode != 'evaluate':
+        from validate_tilebased_full_v85 import require_full_validation
+        require_full_validation(args.full_validation,args,dataset)
     args.torch_version = str(torch.__version__)
     args.checkpoint_modeling_prompt = None
     args.checkpoint_model_representation = None

@@ -52,7 +52,7 @@ def test_formal_attempt_counters_include_model_failures_and_separate_diagnostics
     assert progress.values['evaluation_formal_solver_calls'] == 0
 
 
-@pytest.mark.parametrize("land", [False, True])
+@pytest.mark.parametrize("land", [False, True, "algebra"])
 def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(tmp_path, monkeypatch, land):
     import run_tilebased_v85 as runner
     data = tmp_path/'data'; data.mkdir(); fixture_export(data)
@@ -77,15 +77,34 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
             from tilebased_regions_v85 import REGION_SCHEMA
             model.backbone.answer=json.dumps(dict(schema=REGION_SCHEMA,source_rc=[0,0],target_rc=[19,19],
                 regions=[dict(bounds_rc=[0,0,19,19],cost=1)],blocked_regions=[]))
+        if land == 'algebra':
+            from tilebased_algebra_v85 import SCHEMA
+            model.backbone.answer=json.dumps(dict(schema=SCHEMA,sets={'E':[0]},parameters={},
+                variables={'x':dict(index='E',type='binary',lb='0',ub='1')},
+                objective=dict(sense='min',expression='1+19*x[0]'),
+                constraints=[dict(name='choose',forall={},lhs='x[0]',sense='==',rhs='1')],
+                output=dict(variable='x',arcs=[dict(index=0,polyline_rc=[[0,0],[19,19]])])))
         frozen.update(copy.deepcopy(model.backbone.state_dict()))
         builds.append(model)
         return model
     monkeypatch.setattr(runner, 'build_v85_model', build)
     out = tmp_path/'experiment'
-    monkeypatch.setattr(sys, 'argv', ['run_tilebased_v85.py', '--mode', 'experiment',
-        '--data', str(data), '--vlm-model', 'test-double', '--device', 'cpu', '--output', str(out),
-        '--metric-epochs', '1', '--distill-epochs', '1', '--rl-epochs', '1', '--rl-limit', '1',
-        '--hidden', '16', '--latent-dim', '8', '--mask-steps', '2', '--rl-group-size', '2'])
+    representation = 'algebra' if land == 'algebra' else ('regions' if land else 'segments')
+    common=['--data',str(data),'--vlm-model','test-double','--device','cpu',
+        '--model-representation',representation,'--hidden','16','--latent-dim','8','--mask-steps','2','--rl-group-size','2']
+    approval=[]
+    if land == 'algebra':
+        import validate_tilebased_full_v85 as gate
+        monkeypatch.setattr(gate,'MIN_SAMPLES',1)  # fixture has one task; production requires 32
+        full=tmp_path/'full'
+        monkeypatch.setattr(sys,'argv',['run_tilebased_v85.py','--mode','evaluate','--split','val','--modes','full','--output',str(full)]+common)
+        runner.main()
+        report=gate.audit(full);assert report['passed']
+        report_path=full/'full_validation.json';report_path.write_text(json.dumps(report))
+        approval=['--full-validation',str(report_path)]
+        builds.clear()
+    monkeypatch.setattr(sys, 'argv', ['run_tilebased_v85.py', '--mode', 'experiment','--output',str(out),
+        '--metric-epochs','1','--distill-epochs','1','--rl-epochs','1','--rl-limit','1']+common+approval)
     runner.main()
     assert len(builds) == 1  # Qwen loaded once for all stages and references.
     model = builds[0]
@@ -117,9 +136,9 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
     assert counts['selector_optimizer_steps'] == 2
     assert counts['metric_optimizer_steps'] == 1
     assert counts['training_modeling_calls'] == counts['training_formal_solver_calls'] == 3
-    assert counts['training_diagnostic_solver_calls'] == 6
+    assert counts['training_diagnostic_solver_calls'] == (3 if land == 'algebra' else 6)
     assert counts['evaluation_modeling_calls'] == counts['evaluation_formal_solver_calls'] == 5
-    assert counts['evaluation_diagnostic_solver_calls'] == 10
+    assert counts['evaluation_diagnostic_solver_calls'] == (5 if land == 'algebra' else 10)
     curve = [json.loads(line) for line in (out/'learning_curve.jsonl').read_text().splitlines()]
     assert [entry['stage'] for entry in curve] == ['untrained', 'distilled', 'rl', 'selected_best']
     assert curve[-1]['progress']['optimizer_steps'] == 3
@@ -128,4 +147,4 @@ def test_experiment_trains_freezes_and_compares_same_budget_without_test_split(t
     assert updates[0]['metrics']['informative_reward_group_rate'] == 0
     assert updates[0]['metrics']['all_samples_failed_group_rate'] == 0
     assert updates[0]['metrics']['sampled_success_rate'] == 1
-    assert json.loads((out/'args.json').read_text())['model_representation'] == ('regions' if land else 'segments')
+    assert json.loads((out/'args.json').read_text())['model_representation'] == representation

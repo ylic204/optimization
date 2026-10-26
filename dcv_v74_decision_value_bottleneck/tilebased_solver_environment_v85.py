@@ -1,4 +1,6 @@
-"""Frozen VLM -> corridor (or legacy matrix) model -> solver -> true-cost reward."""
+"""Frozen VLM -> generated mathematical model -> solver -> independent reward.
+Historical parameter-only environments remain explicit reproducibility options.
+"""
 import hashlib
 import inspect
 import time
@@ -17,6 +19,9 @@ REGION_ENVIRONMENT_CONTRACT = 'frozen_tilebased_land_regions_v3'
 SEGMENT_ENVIRONMENT_CONTRACT = 'frozen_tilebased_llm_sg_segments_v2'
 
 def environment_contract(representation):
+    if representation == 'algebra':
+        from tilebased_algebra_v85 import CONTRACT
+        return CONTRACT
     if representation == 'regions':return REGION_ENVIRONMENT_CONTRACT
     if representation == 'matrix':return ENVIRONMENT_CONTRACT
     if representation == 'corridor':return CORRIDOR_ENVIRONMENT_CONTRACT
@@ -51,8 +56,8 @@ class FrozenTilebasedSolverEnvironment:
             chosen = indices[row].cpu().tolist()
             protocol = public_inputs.get('navigation_protocol',['original']*len(indices))[row]
             land = protocol == LAND_PROTOCOL
-            if land != (self.model_representation == 'regions'):
-                raise ValueError('land protocol requires regions; legacy representations require original protocol')
+            if land != (self.model_representation in ('regions','algebra')):
+                raise ValueError('land protocol requires algebra or legacy regions; other legacy representations require original protocol')
             system = modeling_system_prompt(self.prompt_variant,dataset,self.model_representation)
             prompt = modeling_user_prompt(self.prompt_variant,public_inputs['task_text'][row], dataset, source, target,
                                         chosen, self.region_grid, public_inputs['legend'][row],self.model_representation)
@@ -71,7 +76,7 @@ class FrozenTilebasedSolverEnvironment:
                 generation_kwargs = {'system_prompt':system} if system else {}
                 self.calls['modeling_calls'] += 1
                 if hasattr(self.backbone, 'generate_selected_report'):
-                    if self.model_representation in ('segments','regions') and 'output_guard' in inspect.signature(self.backbone.generate_selected_report).parameters:
+                    if self.model_representation in ('segments','regions','algebra') and 'output_guard' in inspect.signature(self.backbone.generate_selected_report).parameters:
                         generation_kwargs['output_guard'] = RegionOutputGuard() if land else SegmentOutputGuard(dataset)
                     generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                     answer = generation['text']
@@ -86,7 +91,30 @@ class FrozenTilebasedSolverEnvironment:
                     raise ValueError(f'coordinate output guard stopped generation: {finish}')
                 if finish == 'length':
                     item['failure_category'] = 'length_limit'
-                if land:
+                if self.model_representation == 'algebra':
+                    from tilebased_algebra_v85 import compile_model, solve_model, validate_output, decode_route, ModelError
+                    if finish == 'length':raise ModelError('length_limit','generated algebra was truncated')
+                    compiled = compile_model(answer)
+                    from tilebased_core_v85 import DATASETS
+                    binding = validate_output(compiled, (DATASETS[dataset]['grid'],)*2)
+                    item['generated_model'] = compiled['raw']
+                    item['compiled_model'] = dict(variable_labels=compiled['labels'],
+                        objective_coefficients=compiled['c'].tolist(), objective_constant=compiled['constant'],
+                        objective_sense=compiled['sense'], lower=compiled['lower'].tolist(), upper=compiled['upper'].tolist(),
+                        integrality=compiled['integrality'].tolist(),
+                        constraints=[dict(coefficients={str(i):float(v) for i,v in zip(compiled['A'].getrow(r).indices,compiled['A'].getrow(r).data)},
+                            lower=None if not np.isfinite(compiled['cl'][r]) else float(compiled['cl'][r]),
+                            upper=None if not np.isfinite(compiled['cu'][r]) else float(compiled['cu'][r])) for r in range(len(compiled['cl']))])
+                    item['status'] = 'solver_failure'
+                    self.calls['formal_solver_calls'] += 1
+                    solution = solve_model(compiled)
+                    item['solver_result'] = solution
+                    if solution['status'] != 'optimal':raise ModelError(solution['status'],solution['message'])
+                    item['status'] = 'model_failure'
+                    route = decode_route(compiled,solution,binding,source,target)
+                    item['generated_objective_value'] = solution['objective_value']
+                    item['compiled_graph'] = dict(arcs=[[list(a),list(b),0.] for path in binding[1].values() for a,b in zip(path,path[1:])])
+                elif land:
                     modeled = validate_regions(answer,dataset,source,target)
                     graph = compile_regions(modeled)
                     item['status'] = 'solver_failure'
@@ -136,7 +164,9 @@ class FrozenTilebasedSolverEnvironment:
                 item.update(measured, status='success')
                 item['loss'] = min(measured['relative_regret'], self.failure_cost*.999)
                 truth = supervision['true_costs'][row].cpu().numpy()
-                if land:
+                if self.model_representation == 'algebra':
+                    pass  # Do not replace the generated objective with a diagnostic routing objective.
+                elif land:
                     self.calls['diagnostic_solver_calls'] += 1
                     item.update(region_evaluation(graph,route,estimated,truth,allowed,float(supervision['optimal_cost'][row])))
                 elif self.model_representation in ('corridor','segments'):
@@ -150,7 +180,8 @@ class FrozenTilebasedSolverEnvironment:
                 item['same_path_as_uniform_cost'] = bool(np.array_equal(route, uniform))
             except (ValueError, KeyError, TypeError, OverflowError) as exc:
                 item['error'] = str(exc)
-                item.setdefault('failure_category', 'invalid_model' if item['status']=='model_failure' else 'solver_error')
+                if hasattr(exc,'category'):item['failure_category'] = exc.category
+                item.setdefault('failure_category', ('model_error' if self.model_representation=='algebra' else 'invalid_model') if item['status']=='model_failure' else 'solver_error')
             item['environment_seconds'] = time.perf_counter() - start
             results.append(item)
         return results
@@ -202,6 +233,8 @@ def summarize_outcomes(results):
         result['constant_segment_cost_rate_successful'] = float(np.mean([x['constant_segment_costs'] for x in graph_success]))
     result['failure_categories'] = {key:sum(x.get('failure_category','unknown')==key and x['status']!='success' for x in results)
         for key in sorted({x.get('failure_category','unknown') for x in results if x['status']!='success'})}
+    for category in ('format_error','model_error','infeasible','invalid_solution','solver_limit'):
+        result[category+'_rate'] = sum(x.get('failure_category')==category for x in results)/len(results)
     result['empty_connections_rate_all'] = sum(bool(x.get('empty_connections')) and x['status']!='success' for x in results)/len(results)
     generation = [x['generation'] for x in results if 'generation' in x]
     if generation:

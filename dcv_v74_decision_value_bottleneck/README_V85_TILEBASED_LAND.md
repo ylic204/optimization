@@ -1,5 +1,7 @@
 # V8.5：区域建模与陆地最小成本规划
 
+**当前默认已改为生成完整数学模型，运行请见 [README_V85_TILEBASED_ALGEBRA.md](README_V85_TILEBASED_ALGEBRA.md)。本文保留区域版本复现及陆地数据准备说明。**
+
 当前分支：`v85-tilebased-llm-solver`。
 研究目标仍为：学习固定预算视觉 token 选择器，冻结 Qwen，由 Qwen 根据任务及保留视觉信息生成优化实例，再调用求解器获得真实任务反馈。
 不增加探索、记忆或步数约束；不要求预测路径逐格等于参考解。

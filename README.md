@@ -1,14 +1,14 @@
 # V8.5 — BEV Selector with Frozen LLM Modeling and Solver Feedback
 
-## 当前 Tilebased 算法：区域建模与陆地规划
+## 当前 Tilebased 算法：生成变量、目标与约束
 
-**运行入口：[README_V85_TILEBASED_LAND.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED_LAND.md)。**
-Qwen 生成有面积的通道区域、区域成本和预测水域边界；Dijkstra 在区域内部选择路线。
-同时排除水域起终点，禁止涉水/斜穿水角，重新生成最小成本与最短步数参考解。
-真实水域标签仅用于离线参考与事后评价，模型漏识别的水域不会被求解器自动纠正。
-仍学习固定预算视觉选择器，冻结 Qwen，保留代理预热、梯度蒸馏/FM/ND 和求解器反馈 RL。
+**运行入口：[README_V85_TILEBASED_ALGEBRA.md](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED_ALGEBRA.md)。**
+冻结 Qwen 根据任务与视觉生成可执行 LP/MILP，通用表达式编译器忠实转换后由 HiGHS 求解。
+不自动补写最短路径约束，不调用 Dijkstra 修复正式解；真实地图独立检查可行性和成本。
+陆地数据 `auto` 默认使用 `algebra`。先做 Full 验证，再以同一提示词训练与比较视觉选择器。
+旧区域/通路参数接口仅用于历史复现，见 [区域版说明](dcv_v74_decision_value_bottleneck/README_V85_TILEBASED_LAND.md)。
 
-## Tilebased 最小地形成本路径适配
+## 历史 Tilebased 最小地形成本路径适配
 
 新增分支 `v85-tilebased-llm-solver`，基于 `v85-bev-selector-llm-solver`。
 接入原始 Pokémon/Warcraft tile-map 数据协议；推荐先用 Pokémon 的现成
