@@ -66,6 +66,7 @@ class Expressions:
         self.remaining=200000
 
     def parse(self,text,local=None):
+        if type(text) in (int,float):return number(text)
         if not isinstance(text,str) or len(text)>8192:fail('expression must be a string <=8192 characters')
         try:tree=ast.parse(text,mode='eval')
         except (SyntaxError,RecursionError) as exc:fail(f'invalid expression: {exc}')
@@ -76,19 +77,23 @@ class Expressions:
         self.remaining-=1
         if self.remaining<0 or depth>40:fail('expression expansion limit')
         sub=lambda n:self.visit(n,ctx,depth+1)
-        if isinstance(node,ast.Constant):return number(node.value)
+        if isinstance(node,ast.Constant):
+            return node.value if isinstance(node.value,str) else number(node.value)
         if isinstance(node,ast.Name):
             if node.id not in ctx:fail(f'undefined symbol: {node.id}')
             return ctx[node.id]
         if isinstance(node,ast.Subscript):
-            obj=sub(node.value);idx=scalar(sub(node.slice))
-            if idx!=int(idx):fail('index must be integer')
-            idx=int(idx)
+            obj=sub(node.value);raw=sub(node.slice)
+            if isinstance(raw,str):idx=raw
+            else:
+                idx=scalar(raw)
+                if idx!=int(idx):fail('index must be integer')
+                idx=int(idx)
             if isinstance(obj,list):
-                if not 0<=idx<len(obj):fail('parameter index out of range')
+                if not isinstance(idx,int) or not 0<=idx<len(obj):fail('parameter index out of range')
             elif isinstance(obj,dict):
-                if idx not in obj:fail('variable index not in declared set')
-            else:fail('only parameter arrays and indexed variables can be indexed')
+                if idx not in obj:fail(f'undefined indexed entry: {idx}')
+            else:fail('only parameter arrays/maps and indexed variables can be indexed')
             return obj[idx]
         if isinstance(node,ast.UnaryOp):
             v=Linear.cast(sub(node.operand))
@@ -176,13 +181,17 @@ def compile_model(answer):
     for k,values in obj['sets'].items():
         if not isinstance(values,list) or len(values)>1024 or any(type(v) is not int or abs(v)>100000 for v in values) or len(set(values))!=len(values):fail('sets require unique bounded integers')
         ctx[k]=values
-    def parameter(v,depth=0):
+    def parameter(v,depth=0,path='parameters'):
         if depth>4:fail('parameter nesting limit')
         if isinstance(v,list):
             if len(v)>1024:fail('parameter size limit')
-            return [parameter(x,depth+1) for x in v]
-        return number(v)
-    for k,v in obj['parameters'].items():ctx[k]=parameter(v)
+            return [parameter(x,depth+1,f'{path}[{i}]') for i,x in enumerate(v)]
+        if isinstance(v,dict):
+            if len(v)>1024:fail(f'{path}: parameter size limit')
+            return {k:parameter(x,depth+1,f'{path}.{k}') for k,x in v.items()}
+        try:return number(v)
+        except ModelError as exc:fail(f'{path}: {exc}')
+    for k,v in obj['parameters'].items():ctx[k]=parameter(v,path=f'parameters.{k}')
     exp=Expressions(ctx);labels=[];lower=[];upper=[];integrality=[];domains={}
     for k,v in obj['variables'].items():
         keys(v,{'index','type','lb','ub'})
@@ -287,7 +296,9 @@ def decode_route(m,report,binding,source,target):
 def algebra_prompt(task,dataset,source,target,indices,region_grid,legend):
     from tilebased_core_v85 import DATASETS
     n=DATASETS[dataset]['grid'];side=DATASETS[dataset]['image_side']
-    return f'''{task}
+    from tilebased_model_templates_v85 import template_prompt
+    guidance=template_prompt(task)
+    return guidance + f'''{task}
 Top-down pixel-art image: {side}x{side}; terrain grid {n}x{n}. Cell coordinates [row,column], zero-based.
 S={list(map(int,source))}; G={list(map(int,target))}. Public terrain rules: {legend}
 Retained visual positions on the original {region_grid}x{region_grid} row-major visual grid: {list(map(int,indices))}.
@@ -308,8 +319,8 @@ and sum(expr for i in SET if parameter_condition). Example of syntax only: sum(p
 Conditional expressions (a if parameter_condition else b), comparisons and and/or are allowed on PARAMETERS only.
 Do not multiply decision variables, use decision-dependent conditions, Python calls other than sum, attributes, or imports.
 Indices in sums/forall must not shadow existing names. Bounds must be parameter-only scalar expressions.
-All mathematical expressions must be JSON strings. Choose your own sets, variables, objective and constraints;
-the syntax example above is not a navigation model template.
+Expressions can be JSON strings or numeric constants. Use the retrieved path template as guidance;
+instantiate and return the full mathematical model, including all constraints, yourself.
 Output decoding contract: "output":{{"variable":"YOUR_ARC_SELECTION_VARIABLE","arcs":[{{"index":integer,"polyline_rc":[[row,col],...]}}]}}.
 Bind each index of one declared variable family to one directed spatial connection. Selected connections must have value 1,
 others 0. Each connection may bend: give its ordered polyline cell coordinates; preserve alternative connections where useful.

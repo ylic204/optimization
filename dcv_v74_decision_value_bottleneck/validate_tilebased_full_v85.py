@@ -15,7 +15,7 @@ def digest(path):
 
 def code_signature():
     root=Path(__file__).resolve().parent
-    files=['tilebased_algebra_v85.py','tilebased_prompts_v85.py','tilebased_solver_environment_v85.py',
+    files=['tilebased_model_templates_v85.py','tilebased_algebra_v85.py','tilebased_prompts_v85.py','tilebased_solver_environment_v85.py',
            'prompts/tilebased_land_system_v85.txt']
     return {f:digest(root/f) for f in files}
 

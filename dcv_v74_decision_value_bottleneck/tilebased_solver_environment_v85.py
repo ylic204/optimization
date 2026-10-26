@@ -69,6 +69,9 @@ class FrozenTilebasedSolverEnvironment:
                     'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None,
                     'navigation_protocol': protocol, 'spl': 0.0, 'cost_efficiency': 0.0, 'path_length': None, 'shortest_path_length': None}
             try:
+                if self.model_representation == 'algebra':
+                    from tilebased_model_templates_v85 import retrieve_template
+                    item['modeling_template'] = retrieve_template(public_inputs['task_text'][row])
                 item['modeling_prompt'] = prompt
                 item['modeling_prompt_variant'] = self.prompt_variant
                 item['system_prompt'] = system

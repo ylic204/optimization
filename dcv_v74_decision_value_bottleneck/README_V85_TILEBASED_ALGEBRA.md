@@ -1,3 +1,19 @@
+# 路径规划模板指导更新
+
+参考 MM-Agent 固定版本 `74d84f393a0557d41ae45a01625d15e0d61df983`：
+- [方法检索](https://github.com/usail-hkust/LLM-MM-Agent/blob/74d84f393a0557d41ae45a01625d15e0d61df983/MMAgent/agent/retrieve_method.py)：层次方法库，embedding 或 LLM 打分。
+- [建模流程](https://github.com/usail-hkust/LLM-MM-Agent/blob/74d84f393a0557d41ae45a01625d15e0d61df983/MMAgent/utils/mathematical_modeling.py)：分析、检索、公式与建模。
+
+本实现借鉴工作流，未复制上游实现。当前任务类别由公开 benchmark 任务规则确定为 path_planning/minimum_terrain_cost，检索唯一适用的 land_flow_v1 模板；这不是通用 LLM 分类器，不扩展到其他竞赛任务。未知任务明确拒绝。
+
+新提示词提供完整路径模型范例：成本是参数，binary 连接选择变量、成本目标、逐节点流量守恒、度数上界与禁行约束；要求 Qwen 用当前图像实例化全部内容。模板仅进入提示词，不送进编译器作为默认约束。原始生成结果仍独立校验、编译、求解；遗漏约束不会自动补上。所有 baseline 共用模板，新增文本 token 计入输入统计。
+
+兼容数值表达式与字符串键参数字典，避免把正常 JSON 数字误判为数学错误。非线性乘积、未定义符号和缺少输出绑定仍拒绝。每条日志保存 modeling_template，验证签名包含模板模块；旧 Full 报告须重跑。当前没有增加自动重试或声称复现 MM-Agent 全部多轮流程。
+
+命令不变，请将结果目录改为 `results/tilebased_algebra_template_full_r2`。数据无需重建，真实 Qwen 效果仍须运行验证。
+
+---
+
 # V8.5：Qwen 生成数学模型，HiGHS 求解
 
 当前分支 `v85-tilebased-llm-solver`。陆地数据的 `auto` 默认改为 `algebra`。
@@ -37,7 +53,7 @@ Qwen 输出 `tilebased_algebra_v1` JSON：
 
 完整 JSON 还需要集合、参数、schema 与输出绑定；上述片段不可以直接用于导航。
 表达式支持数值、参数数组索引、决策变量、加减、参数乘除、有限求和、参数条件与条件表达式。
-不支持变量乘变量、变量条件、任意函数调用、属性、导入或执行 Python。使用 AST 解释器，不使用 `eval/exec`。
+支持参数字典的字符串键索引、JSON 数值常量。仍不支持变量乘变量、变量条件、任意函数调用、属性、导入或执行 Python。使用 AST 解释器，不使用 `eval/exec`。
 每条约束可有一个 `forall` 索引，每个求和有一个生成器；可以使用多个求和。索引不能遮蔽已有名称。
 
 ### 路径输出接口不是预制优化模型

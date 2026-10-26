@@ -112,11 +112,11 @@ def test_no_hidden_terrain_or_dijkstra_in_formal_model(monkeypatch):
     assert invalid['failure_category']=='model_error' and 'solver_result' not in invalid
 
 
-def test_prompt_is_shared_and_does_not_supply_flow_equations():
+def test_prompt_is_shared_and_retrieves_path_template():
     from tilebased_prompts_v85 import modeling_system_prompt,modeling_user_prompt
-    p=modeling_user_prompt('navigation','task','pkmn',[0,0],[0,2],[0,1],2,{},'algebra')
+    p=modeling_user_prompt('navigation','Find a minimum total terrain-cost LAND path','pkmn',[0,0],[0,2],[0,1],2,{},'algebra')
     assert 'variables' in p and 'constraints' in p and 'objective' in p
-    assert 'tail[e]' not in p and 'head[e]' not in p
+    assert 'tail[e]' in p and 'head[e]' in p and 'land_flow_v1' in p
     assert 'sky' in modeling_system_prompt('navigation','pkmn','algebra')
     with pytest.raises(ValueError):modeling_system_prompt('legacy','pkmn','algebra')
 
