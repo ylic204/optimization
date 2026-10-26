@@ -8,9 +8,9 @@ from pathlib import Path
 import time
 import traceback
 
-VQA_SYSTEM = ('You inspect top-down pixel-art maps for navigation. This is an overhead '
-              'game map, not a perspective landscape. Describe only visible evidence; '
-              'do not invent hidden terrain or claim a solver-verified path.')
+from tilebased_prompts_v85 import navigation_environment_prompt
+
+VQA_SYSTEM = navigation_environment_prompt()
 VQA_PROMPT = '''Answer briefly in English, at most 150 words. No JSON or mathematical model.
 1. Is the entire map water, or are there land areas? Describe their approximate locations.
 2. Where are the main water boundaries and land passages?
@@ -86,7 +86,7 @@ def native_generate(model,processor,inputs,budget,trace):
     ended=bool(tokens and tokens[-1] in eos);content=tokens[:-1] if ended else tokens
     return dict(text=processor.tokenizer.decode(content,skip_special_tokens=True),
                 finish_reason='eos' if ended else 'length',generated_tokens=len(content),backend='native',
-                input_tokens=int(inputs['input_ids'].shape[1]),image_grid_thw=inputs['image_grid_thw'].tolist())
+                input_tokens=int(inputs['input_ids'].shape[1]),image_grid_thw=inputs['image_grid_thw'].tolist() if 'image_grid_thw' in inputs else None)
 
 
 def input_parity(official,custom):

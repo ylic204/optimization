@@ -9,16 +9,23 @@ from tilebased_regions_v85 import regions_user_prompt
 SYSTEM_FILE = Path(__file__).resolve().parent/'prompts/tilebased_vqa_system_v85.txt'
 
 
+def navigation_environment_prompt():
+    """Shared public environment knowledge for VQA, evidence and modeling."""
+    text = SYSTEM_FILE.with_name('tilebased_land_system_v85.txt').read_text(encoding='utf-8').strip()
+    if not text:
+        raise ValueError('empty navigation environment prompt')
+    return text
+
+
 def modeling_system_prompt(variant, dataset, model_representation="matrix"):
     if model_representation == 'algebra':
         if variant != 'navigation':raise ValueError('algebra uses one shared navigation prompt')
-        return ('You interpret top-down pixel-art terrain for navigation and generate executable linear/integer optimization models. '
-                'Images are overhead maps, not perspective landscapes: blue areas can be water, not sky. '
-                'Use the public legend and task, not real-world assumptions about game objects. '
-                'Keep visual evidence separate from mathematical expressions. '
-                'Never enumerate nodes, edges or candidate routes. Return only the requested JSON. '
-                'Unknown visual regions are unknown; do not claim they were observed. '
-                'The solver, not your answer, produces the trajectory.')
+        return navigation_environment_prompt() + (
+            '\n\nSYMBOLIC MODEL OUTPUT\n'
+            'Generate executable linear/integer optimization models using the requested schema. '
+            'Keep visual evidence separate from mathematical expressions. '
+            'Never enumerate nodes, edges or candidate routes. Return only the requested JSON. '
+            'The solver produces the trajectory. Include all requested model fields.')
     if variant == 'legacy':
         return ''
     if variant != 'navigation':

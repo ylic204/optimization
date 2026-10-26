@@ -48,3 +48,74 @@ investigate modeling prompt/schema complexity. VQA correctness requires inspecti
 the saved image and answer; JSON completion and compilation are not accuracy scores.
 CPU tests cover output diagnosis and image-only loading. GPU inference must be run
 with the local Qwen model and dataset; it is not covered by these CPU tests.
+
+## Staged native diagnosis with the shared environment prompt
+
+The full `prompts/tilebased_land_system_v85.txt` is now loaded by formal symbolic
+modeling, the native/custom diagnostic VQA, and all stages below. The formal
+modeling suffix only adds output requirements. The Full validation signature now
+includes this prompt file, so validation from an older prompt cannot qualify a
+new selector run.
+
+Run each stage separately in the script directory. Review the visual stages
+before running `joint`; no automatic metric can certify image interpretation.
+All stages below use native Qwen inference, not the custom selector backend.
+
+```bash
+export VLM_MODEL=/data/lyi/models/Qwen3-VL-8B-Instruct
+export TILE_DATA=/data/v85_tilebased/pkmn_land_v3
+
+# 1. Visual description: compare model_answer.txt against input.png.
+python diagnose_stages_qwen_v85.py --stage vqa --data "$TILE_DATA" \
+  --vlm-model "$VLM_MODEL" --device cuda:0 --load-4bit \
+  --sample-index 0 --output results/stage_vqa_r2
+
+# 2. Scene evidence ONLY: no variables, objective or constraints requested.
+python diagnose_stages_qwen_v85.py --stage scene --data "$TILE_DATA" \
+  --vlm-model "$VLM_MODEL" --device cuda:0 --load-4bit \
+  --sample-index 0 --output results/stage_scene_r2
+
+# 3. Pure text modeling: no image, dataset, or ground-truth map loaded.
+python diagnose_stages_qwen_v85.py --stage model \
+  --vlm-model "$VLM_MODEL" --device cuda:0 --load-4bit \
+  --output results/stage_model_r2
+
+# 4. Only after reviewing stages 1/2 and checking stage 3:
+python diagnose_stages_qwen_v85.py --stage joint --data "$TILE_DATA" \
+  --vlm-model "$VLM_MODEL" --device cuda:0 --load-4bit \
+  --sample-index 0 --output results/stage_joint_r2
+```
+
+Each run prints the answer and saves `model_answer.txt`, `summary.json`, exact
+`prompt.json`, `chat.txt`, and generation configuration. Generation stops at EOS
+or budget, without repairing output. Use fresh output directories for reruns.
+
+- `vqa`: manually check viewpoint, water/land locations and boundaries; no automated pass.
+- `scene`: validates geometry/schema and reports duplicate regions, blocked fraction,
+  unknown fraction, and structural sanity. `scene_raster.json` contains the estimated
+  cost/blocked/coverage grids. Structural sanity is NOT visual correctness.
+- `model`: uses an explicit, hand-constructed 3x5 scene saved as `fixture.json`.
+  Costs are shown below; X is forbidden water. S=(1,0), G=(1,4), eight neighbors,
+  no water corner cuts, cost includes both endpoints. The optimal cost is 5.
+
+| Row / column | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| 0 | 1 | 1 | X | 1 | 1 |
+| 1 | S:1 | 8 | 8 | 8 | G:1 |
+| 2 | 1 | 1 | 1 | 1 | 1 |
+
+  Qwen returns `{"model":{...}}`. The diagnostic attaches the **supplied scene**
+  for compilation, never inserts missing model expressions. It solves the generated
+  model and independently checks the decoded path, true cost, and objective value.
+  `fixture_passed=true` means this one synthetic case passed, not that the model is
+  correct for all maps. The usual formulation example remains in the prompt, so this
+  measures guided executable modeling, not unaided discovery of a formulation.
+  Artifacts are in `model_check.json`; these results never count as visual navigation SR.
+- `joint`: uses exactly the formal shared modeling prompt, checks compilation and
+  saves the estimated scene and symbolic model. It does not certify visual accuracy
+  or replace the full independent evaluation.
+
+Validation: 39 CPU tests passed, including supplied-fixture solve/cost validation,
+rejection of missing model fields, detection of repeated whole-map blocks, shared
+prompt wiring, and existing symbolic pipeline tests. Qwen GPU outputs have not been
+validated here; run the commands with the local model and inspect the saved answers.
