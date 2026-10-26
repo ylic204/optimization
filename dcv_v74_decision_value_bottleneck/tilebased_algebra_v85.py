@@ -298,10 +298,12 @@ def algebra_prompt(task,dataset,source,target,indices,region_grid,legend):
     n=DATASETS[dataset]['grid'];side=DATASETS[dataset]['image_side']
     from tilebased_model_templates_v85 import template_prompt
     guidance=template_prompt(task)
+    visibility = ("Full image: all visual positions retained." if len(indices) == region_grid**2 else
+                  f"Retained positions on the {region_grid}x{region_grid} visual grid: {list(map(int,indices))}.")
     return guidance + f'''{task}
 Top-down pixel-art image: {side}x{side}; terrain grid {n}x{n}. Cell coordinates [row,column], zero-based.
 S={list(map(int,source))}; G={list(map(int,target))}. Public terrain rules: {legend}
-Retained visual positions on the original {region_grid}x{region_grid} row-major visual grid: {list(map(int,indices))}.
+{visibility}
 Missing appearance is unknown. Construct the optimization problem yourself from the task and visible evidence.
 Declare decision variables, the objective and ALL necessary constraints. No route constraints, endpoint constraints,
 connectivity constraints, costs or forbidden-region constraints will be supplied or repaired by the program.

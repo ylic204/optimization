@@ -6,6 +6,7 @@ import inspect
 import time
 import numpy as np
 import torch
+from tilebased_generation_v85 import AlgebraOutputGuard, GenerationTrace
 from tilebased_core_v85 import validate_model, shortest_path, evaluate_path, matrix_diagnostics, LAND_PROTOCOL
 
 from tilebased_corridor_v85 import validate_corridor, compile_corridor, solve_corridor, corridor_evaluation
@@ -30,11 +31,13 @@ def environment_contract(representation):
 
 
 class FrozenTilebasedSolverEnvironment:
-    def __init__(self, backbone, region_grid, max_new_tokens=4096, failure_cost=10., prompt_variant='legacy', model_representation='matrix'):
+    def __init__(self, backbone, region_grid, max_new_tokens=4096, failure_cost=10., prompt_variant='legacy', model_representation='matrix', stream_generation=False, generation_log_dir=None):
         if failure_cost <= 0 or not np.isfinite(failure_cost) or max_new_tokens <= 0:
             raise ValueError('positive failure cost and decode budget required')
         if prompt_variant not in ('legacy','navigation'):
             raise ValueError('unknown modeling prompt variant')
+        self.stream_generation = stream_generation
+        self.generation_log_dir = generation_log_dir
         self.contract = environment_contract(model_representation)
         self.model_representation = model_representation
         self.prompt_variant = prompt_variant
@@ -68,6 +71,7 @@ class FrozenTilebasedSolverEnvironment:
                     'retained_tokens': len(chosen), 'total_tokens': self.region_grid**2,
                     'relative_regret': None, 'true_cost': None, 'optimal': None, 'path_rc': None,
                     'navigation_protocol': protocol, 'spl': 0.0, 'cost_efficiency': 0.0, 'path_length': None, 'shortest_path_length': None}
+            trace = None
             try:
                 if self.model_representation == 'algebra':
                     from tilebased_model_templates_v85 import retrieve_template
@@ -77,15 +81,20 @@ class FrozenTilebasedSolverEnvironment:
                 item['system_prompt'] = system
                 item['prompt_sha256'] = hashlib.sha256((system+'\n'+prompt).encode()).hexdigest()
                 generation_kwargs = {'system_prompt':system} if system else {}
+                trace = GenerationTrace(self.generation_log_dir, item['sample_id'], self.stream_generation)
+                if trace.path: item['model_answer_file'] = str(trace.path.resolve())
                 self.calls['modeling_calls'] += 1
                 if hasattr(self.backbone, 'generate_selected_report'):
+                    if 'text_callback' in inspect.signature(self.backbone.generate_selected_report).parameters:
+                        generation_kwargs['text_callback'] = trace
                     if self.model_representation in ('segments','regions','algebra') and 'output_guard' in inspect.signature(self.backbone.generate_selected_report).parameters:
-                        generation_kwargs['output_guard'] = RegionOutputGuard() if land else SegmentOutputGuard(dataset)
+                        generation_kwargs['output_guard'] = AlgebraOutputGuard() if self.model_representation == 'algebra' else (RegionOutputGuard() if land else SegmentOutputGuard(dataset))
                     generation = self.backbone.generate_selected_report(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
                     answer = generation['text']
                     item['generation'] = {k:v for k,v in generation.items() if k != 'text'}
                 else:
                     answer = self.backbone.generate_selected_json(state, indices[row:row+1], prompt, self.max_new_tokens, **generation_kwargs)
+                trace.finish(answer, item.get('generation', {}).get('finish_reason', 'unknown'))
                 item['model_answer'] = answer
                 item['streaming_guard_enabled'] = 'output_guard' in generation_kwargs
                 finish = item.get('generation', {}).get('finish_reason')
@@ -96,6 +105,7 @@ class FrozenTilebasedSolverEnvironment:
                     item['failure_category'] = 'length_limit'
                 if self.model_representation == 'algebra':
                     from tilebased_algebra_v85 import compile_model, solve_model, validate_output, decode_route, ModelError
+                    if finish == 'array_limit':raise ModelError('model_error', generation_kwargs['output_guard'].error)
                     if finish == 'length':raise ModelError('length_limit','generated algebra was truncated')
                     compiled = compile_model(answer)
                     from tilebased_core_v85 import DATASETS
@@ -186,6 +196,8 @@ class FrozenTilebasedSolverEnvironment:
                 if hasattr(exc,'category'):item['failure_category'] = exc.category
                 item.setdefault('failure_category', ('model_error' if self.model_representation=='algebra' else 'invalid_model') if item['status']=='model_failure' else 'solver_error')
             item['environment_seconds'] = time.perf_counter() - start
+            if self.stream_generation:
+                print(f"[Result] sample={item['sample_id']} status={item['status']} failure={item.get('failure_category')} error={item.get('error', '')}", flush=True)
             results.append(item)
         return results
 

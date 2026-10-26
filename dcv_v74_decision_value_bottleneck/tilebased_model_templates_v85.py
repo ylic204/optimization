@@ -5,7 +5,7 @@ No upstream code copied. Only the current benchmark family is supported.
 import hashlib
 import json
 
-TEMPLATE_ID='path_planning/minimum_terrain_cost/land_flow_v1'
+TEMPLATE_ID='path_planning/minimum_terrain_cost/land_flow_v2'
 
 
 def retrieve_template(task):
@@ -24,7 +24,12 @@ This is modeling guidance, not a model installed by the compiler. Return every v
 objective and constraint in your JSON. Adapt the template to the actual visible scene.
 1. Build a compact directed graph of task-relevant junctions and connections with alternatives.
    Node identifiers are arbitrary integers, NOT visual token IDs. Define N and E only for
-   actual modeled nodes/arcs. Do not declare 100 arcs because there are 100 visual tokens.
+   actual modeled nodes/arcs. Choose junctions from visible passage geometry.
+   Aim for a small graph (roughly 4-12 junctions and 4-24 connections when sufficient);
+   these are guidance, not hard limits. Preserve necessary bends and alternatives.
+   Use compact JSON arrays. Each tail/head/cost/allowed array has exactly len(E)
+   entries. Close each array immediately after its last entry; then write the
+   variables, objective, constraints and output. Never enumerate visual positions as nodes.
 2. Supply numeric parameter arrays tail[e], head[e], cost[e], allowed[e], and scalar s,t,start_cost.
    cost[e] is a POSITIVE estimated total cost of all entered cells along that connection,
    excluding its departure and including its arrival. It is a PARAMETER, not a decision variable.

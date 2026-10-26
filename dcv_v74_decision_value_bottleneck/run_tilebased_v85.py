@@ -288,6 +288,7 @@ def parse_args():
     p.add_argument('--rl-kl-weight', type=float, default=.02)
     p.add_argument('--rl-entropy-weight', type=float, default=.001)
     p.add_argument('--failure-cost', type=float, default=10.)
+    p.add_argument('--quiet-generation', action='store_true', help='hide live Qwen text; raw answer files are still saved')
     p.add_argument('--modeling-max-new-tokens', type=int, default=4096)
     p.add_argument('--model-representation', choices=['auto','algebra','regions','segments','corridor','matrix'], default='auto')
     p.add_argument('--modeling-prompt', choices=['legacy','navigation'], default='navigation')
@@ -369,7 +370,8 @@ def main():
     (output/'prompt_config.json').write_text(json.dumps(prompt_config,indent=2)+'\n')
     loader = DataLoader(dataset,batch_size=args.batch,shuffle=args.mode!='evaluate',num_workers=args.workers)
     environments = {variant:FrozenTilebasedSolverEnvironment(model.backbone,args.region_grid,
-        args.modeling_max_new_tokens,args.failure_cost,prompt_variant=variant,model_representation=args.model_representation) for variant in variants}
+        args.modeling_max_new_tokens,args.failure_cost,prompt_variant=variant,model_representation=args.model_representation, stream_generation=not args.quiet_generation,
+        generation_log_dir=output/'model_answers'/variant) for variant in variants}
     env = environments if args.compare_prompts else environments[args.modeling_prompt]
     if args.mode == 'evaluate':
         report = evaluate(model,loader,env,args,device,args.modes,output/'outcomes.jsonl')

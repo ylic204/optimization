@@ -135,3 +135,32 @@ python run_tilebased_v85.py \
 
 保留 proxy→梯度蒸馏/FM/ND→求解反馈 RL。proxy 仍是训练用的地形决策代理，**不是生成式 MILP 的精确梯度**。正式 RL 的成功和成本来自本页的新建模／求解／评价流程。
 本次实现已进行 CPU 编译器、HiGHS、故障分类及环境测试；当前工作环境无用户服务器上的 Qwen 8B 权重和真实数据，未运行真实 Full、没有启动选择器训练，也不声称 SR 提升。
+
+### Live generation and bounded-array diagnostics (2026-10-26)
+
+The runner now prints Qwen output during decoding (chunks of 16 tokens), followed
+by the generation stop reason and the evaluated sample status/error. Add
+`--quiet-generation` to hide this terminal output. Both modes save each raw answer
+under `<output>/model_answers/<prompt_variant>/<unique-id>.txt`; `outcomes.jsonl`
+records its absolute `model_answer_file` path and still contains `model_answer`.
+Partial output is saved during generation, so it can be inspected before evaluation
+finishes. Repeated calls for the same sample never overwrite one another.
+
+The algebra streaming guard stops an array when it exceeds the compiler's existing
+1024-entry limit. The generation reason is `array_limit`, categorized as
+`model_error`, with the partial answer preserved. Equal costs within the limit
+are legal. This detects invalid output sooner; it does not repair or complete a
+model and cannot establish navigation success. Template v2 asks for compact,
+scene-grounded graphs and matching parameter lengths; Full prompts no longer
+list every visual position. Suggested graph sizes are guidance, not solver limits.
+
+First rerun Full on 2 samples using the existing evaluation command with
+`--limit 2 --output results/tilebased_algebra_stream_smoke`. Inspect live output
+and the raw files before spending time on a full 32-sample run. A two-sample run
+cannot pass the Full training gate. All methods share the changed prompt.
+
+Validation: 10 CPU unit tests (streaming guard/logging and executable template)
+passed, plus Python compilation and diff whitespace checks. No real Qwen GPU
+rerun or native/custom backend comparison was performed in this workspace;
+improved generation quality and SR remain unverified. The signature now includes
+the streaming helper and Qwen backend, invalidating older Full validation reports.
