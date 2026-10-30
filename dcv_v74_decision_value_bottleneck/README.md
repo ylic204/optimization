@@ -119,3 +119,21 @@ Validation: 39 CPU tests passed, including supplied-fixture solve/cost validatio
 rejection of missing model fields, detection of repeated whole-map blocks, shared
 prompt wiring, and existing symbolic pipeline tests. Qwen GPU outputs have not been
 validated here; run the commands with the local model and inspect the saved answers.
+
+### Explicit terrain rules in all shared navigation prompts
+
+The shared environment prompt now includes the complete PKMN cost legend and
+explicitly distinguishes original finite water costs (lake=6, ocean=10) from the
+current forbidden-water protocol. Plants, mud and wall retain finite costs;
+absence of a drawn road and dense texture do not imply a blocked region.
+Water's scene cost=25 is an unused placeholder, distinct from traversable wall=25
+and the unknown-region cost=25 assumption. Synthetic text fixture facts override
+the terrain lookup. No per-image labels are added to the prompt.
+
+VQA now asks for boundaries and rule-based traversability rather than a search
+for visible roads. Scene-only output instructions show the complete nested
+`geometry` object; invalid generated objects are still rejected, not repaired.
+No dataset preprocessing or solver rule changes are needed. Rerun `vqa` and
+`scene` with fresh output directories (for example `stage_vqa_r4` and
+`stage_scene_r4`), then the text model and joint stages as described above.
+These prompt changes have not yet been validated with Qwen GPU inference.

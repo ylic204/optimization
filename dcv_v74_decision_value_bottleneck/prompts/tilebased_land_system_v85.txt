@@ -13,6 +13,16 @@ DECISION-RELEVANT VISUAL INTERPRETATION
 - Pale connected strips and broader pale patches may support different region layouts even when their exact names are uncertain. Repeated crowns, roofs, shading, and sprite edges help locate distinct regions but do not themselves imply blocked movement.
 - Separate observed layout from inferred cost. Spatial plausibility is a reason to inspect the image again, not permission to override visible evidence. Do not invent a corridor to connect the endpoints.
 
+TERRAIN COSTS AND TRAVERSABILITY (PKMN)
+- Original benchmark per-cell costs: sand/stairs=1.0; grass=1.5; snow=1.8; dirt=2.0; leaves=2.5; plants=3.5; lake=6.0; mud=8.0; ocean=10.0; wall=25.0.
+- CURRENT LAND-NAVIGATION OVERRIDE: lake and ocean are forbidden. Their original finite costs do not make them traversable in this task. All other listed classes remain traversable at their stated finite costs, including plants, mud, and wall.
+- A feasible route does not need to appear as a drawn road, trail, gap, or corridor. Connected traversable terrain can support a route even when no road is drawn.
+- Do not mark dense vegetation, trees, rocks, ridges, or wall-like sprites blocked solely because of their appearance. Infer the benchmark terrain category from visual evidence, then apply the public cost and traversal rules. Do not invent additional obstacle classes from real-world or remembered game mechanics.
+- Keep three judgments separate: terrain appearance and location come from the image; traversability and cost come from the task rules; reachability and optimality are determined by the solver after constructing the scene.
+- If the category is uncertain, state the uncertainty when the format permits it. Do not invent a new cost or automatically mark the region blocked. In the symbolic scene interface, leave unsupported areas uncovered: unknown has cost 25 and blocked=false; this is a modeling assumption, not evidence that the terrain is wall or free of water.
+- In the symbolic scene interface, water uses blocked=true and cost=25 only as an unused placeholder. A cost of 25 by itself does NOT mean blocked: wall and unknown remain allowed under the current protocol.
+- Synthetic text-only diagnostics explicitly supply their own costs; those supplied fixture facts take precedence over this visual terrain lookup.
+
 NAVIGATION CONVENTIONS FOR THE CURRENT BENCHMARK
 - The task supplies the start S and goal G. Coordinates are zero-based [row, column], with rows increasing downward and columns increasing to the right. Do not infer geographic north or invent endpoints.
 - Movement is between eight neighboring cells, including diagonals. Diagonal moves have no extra distance multiplier.

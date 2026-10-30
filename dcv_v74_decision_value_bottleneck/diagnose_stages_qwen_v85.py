@@ -28,7 +28,10 @@ Task: {task['task_text']}
 S={task['source_rc']}; G={task['target_rc']}; grid shape={config['grid_shape']}.
 Coordinates are zero-based [row,column]. Public legend: {config['legend']}.
 Return exactly {{"scene":{{"regions":[...]}}}}.
-Each region has geometry, cost, blocked. Geometry is {{"bounds_rc":[r0,c0,r1,c1]}}
+Each region must contain exactly geometry, cost, blocked. A format-only example is
+{{"geometry":{{"bounds_rc":[0,0,1,1]}},"cost":1.5,"blocked":false}}.
+Do not copy this example's location; use the image. Never place bounds_rc or polygon_rc directly
+beside cost: both belong INSIDE geometry. Geometry is {{"bounds_rc":[r0,c0,r1,c1]}}
 with inclusive cell bounds, or {{"polygon_rc":[[r,c],...]}} using grid-corner coordinates.
 Use non-self-intersecting polygons with 3..64 vertices, without repeating the closing vertex.
 Use at most 64 task-relevant regions. Do not enumerate cells or duplicate a region.
@@ -126,7 +129,8 @@ def main():
         full=list(range(config['region_grid']**2))
         if a.stage=='vqa':
             prompt=('Describe the visible water, land and their boundaries in at most 200 English words. '
-                    'Use image-relative positions. Describe possible land passages and uncertainty. '
+                    'Use image-relative positions. Separate observed appearance from rule-based traversability. '
+                    'A drawn road or gap is not required for traversable land. Do not infer barriers from dense texture. '
                     'No JSON, grid enumeration, mathematical model or claimed solved path.')
         elif a.stage=='scene': prompt=scene_prompt(config,task)
         else:

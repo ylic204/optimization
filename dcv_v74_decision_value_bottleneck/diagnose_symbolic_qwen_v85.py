@@ -13,8 +13,8 @@ from tilebased_prompts_v85 import navigation_environment_prompt
 VQA_SYSTEM = navigation_environment_prompt()
 VQA_PROMPT = '''Answer briefly in English, at most 150 words. No JSON or mathematical model.
 1. Is the entire map water, or are there land areas? Describe their approximate locations.
-2. Where are the main water boundaries and land passages?
-3. Can you identify distinct terrain appearances that could affect navigation?
+2. Where are the main water/land boundaries? Do not require a drawn road to recognize traversable land.
+3. Which visible terrain appearances imply different costs under the supplied rules? Separate visual evidence from traversal rules.
 State uncertainty when appropriate. Do not list nodes, edges, grid cells or routes.'''
 
 
